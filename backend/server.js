@@ -14,11 +14,12 @@ const server = http.createServer(app);
 const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:3000').split(',');
 const isLocalhostOrigin = (origin) => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
 const corsOriginCheck = (origin, callback) => {
-  if (!origin || allowedOrigins.includes(origin) || (process.env.NODE_ENV !== 'production' && isLocalhostOrigin(origin))) {
+  if (!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin) || isLocalhostOrigin(origin)) {
     return callback(null, true);
   }
   return callback(new Error('Origine non autorisee par CORS.'));
 };
+
 const io = new Server(server, {
   cors: { origin: corsOriginCheck, methods: ['GET', 'POST'] },
 });

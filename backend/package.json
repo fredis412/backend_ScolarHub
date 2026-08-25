@@ -1,0 +1,41 @@
+{
+  "name": "scolarhub-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "start:etudiants": "node etudiants_server.js",
+    "dev": "nodemon server.js",
+    "migrate:etudiants": "node migrate_etudiants.js",
+    "migrate:filieres": "node migrate_filieres.js"
+  },
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.107.0",
+    "bcryptjs": "^2.4.3",
+    "body-parser": "^2.2.2",
+    "cloudinary": "^1.41.3",
+    "cors": "^2.8.6",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.2",
+    "helmet": "^7.0.0",
+    "iconv-lite": "^0.7.2",
+    "jsonwebtoken": "^9.0.0",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.4",
+    "nodemailer": "^9.0.3",
+    "pdf-parse": "^2.4.5",
+    "pdfkit": "^0.15.0",
+    "pg": "^8.21.0",
+    "socket.io": "^4.6.0",
+    "uuid": "^9.0.0",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  }
+}

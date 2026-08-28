@@ -164,48 +164,98 @@ const setupPassword = async (req, res) => {
 const lookup = async (req, res) => {
   try {
     const matricule = (req.query.matricule || '').trim().toUpperCase();
-    if (!matricule) return res.status(400).json({ found: false, message: 'Matricule requis.' });
+    const nom = (req.query.nom || '').trim();
+    const prenom = (req.query.prenom || req.query.prenoms || '').trim();
+    const tel = (req.query.tel || req.query.telephone || req.query.numero || '').trim().replaceAll(' ', '');
 
     let row = null;
-    try {
-      const r = await pool.query(
-        `SELECT u.id, u.nom, u.prenoms, u.matricule, u.role, u.statut,
-                u.mot_de_passe IS NOT NULL AS a_mot_de_passe,
-                COALESCE(e.filiere_nom, u.filiere_nom) AS filiere_nom,
-                COALESCE(e.domaine, u.domaine)        AS domaine,
-                COALESCE(e.niveau, u.niveau)          AS niveau
-         FROM users u
-         LEFT JOIN etudiants e ON u.id = e.user_id
-         WHERE u.matricule = $1`,
-        [matricule]
-      );
-      row = r.rows[0];
-    } catch (dbErr) {
-      console.warn('Direct PG failed in lookup, fallback to Supabase SDK:', dbErr.message);
-      if (supabase && typeof supabase.from === 'function') {
-        const { data, error } = await supabase
-          .from('users')
-          .select('id, nom, prenoms, matricule, role, statut, mot_de_passe, filiere_nom, domaine, niveau')
-          .eq('matricule', matricule)
-          .maybeSingle();
-        if (!error && data) {
-          row = {
-            id: data.id,
-            nom: data.nom,
-            prenoms: data.prenoms,
-            matricule: data.matricule,
-            role: data.role,
-            statut: data.statut,
-            a_mot_de_passe: !!data.mot_de_passe,
-            filiere_nom: data.filiere_nom,
-            domaine: data.domaine,
-            niveau: data.niveau,
-          };
+
+    if (matricule) {
+      try {
+        const r = await pool.query(
+          `SELECT u.id, u.nom, u.prenoms, u.matricule, u.role, u.admin_sub_role, u.statut,
+                  u.mot_de_passe IS NOT NULL AS a_mot_de_passe,
+                  COALESCE(e.filiere_nom, u.filiere_nom) AS filiere_nom,
+                  COALESCE(e.domaine, u.domaine)        AS domaine,
+                  COALESCE(e.niveau, u.niveau)          AS niveau
+           FROM users u
+           LEFT JOIN etudiants e ON u.id = e.user_id
+           WHERE u.matricule = $1`,
+          [matricule]
+        );
+        row = r.rows[0];
+      } catch (dbErr) {
+        console.warn('Direct PG failed in lookup by matricule, fallback to Supabase SDK:', dbErr.message);
+        if (supabase && typeof supabase.from === 'function') {
+          const { data, error } = await supabase
+            .from('users')
+            .select('id, nom, prenoms, matricule, role, admin_sub_role, statut, mot_de_passe, filiere_nom, domaine, niveau')
+            .eq('matricule', matricule)
+            .maybeSingle();
+          if (!error && data) {
+            row = {
+              id: data.id,
+              nom: data.nom,
+              prenoms: data.prenoms,
+              matricule: data.matricule,
+              role: data.role,
+              admin_sub_role: data.admin_sub_role,
+              statut: data.statut,
+              a_mot_de_passe: !!data.mot_de_passe,
+              filiere_nom: data.filiere_nom,
+              domaine: data.domaine,
+              niveau: data.niveau,
+            };
+          }
         }
       }
+    } else if (nom && prenom && tel) {
+      try {
+        const r = await pool.query(
+          `SELECT u.id, u.nom, u.prenoms, u.matricule, u.role, u.admin_sub_role, u.statut,
+                  u.mot_de_passe IS NOT NULL AS a_mot_de_passe,
+                  COALESCE(e.filiere_nom, u.filiere_nom) AS filiere_nom,
+                  COALESCE(e.domaine, u.domaine)        AS domaine,
+                  COALESCE(e.niveau, u.niveau)          AS niveau
+           FROM users u
+           LEFT JOIN etudiants e ON u.id = e.user_id
+           WHERE LOWER(u.nom) = LOWER($1)
+             AND (LOWER(u.prenoms) = LOWER($2) OR LOWER(u.prenoms) LIKE LOWER($3))
+             AND (REPLACE(u.tel, ' ', '') = $4 OR REPLACE(u.tel, ' ', '') LIKE $5 OR u.tel IS NULL)`,
+          [nom, prenom, `%${prenom}%`, tel, `%${tel}%`]
+        );
+        row = r.rows[0];
+      } catch (dbErr) {
+        console.warn('Direct PG failed in lookup by details, fallback to Supabase SDK:', dbErr.message);
+        if (supabase && typeof supabase.from === 'function') {
+          const { data, error } = await supabase
+            .from('users')
+            .select('id, nom, prenoms, matricule, role, admin_sub_role, statut, mot_de_passe, filiere_nom, domaine, niveau')
+            .ilike('nom', nom)
+            .ilike('prenoms', `%${prenom}%`)
+            .maybeSingle();
+          if (!error && data) {
+            row = {
+              id: data.id,
+              nom: data.nom,
+              prenoms: data.prenoms,
+              matricule: data.matricule,
+              role: data.role,
+              admin_sub_role: data.admin_sub_role,
+              statut: data.statut,
+              a_mot_de_passe: !!data.mot_de_passe,
+              filiere_nom: data.filiere_nom,
+              domaine: data.domaine,
+              niveau: data.niveau,
+            };
+          }
+        }
+      }
+    } else {
+      return res.status(400).json({ found: false, message: 'Matricule ou détails (nom, prenom, tel) requis.' });
     }
 
-    if (!row) return res.status(404).json({ found: false, message: 'Matricule non reconnu.' });
+    if (!row) return res.status(404).json({ found: false, message: 'Utilisateur non reconnu.' });
     if (row.statut === 'suspendu' || row.statut === 'renvoye') {
       return res.status(403).json({ found: false, message: 'Compte désactivé. Contactez l\'administration.' });
     }
@@ -220,6 +270,7 @@ const lookup = async (req, res) => {
         prenoms: row.prenoms,
         matricule: row.matricule,
         role: row.role,
+        admin_sub_role: row.admin_sub_role,
         filiere: row.filiere_nom || '',
         domaine: row.domaine || '',
         niveau: row.niveau || '',

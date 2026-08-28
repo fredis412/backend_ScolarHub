@@ -19,7 +19,6 @@ const corsOriginCheck = (origin, callback) => {
   }
   return callback(new Error('Origine non autorisee par CORS.'));
 };
-
 const io = new Server(server, {
   cors: { origin: corsOriginCheck, methods: ['GET', 'POST'] },
 });
@@ -39,6 +38,7 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 app.use('/api/auth',          require('./src/routes/auth.routes'));
+app.use('/api/membres',       require('./src/routes/membres.routes'));
 app.use('/api/etudiants',     require('./src/routes/etudiants.routes'));
 app.use('/api/professeurs',   require('./src/routes/professeurs.routes'));
 app.use('/api/parents',       require('./src/routes/parents.routes'));

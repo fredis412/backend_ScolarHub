@@ -1,0 +1,214 @@
+const pool = require('../config/db');
+const supabase = require('../config/supabase');
+const bcrypt = require('bcryptjs');
+
+// ── GET /api/membres — Récupérer tous les administrateurs et membres ────────
+const getAllMembres = async (req, res) => {
+  try {
+    let membres = [];
+    try {
+      const r = await pool.query(
+        `SELECT u.id, u.nom, u.prenoms, u.email, u.role, u.admin_sub_role, u.statut,
+                COALESCE(m.permissions, '{}'::jsonb) AS permissions,
+                u.created_at
+         FROM users u
+         LEFT JOIN membres m ON u.id = m.user_id
+         WHERE u.role = 'admin' OR u.role = 'admi' OR u.role = 'administrator'
+         ORDER BY u.created_at DESC`
+      );
+      membres = r.rows;
+    } catch (dbErr) {
+      console.warn('Direct PG failed in getAllMembres, fallback to Supabase SDK:', dbErr.message);
+      if (supabase && typeof supabase.from === 'function') {
+        const { data, error } = await supabase
+          .from('users')
+          .select('id, nom, prenoms, email, role, admin_sub_role, statut, permissions, created_at')
+          .or('role.eq.admin,role.eq.admi');
+        if (!error && data) membres = data;
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: membres.map((m) => ({
+        id: m.id,
+        nom: m.nom || '',
+        prenoms: m.prenoms || '',
+        email: m.email || '',
+        role: m.admin_sub_role || m.role || 'super_admin',
+        admin_sub_role: m.admin_sub_role || 'super_admin',
+        droits: typeof m.permissions === 'string' ? JSON.parse(m.permissions) : (m.permissions || {}),
+        actif: m.statut !== 'suspendu' && m.statut !== 'renvoye',
+        dateCreation: m.created_at ? new Date(m.created_at).toLocaleDateString('fr-FR') : '01/01/2026',
+      })),
+    });
+  } catch (err) {
+    console.error('getAllMembres error:', err);
+    return res.status(500).json({ success: false, message: 'Erreur serveur lors de la récupération.' });
+  }
+};
+
+// ── POST /api/membres — Inscrire un nouvel administrateur en Base de Données ──
+const createMembre = async (req, res) => {
+  let client;
+  try {
+    const { nom, prenoms, email, motDePasse, role, admin_sub_role, permissions } = req.body;
+
+    if (!nom || !email) {
+      return res.status(400).json({ success: false, message: 'Nom et Email sont requis.' });
+    }
+
+    const pass = motDePasse || 'Admin1234!';
+    const hashedPassword = await bcrypt.hash(pass, 10);
+    const subRole = admin_sub_role || role || 'scolarite';
+    const permissionsObj = permissions || {};
+
+    let createdUser = null;
+
+    try {
+      client = await pool.connect();
+      await client.query('BEGIN');
+
+      // Vérifier si l'email existe déjà
+      const checkEmail = await client.query('SELECT id FROM users WHERE email = $1', [email.trim().toLowerCase()]);
+      if (checkEmail.rows.length > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ success: false, message: 'Cet email est déjà utilisé par un autre compte.' });
+      }
+
+      // Générer matricule admin unique
+      const countRes = await client.query("SELECT COUNT(*)::int AS c FROM users WHERE role = 'admin'");
+      const matricule = `ADM-${new Date().getFullYear()}-${(countRes.rows[0].c + 1).toString().padStart(3, '0')}`;
+
+      // 1. Insertion dans la table users
+      const userRes = await client.query(
+        `INSERT INTO users (matricule, nom, prenoms, email, mot_de_passe, role, admin_sub_role, statut)
+         VALUES ($1, $2, $3, $4, $5, 'admin', $6, 'actif')
+         RETURNING id, matricule, nom, prenoms, email, role, admin_sub_role`,
+        [matricule, nom.trim().toUpperCase(), prenoms.trim(), email.trim().toLowerCase(), hashedPassword, subRole]
+      );
+      createdUser = userRes.rows[0];
+
+      // 2. Insertion dans la table membres / permissions
+      await client.query(
+        `INSERT INTO membres (user_id, permissions)
+         VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET permissions = EXCLUDED.permissions`,
+        [createdUser.id, JSON.stringify(permissionsObj)]
+      );
+
+      // 3. Insertion complémentaire facultative dans la table administrateurs si elle existe dans Supabase
+      try {
+        await client.query(
+          `INSERT INTO administrateurs (user_id, nom, prenoms, email, role, permissions)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT DO NOTHING`,
+          [createdUser.id, nom.trim().toUpperCase(), prenoms.trim(), email.trim().toLowerCase(), subRole, JSON.stringify(permissionsObj)]
+        );
+      } catch (_) {
+        // Table administrateurs optionnelle
+      }
+
+      await client.query('COMMIT');
+    } catch (dbErr) {
+      if (client) try { await client.query('ROLLBACK'); } catch (_) {}
+      console.warn('Direct PG failed in createMembre, fallback to Supabase SDK:', dbErr.message);
+
+      if (supabase && typeof supabase.from === 'function') {
+        const { data: userSup, error: errSup } = await supabase.from('users').insert([{
+          nom: nom.trim().toUpperCase(),
+          prenoms: prenoms.trim(),
+          email: email.trim().toLowerCase(),
+          mot_de_passe: hashedPassword,
+          role: 'admin',
+          admin_sub_role: subRole,
+          statut: 'actif'
+        }]).select().single();
+
+        if (errSup) return res.status(500).json({ success: false, message: errSup.message });
+        createdUser = userSup;
+
+        await supabase.from('membres').insert([{
+          user_id: createdUser.id,
+          permissions: permissionsObj
+        }]);
+      }
+    } finally {
+      if (client) client.release();
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: 'Administrateur créé avec succès en base de données.',
+      data: {
+        id: createdUser.id,
+        nom: createdUser.nom,
+        prenoms: createdUser.prenoms,
+        email: createdUser.email,
+        role: createdUser.admin_sub_role || subRole,
+        admin_sub_role: subRole,
+        droits: permissionsObj,
+        actif: true,
+      },
+    });
+  } catch (err) {
+    console.error('createMembre error:', err);
+    return res.status(500).json({ success: false, message: 'Erreur serveur lors de la création.' });
+  }
+};
+
+// ── PATCH /api/membres/:id/permissions — Modifier les droits ─────────────────
+const updatePermissions = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { permissions, role } = req.body;
+
+    try {
+      await pool.query(
+        `INSERT INTO membres (user_id, permissions)
+         VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET permissions = $2`,
+        [id, JSON.stringify(permissions || {})]
+      );
+
+      if (role) {
+        await pool.query('UPDATE users SET admin_sub_role = $1 WHERE id = $2', [role, id]);
+      }
+    } catch (dbErr) {
+      if (supabase && typeof supabase.from === 'function') {
+        await supabase.from('membres').upsert({ user_id: id, permissions: permissions || {} });
+        if (role) await supabase.from('users').update({ admin_sub_role: role }).eq('id', id);
+      }
+    }
+
+    return res.status(200).json({ success: true, message: 'Permissions mises à jour en base de données.' });
+  } catch (err) {
+    console.error('updatePermissions error:', err);
+    return res.status(500).json({ success: false, message: 'Erreur serveur.' });
+  }
+};
+
+// ── DELETE /api/membres/:id — Supprimer un administrateur ────────────────────
+const deleteMembre = async (req, res) => {
+  try {
+    const { id } = req.params;
+    try {
+      await pool.query('DELETE FROM users WHERE id = $1', [id]);
+    } catch (dbErr) {
+      if (supabase && typeof supabase.from === 'function') {
+        await supabase.from('users').delete().eq('id', id);
+      }
+    }
+    return res.status(200).json({ success: true, message: 'Membre supprimé de la base de données.' });
+  } catch (err) {
+    console.error('deleteMembre error:', err);
+    return res.status(500).json({ success: false, message: 'Erreur lors de la suppression.' });
+  }
+};
+
+module.exports = {
+  getAllMembres,
+  createMembre,
+  updatePermissions,
+  deleteMembre,
+};

@@ -18,6 +18,7 @@ const login = async (req, res) => {
 
     try {
       if (matricule) {
+        const matClean = matricule.trim().toLowerCase();
         const r = await pool.query(
           `SELECT u.*, e.filiere_id, e.premierefois,
                   COALESCE(e.filiere_nom, u.filiere_nom) AS filiere,
@@ -25,8 +26,8 @@ const login = async (req, res) => {
                   COALESCE(e.email, u.email) AS email_etudiant,
                   COALESCE(e.tel, u.tel) AS tel_etudiant
            FROM users u LEFT JOIN etudiants e ON u.id = e.user_id
-           WHERE u.matricule = $1`,
-          [matricule.trim().toUpperCase()]
+           WHERE LOWER(u.matricule) = $1 OR LOWER(u.email) = $1`,
+          [matClean]
         );
         user = r.rows[0];
       } else if (nom && tel) {
@@ -43,7 +44,8 @@ const login = async (req, res) => {
       if (supabase && typeof supabase.from === 'function') {
         let query = supabase.from('users').select('*');
         if (matricule) {
-          query = query.eq('matricule', matricule.trim().toUpperCase());
+          const matClean = matricule.trim().toLowerCase();
+          query = query.or(`matricule.ilike.${matClean},email.ilike.${matClean}`);
         } else if (nom && tel) {
           query = query.ilike('nom', nom.trim()).eq('tel', tel.trim());
         }

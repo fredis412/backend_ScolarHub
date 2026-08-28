@@ -8,7 +8,7 @@ const getAllMembres = async (req, res) => {
     let membres = [];
     try {
       const r = await pool.query(
-        `SELECT u.id, u.nom, u.prenoms, u.email, u.role, u.admin_sub_role, u.statut,
+        `SELECT u.id, u.nom, u.prenoms, u.email, u.tel, u.role, u.admin_sub_role, u.statut,
                 COALESCE(m.permissions, '{}'::jsonb) AS permissions,
                 u.created_at
          FROM users u
@@ -22,7 +22,7 @@ const getAllMembres = async (req, res) => {
       if (supabase && typeof supabase.from === 'function') {
         const { data, error } = await supabase
           .from('users')
-          .select('id, nom, prenoms, email, role, admin_sub_role, statut, permissions, created_at')
+          .select('id, nom, prenoms, email, tel, role, admin_sub_role, statut, permissions, created_at')
           .or('role.eq.admin,role.eq.admi');
         if (!error && data) membres = data;
       }
@@ -35,6 +35,8 @@ const getAllMembres = async (req, res) => {
         nom: m.nom || '',
         prenoms: m.prenoms || '',
         email: m.email || '',
+        tel: m.tel || '',
+        numero: m.tel || '',
         role: m.admin_sub_role || m.role || 'super_admin',
         admin_sub_role: m.admin_sub_role || 'super_admin',
         droits: typeof m.permissions === 'string' ? JSON.parse(m.permissions) : (m.permissions || {}),
@@ -52,12 +54,13 @@ const getAllMembres = async (req, res) => {
 const createMembre = async (req, res) => {
   let client;
   try {
-    const { nom, prenoms, email, motDePasse, role, admin_sub_role, permissions } = req.body;
+    const { nom, prenoms, email, tel, telephone, numero, motDePasse, role, admin_sub_role, permissions } = req.body;
 
     if (!nom || !email) {
       return res.status(400).json({ success: false, message: 'Nom et Email sont requis.' });
     }
 
+    const telFinal = tel || telephone || numero || null;
     const pass = motDePasse || 'Admin1234!';
     const hashedPassword = await bcrypt.hash(pass, 10);
     const subRole = admin_sub_role || role || 'scolarite';
@@ -82,10 +85,10 @@ const createMembre = async (req, res) => {
 
       // 1. Insertion dans la table users
       const userRes = await client.query(
-        `INSERT INTO users (matricule, nom, prenoms, email, mot_de_passe, role, admin_sub_role, statut)
-         VALUES ($1, $2, $3, $4, $5, 'admin', $6, 'actif')
-         RETURNING id, matricule, nom, prenoms, email, role, admin_sub_role`,
-        [matricule, nom.trim().toUpperCase(), prenoms.trim(), email.trim().toLowerCase(), hashedPassword, subRole]
+        `INSERT INTO users (matricule, nom, prenoms, email, tel, mot_de_passe, role, admin_sub_role, statut)
+         VALUES ($1, $2, $3, $4, $5, $6, 'admin', $7, 'actif')
+         RETURNING id, matricule, nom, prenoms, email, tel, role, admin_sub_role`,
+        [matricule, nom.trim().toUpperCase(), prenoms.trim(), email.trim().toLowerCase(), telFinal, hashedPassword, subRole]
       );
       createdUser = userRes.rows[0];
 

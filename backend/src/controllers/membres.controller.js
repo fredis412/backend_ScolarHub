@@ -9,12 +9,11 @@ const getAllMembres = async (req, res) => {
     try {
       const r = await pool.query(
         `SELECT u.id, u.nom, u.prenoms, u.email, u.tel, u.role, u.admin_sub_role, u.statut,
-                COALESCE(m.permissions, '{}'::jsonb) AS permissions,
-                u.created_at
+                COALESCE(m.permissions, '{}'::jsonb) AS permissions
          FROM users u
          LEFT JOIN membres m ON u.id = m.user_id
          WHERE u.role = 'admin' OR u.role = 'admi' OR u.role = 'administrator'
-         ORDER BY u.created_at DESC`
+         ORDER BY u.nom`
       );
       membres = r.rows;
     } catch (dbErr) {
@@ -22,7 +21,7 @@ const getAllMembres = async (req, res) => {
       if (supabase && typeof supabase.from === 'function') {
         const { data, error } = await supabase
           .from('users')
-          .select('id, nom, prenoms, email, tel, role, admin_sub_role, statut, permissions, created_at')
+          .select('id, nom, prenoms, email, tel, role, admin_sub_role, statut, permissions')
           .or('role.eq.admin,role.eq.admi');
         if (!error && data) membres = data;
       }
@@ -100,11 +99,11 @@ const createMembre = async (req, res) => {
         [createdUser.id, JSON.stringify(permissionsObj)]
       );
 
-      // 3. Insertion dans la table administrateurs
+      // 3. Insertion dans la table administrateurs (sans colonne 'role' qui n'existe pas)
       try {
         await client.query(
-          `INSERT INTO administrateurs (user_id, nom, prenoms, email, tel, role, admin_sub_role, permissions, statut)
-           VALUES ($1, $2, $3, $4, $5, $6, $6, $7, 'actif')
+          `INSERT INTO administrateurs (user_id, nom, prenoms, email, tel, admin_sub_role, permissions, statut)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'actif')
            ON CONFLICT (user_id) DO UPDATE SET
              nom = EXCLUDED.nom, prenoms = EXCLUDED.prenoms,
              email = EXCLUDED.email, tel = EXCLUDED.tel,
@@ -114,20 +113,6 @@ const createMembre = async (req, res) => {
         );
       } catch (admErr) {
         console.warn('[createMembre] Insertion dans administrateurs échouée:', admErr.message);
-        // Tentative alternative sans colonne tel (si la table n'a pas cette colonne)
-        try {
-          await client.query(
-            `INSERT INTO administrateurs (user_id, nom, prenoms, email, role, admin_sub_role, permissions, statut)
-             VALUES ($1, $2, $3, $4, $5, $5, $6, 'actif')
-             ON CONFLICT (user_id) DO UPDATE SET
-               nom = EXCLUDED.nom, prenoms = EXCLUDED.prenoms,
-               email = EXCLUDED.email, admin_sub_role = EXCLUDED.admin_sub_role,
-               permissions = EXCLUDED.permissions`,
-            [createdUser.id, nom.trim().toUpperCase(), prenoms?.trim() || '', email.trim().toLowerCase(), subRole, JSON.stringify(permissionsObj)]
-          );
-        } catch (admErr2) {
-          console.warn('[createMembre] Insertion administrateurs (fallback):', admErr2.message);
-        }
       }
 
       await client.query('COMMIT');
@@ -156,14 +141,13 @@ const createMembre = async (req, res) => {
           permissions: permissionsObj
         }]);
 
-        // Insertion dans administrateurs via Supabase SDK
+        // Insertion dans administrateurs via Supabase SDK (sans colonne 'role')
         const { error: admSupErr } = await supabase.from('administrateurs').upsert([{
           user_id: createdUser.id,
           nom: nom.trim().toUpperCase(),
           prenoms: prenoms?.trim() || '',
           email: email.trim().toLowerCase(),
           tel: telFinal,
-          role: 'admin',
           admin_sub_role: subRole,
           permissions: permissionsObj,
           statut: 'actif',

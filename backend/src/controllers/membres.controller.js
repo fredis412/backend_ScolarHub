@@ -100,16 +100,34 @@ const createMembre = async (req, res) => {
         [createdUser.id, JSON.stringify(permissionsObj)]
       );
 
-      // 3. Insertion complémentaire facultative dans la table administrateurs si elle existe dans Supabase
+      // 3. Insertion dans la table administrateurs
       try {
         await client.query(
-          `INSERT INTO administrateurs (user_id, nom, prenoms, email, role, permissions)
-           VALUES ($1, $2, $3, $4, $5, $6)
-           ON CONFLICT DO NOTHING`,
-          [createdUser.id, nom.trim().toUpperCase(), prenoms.trim(), email.trim().toLowerCase(), subRole, JSON.stringify(permissionsObj)]
+          `INSERT INTO administrateurs (user_id, nom, prenoms, email, tel, role, admin_sub_role, permissions, statut)
+           VALUES ($1, $2, $3, $4, $5, $6, $6, $7, 'actif')
+           ON CONFLICT (user_id) DO UPDATE SET
+             nom = EXCLUDED.nom, prenoms = EXCLUDED.prenoms,
+             email = EXCLUDED.email, tel = EXCLUDED.tel,
+             admin_sub_role = EXCLUDED.admin_sub_role,
+             permissions = EXCLUDED.permissions`,
+          [createdUser.id, nom.trim().toUpperCase(), prenoms?.trim() || '', email.trim().toLowerCase(), telFinal, subRole, JSON.stringify(permissionsObj)]
         );
-      } catch (_) {
-        // Table administrateurs optionnelle
+      } catch (admErr) {
+        console.warn('[createMembre] Insertion dans administrateurs échouée:', admErr.message);
+        // Tentative alternative sans colonne tel (si la table n'a pas cette colonne)
+        try {
+          await client.query(
+            `INSERT INTO administrateurs (user_id, nom, prenoms, email, role, admin_sub_role, permissions, statut)
+             VALUES ($1, $2, $3, $4, $5, $5, $6, 'actif')
+             ON CONFLICT (user_id) DO UPDATE SET
+               nom = EXCLUDED.nom, prenoms = EXCLUDED.prenoms,
+               email = EXCLUDED.email, admin_sub_role = EXCLUDED.admin_sub_role,
+               permissions = EXCLUDED.permissions`,
+            [createdUser.id, nom.trim().toUpperCase(), prenoms?.trim() || '', email.trim().toLowerCase(), subRole, JSON.stringify(permissionsObj)]
+          );
+        } catch (admErr2) {
+          console.warn('[createMembre] Insertion administrateurs (fallback):', admErr2.message);
+        }
       }
 
       await client.query('COMMIT');
@@ -120,8 +138,9 @@ const createMembre = async (req, res) => {
       if (supabase && typeof supabase.from === 'function') {
         const { data: userSup, error: errSup } = await supabase.from('users').insert([{
           nom: nom.trim().toUpperCase(),
-          prenoms: prenoms.trim(),
+          prenoms: prenoms?.trim() || '',
           email: email.trim().toLowerCase(),
+          tel: telFinal,
           mot_de_passe: hashedPassword,
           role: 'admin',
           admin_sub_role: subRole,
@@ -131,10 +150,28 @@ const createMembre = async (req, res) => {
         if (errSup) return res.status(500).json({ success: false, message: errSup.message });
         createdUser = userSup;
 
+        // Insertion dans membres
         await supabase.from('membres').insert([{
           user_id: createdUser.id,
           permissions: permissionsObj
         }]);
+
+        // Insertion dans administrateurs via Supabase SDK
+        const { error: admSupErr } = await supabase.from('administrateurs').upsert([{
+          user_id: createdUser.id,
+          nom: nom.trim().toUpperCase(),
+          prenoms: prenoms?.trim() || '',
+          email: email.trim().toLowerCase(),
+          tel: telFinal,
+          role: 'admin',
+          admin_sub_role: subRole,
+          permissions: permissionsObj,
+          statut: 'actif',
+        }], { onConflict: 'user_id' });
+
+        if (admSupErr) {
+          console.warn('[createMembre] Supabase administrateurs upsert error:', admSupErr.message);
+        }
       }
     } finally {
       if (client) client.release();

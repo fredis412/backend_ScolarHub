@@ -18,11 +18,21 @@ const ws = require('ws');
 let _supabase = null;
 function getSupabase() {
   if (!_supabase) {
-    _supabase = createClient(
-      process.env.SUPABASE_URL,
-      process.env.SUPABASE_SERVICE_KEY,
-      { realtime: { transport: ws } }
-    );
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_KEY ||
+                process.env.SUPABASE_SECRET_KEY ||
+                process.env.SUPABASE_ANON_KEY ||
+                process.env.SUPABASE_KEY ||
+                process.env.SUPABASE_PUBLISHABLE_KEY;
+
+    if (!url || !key) {
+      throw new Error(
+        '[DB Config] SUPABASE_URL ou la cle Supabase (SUPABASE_SERVICE_KEY / SUPABASE_ANON_KEY) ' +
+        'est manquante dans les variables d\'environnement Render.'
+      );
+    }
+
+    _supabase = createClient(url, key, { realtime: { transport: ws } });
   }
   return _supabase;
 }

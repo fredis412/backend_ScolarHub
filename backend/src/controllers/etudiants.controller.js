@@ -52,6 +52,84 @@ const mapRowToEtudiant = (row) => ({
   premiereFois: row.premierefois ?? true,
 });
 
+// ── Intégrer automatiquement un étudiant dans le groupe filière ───────────────
+const integrerDansGroupeFiliere = async (client, userId, filiereId, filiere, matricule) => {
+  try {
+    // 1. Vérifier si le groupe filière existe, sinon le créer
+    let groupeRes = await client.query(
+      `SELECT id FROM groupes WHERE filiere_id = $1 AND type = 'filiere' LIMIT 1`,
+      [filiereId]
+    );
+
+    let groupeId;
+    if (groupeRes.rows.length === 0) {
+      // Créer le groupe filière
+      const newGroupe = await client.query(
+        `INSERT INTO groupes (nom, type, filiere_id, description, created_at)
+         VALUES ($1, 'filiere', $2, $3, NOW())
+         RETURNING id`,
+        [
+          `Groupe ${filiere}`,
+          filiereId,
+          `Groupe officiel de la filière ${filiere}`
+        ]
+      );
+      groupeId = newGroupe.rows[0].id;
+      console.log(`[integrerDansGroupeFiliere] Groupe filière créé: ${groupeId}`);
+    } else {
+      groupeId = groupeRes.rows[0].id;
+    }
+
+    // 2. Vérifier si le groupe admin-filière existe, sinon le créer
+    let groupeAdminRes = await client.query(
+      `SELECT id FROM groupes WHERE filiere_id = $1 AND type = 'admin_filiere' LIMIT 1`,
+      [filiereId]
+    );
+
+    let groupeAdminId;
+    if (groupeAdminRes.rows.length === 0) {
+      const newGroupeAdmin = await client.query(
+        `INSERT INTO groupes (nom, type, filiere_id, description, created_at)
+         VALUES ($1, 'admin_filiere', $2, $3, NOW())
+         RETURNING id`,
+        [
+          `Admin - ${filiere}`,
+          filiereId,
+          `Canal Administration pour la filière ${filiere}`
+        ]
+      );
+      groupeAdminId = newGroupeAdmin.rows[0].id;
+      console.log(`[integrerDansGroupeFiliere] Groupe admin-filière créé: ${groupeAdminId}`);
+    } else {
+      groupeAdminId = groupeAdminRes.rows[0].id;
+    }
+
+    // 3. Ajouter l'étudiant dans le groupe filière
+    await client.query(
+      `INSERT INTO groupe_membres (groupe_id, user_id, role, joined_at)
+       VALUES ($1, $2, 'membre', NOW())
+       ON CONFLICT (groupe_id, user_id) DO NOTHING`,
+      [groupeId, userId]
+    );
+
+    // 4. Ajouter l'étudiant dans le groupe admin-filière
+    await client.query(
+      `INSERT INTO groupe_membres (groupe_id, user_id, role, joined_at)
+       VALUES ($1, $2, 'membre', NOW())
+       ON CONFLICT (groupe_id, user_id) DO NOTHING`,
+      [groupeAdminId, userId]
+    );
+
+    console.log(`[integrerDansGroupeFiliere] Étudiant ${matricule} intégré dans groupes ${groupeId} et ${groupeAdminId}`);
+    return { groupeId, groupeAdminId };
+  } catch (err) {
+    // Ne pas bloquer l'inscription si l'intégration échoue
+    console.error('[integrerDansGroupeFiliere] Erreur (non bloquante):', err.message);
+    return null;
+  }
+};
+
+// ── GET /api/etudiants ────────────────────────────────────────────────────────
 const listEtudiants = async (req, res) => {
   try {
     const result = await pool.query(`
@@ -90,6 +168,7 @@ const listEtudiants = async (req, res) => {
   }
 };
 
+// ── POST /api/etudiants ───────────────────────────────────────────────────────
 const inscrireEtudiant = async (req, res) => {
   let client;
   try {
@@ -192,11 +271,15 @@ const inscrireEtudiant = async (req, res) => {
       ]
     );
 
+    // ── INTÉGRATION AUTOMATIQUE DANS LE GROUPE FILIÈRE ────────────────────────
+    let groupesInfo = null;
+    if (filiereId) {
+      groupesInfo = await integrerDansGroupeFiliere(client, userId, filiereId, filiere.trim(), matricule);
+    }
+
     await client.query('COMMIT');
 
-    // Notification best-effort (SMS + Email) : n'interrompt jamais l'inscription.
-    // L'email n'est envoyé que si l'admin a fourni une vraie adresse (pas le
-    // placeholder auto @ist.bf).
+    // Notification best-effort
     let notifications = { sms: { envoye: false }, email: { envoye: false } };
     try {
       notifications = await notifierInscription({
@@ -215,6 +298,7 @@ const inscrireEtudiant = async (req, res) => {
       success: true,
       matricule,
       notifications,
+      groupes: groupesInfo,
       etudiant: {
         id: etuRes.rows[0].id,
         userId,
@@ -251,6 +335,7 @@ const inscrireEtudiant = async (req, res) => {
   }
 };
 
+// ── POST /api/etudiants/finaliser ─────────────────────────────────────────────
 const finaliserPremiereConnexion = async (req, res) => {
   const { matricule, id, email, telephone, password } = req.body;
   try {
@@ -258,7 +343,6 @@ const finaliserPremiereConnexion = async (req, res) => {
       return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 4 caractères.' });
     }
 
-    // Trouver l'utilisateur
     let userRow = null;
     if (matricule) {
       const r = await pool.query(
@@ -290,13 +374,11 @@ const finaliserPremiereConnexion = async (req, res) => {
 
     const hashed = await bcrypt.hash(password, 10);
 
-    // Mettre à jour users
     await pool.query(
       'UPDATE users SET mot_de_passe = $1, email = COALESCE($2, email), tel = COALESCE($3, tel) WHERE id = $4',
       [hashed, email || null, telephone || null, userRow.id]
     );
 
-    // Mettre à jour etudiants si la ligne existe
     if (userRow.etudiant_id) {
       await pool.query(
         'UPDATE etudiants SET premierefois = false, email = COALESCE($1, email), tel = COALESCE($2, tel) WHERE id = $3',
@@ -304,7 +386,6 @@ const finaliserPremiereConnexion = async (req, res) => {
       );
     }
 
-    // Générer un token JWT
     const token = jwt.sign(
       { id: userRow.id, matricule: userRow.matricule, role: userRow.role, filiere_id: userRow.filiere_id },
       process.env.JWT_SECRET,

@@ -29,19 +29,23 @@ const getAllMembres = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      data: membres.map((m) => ({
-        id: m.id,
-        nom: m.nom || '',
-        prenoms: m.prenoms || '',
-        email: m.email || '',
-        tel: m.tel || '',
-        numero: m.tel || '',
-        role: m.admin_sub_role || m.role || 'super_admin',
-        admin_sub_role: m.admin_sub_role || 'super_admin',
-        droits: typeof m.permissions === 'string' ? JSON.parse(m.permissions) : (m.permissions || {}),
-        actif: m.statut !== 'suspendu' && m.statut !== 'renvoye',
-        dateCreation: m.created_at ? new Date(m.created_at).toLocaleDateString('fr-FR') : '01/01/2026',
-      })),
+      data: membres.map((m) => {
+        const permissionsParsed = typeof m.permissions === 'string' ? JSON.parse(m.permissions) : (m.permissions || {});
+        return {
+          id: m.id,
+          nom: m.nom || '',
+          prenoms: m.prenoms || '',
+          email: m.email || '',
+          tel: m.tel || '',
+          numero: m.tel || '',
+          role: m.admin_sub_role || m.role || 'super_admin',
+          admin_sub_role: m.admin_sub_role || 'super_admin',
+          domaine: m.domaine || permissionsParsed.domaine || 'Tous',
+          droits: permissionsParsed,
+          actif: m.statut !== 'suspendu' && m.statut !== 'renvoye',
+          dateCreation: m.created_at ? new Date(m.created_at).toLocaleDateString('fr-FR') : '01/01/2026',
+        };
+      }),
     });
   } catch (err) {
     console.error('getAllMembres error:', err);
@@ -53,17 +57,18 @@ const getAllMembres = async (req, res) => {
 const createMembre = async (req, res) => {
   let client;
   try {
-    const { nom, prenoms, email, tel, telephone, numero, motDePasse, role, admin_sub_role, permissions } = req.body;
+    const { nom, prenoms, email, tel, telephone, numero, motDePasse, role, admin_sub_role, domaine, permissions } = req.body;
 
-    if (!nom || !email) {
-      return res.status(400).json({ success: false, message: 'Nom et Email sont requis.' });
+    if (!nom || !email || !motDePasse) {
+      return res.status(400).json({ success: false, message: 'Nom, Email et Mot de passe sont requis.' });
     }
 
     const telFinal = tel || telephone || numero || null;
-    const pass = motDePasse || 'Admin1234!';
+    const pass = motDePasse;
     const hashedPassword = await bcrypt.hash(pass, 10);
     const subRole = admin_sub_role || role || 'scolarite';
-    const permissionsObj = permissions || {};
+    const domaineFinal = domaine || 'Tous';
+    const permissionsObj = { ...(permissions || {}), domaine: domaineFinal };
 
     let createdUser = null;
 
@@ -171,6 +176,7 @@ const createMembre = async (req, res) => {
         email: createdUser.email,
         role: createdUser.admin_sub_role || subRole,
         admin_sub_role: subRole,
+        domaine: domaineFinal,
         droits: permissionsObj,
         actif: true,
       },

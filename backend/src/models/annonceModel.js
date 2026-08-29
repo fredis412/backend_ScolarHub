@@ -16,7 +16,9 @@ const AnnonceModel = {
 
       // Filtrer par filière si fournie
       if (filters.filiere) {
-        query = query.eq('filiere', filters.filiere);
+        query = filters.includeGlobal
+          ? query.or(`filiere.eq.${filters.filiere},filiere.is.null`)
+          : query.eq('filiere', filters.filiere);
       }
 
       // Filtrer par niveau si fourni

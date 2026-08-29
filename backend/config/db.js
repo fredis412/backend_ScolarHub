@@ -1,19 +1,26 @@
-const { Pool } = require('pg');
+﻿const { Pool } = require('pg');
 require('dotenv').config();
 
 const pool = new Pool({
-  user:     process.env.DB_USER || process.env.user,
-  host:     process.env.DB_HOST || process.env.host,
-  database: process.env.DB_NAME || process.env.database,
-  password: process.env.DB_PASS || process.env.DB_PASSWORD,
-  port:     parseInt(process.env.DB_PORT || process.env.port) || 5432,
-  ssl:      { rejectUnauthorized: false },
+  user:     process.env.DB_USER,
+  host:     process.env.DB_HOST,
+  database: process.env.DB_NAME || 'postgres',
+  password: process.env.DB_PASS,
+  port:     parseInt(process.env.DB_PORT) || 5432,
+  ssl: false,
+  keepAlive: true,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+  max: 5,
 });
 
-pool.on('connect', () => {
-  console.log('Connected to the database');
+pool.on('error', (err) => {
+  console.error('Erreur pool PostgreSQL:', err.message);
 });
 
-module.exports = {
-  query: (text, params) => pool.query(text, params),
-};
+pool.connect((err, client, release) => {
+  if (err) console.error('Erreur connexion PostgreSQL :', err.message);
+  else { console.log('Connecte a PostgreSQL — scolarhub'); release(); }
+});
+
+module.exports = pool;

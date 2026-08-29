@@ -1,17 +1,26 @@
-﻿const db = require('../config/db');
+const db = require('../config/db');
 const bcrypt = require('bcryptjs');
 
 // ── Générer un matricule unique PROF-XXXX ─────────────────────────────────────
 const genMatricule = async () => {
   const year = new Date().getFullYear().toString().slice(-2);
-  let matricule;
-  let exists = true;
-  while (exists) {
-    const num = Math.floor(1000 + Math.random() * 9000);
-    matricule = `PROF-${year}${num}`;
-    const check = await db.query('SELECT id FROM users WHERE matricule = $1', [matricule]);
-    exists = check.rows.length > 0;
+  
+  // Compter le nombre de profs existants pour le numéro croissant
+  const countRes = await db.query(
+    "SELECT COUNT(*)::int AS c FROM users WHERE role = 'professeur'"
+  );
+  const num = (countRes.rows[0].c + 1).toString().padStart(4, '0');
+  
+  let matricule = `${year}PROF-${num}`;
+  
+  // Vérifier l'unicité
+  const check = await db.query('SELECT id FROM users WHERE matricule = $1', [matricule]);
+  if (check.rows.length > 0) {
+    // Si existe déjà, incrémenter
+    const nextNum = (countRes.rows[0].c + 2).toString().padStart(4, '0');
+    matricule = `${year}PROF-${nextNum}`;
   }
+  
   return matricule;
 };
 
@@ -92,34 +101,22 @@ exports.createProfesseur = async (req, res) => {
   if (!nom || !prenoms || !tel) {
     return res.status(400).json({ error: 'nom, prenoms et tel sont obligatoires.' });
   }
-  const client = await db.connect();
   try {
-    await client.query('BEGIN');
-
     const matricule = await genMatricule();
-    const motDePasse = await bcrypt.hash(tel.trim(), 10);
-
-    // 1. Insérer dans users
-    const userRes = await client.query(
-      `INSERT INTO users (nom, prenoms, matricule, email, tel, role, domaine, statut, mot_de_passe)
-       VALUES ($1, $2, $3, $4, $5, 'professeur', $6, 'actif', $7)
+    // Pas de mot de passe à la création — le prof le créera à sa première connexion
+    const result = await db.query(
+      `INSERT INTO users (nom, prenoms, matricule, email, tel, role, domaine, statut)
+       VALUES ($1, $2, $3, $4, $5, 'professeur', $6, 'actif')
        RETURNING id, nom, prenoms, matricule, email, tel, role, domaine, statut`,
       [nom.trim().toUpperCase(), prenoms.trim(), matricule,
-       email?.trim() || null, tel.trim(), domaine?.trim() || null, motDePasse]
+       email?.trim() || null, tel.trim(), domaine?.trim() || null]
     );
-    const user = userRes.rows[0];
+    const user = result.rows[0];
 
-    // 2. Insérer dans professeurs
-    await client.query(
-      `INSERT INTO professeurs (user_id, matricule, prenom, numero, specialite)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [user.id, matricule, prenoms.trim(), tel.trim(), domaine?.trim() || null]
-    );
-
-    // 3. Insérer les filières
+    // Insérer les filières assignées
     if (filieres_ids && filieres_ids.length > 0) {
       for (const filiereId of filieres_ids) {
-        await client.query(
+        await db.query(
           `INSERT INTO professeur_filieres (professeur_id, filiere_id)
            VALUES ($1, $2) ON CONFLICT DO NOTHING`,
           [user.id, filiereId]
@@ -127,27 +124,20 @@ exports.createProfesseur = async (req, res) => {
       }
     }
 
-    await client.query('COMMIT');
-
     res.status(201).json({
       message: 'Professeur créé avec succès.',
       professeur: user,
       identifiants: {
         matricule,
-        motDePasse: tel.trim(),
-        info: 'Le mot de passe par défaut est le numéro de téléphone.',
+        info: 'Le professeur devra créer son mot de passe à sa première connexion.',
       },
     });
   } catch (err) {
-    await client.query('ROLLBACK');
     console.error('createProfesseur:', err.message);
     if (err.code === '23505') return res.status(409).json({ error: 'Email ou matricule déjà utilisé.' });
     res.status(500).json({ error: err.message });
-  } finally {
-    client.release();
   }
 };
-
 // ── PUT /api/professeurs/:id ──────────────────────────────────────────────────
 exports.updateProfesseur = async (req, res) => {
   const { id } = req.params;

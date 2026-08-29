@@ -4,28 +4,22 @@
 // Usage : node seed_canaux.js
 // ============================================================
 
-const pool = require('./src/config/db');
+const supabase = require('./src/config/supabase');
 
 const CANAUX = [
   { id: 1, nom: 'Administration',        description: 'Annonces officielles de l\'administration', type: 'administration' },
   { id: 2, nom: 'Admin & Filière',       description: 'Échanges entre l\'administration et les délégués de filière', type: 'admin_filiere' },
   { id: 3, nom: 'Bureau des Étudiants',  description: 'Annonces et activités du BDE', type: 'bde' },
+  { id: 4, nom: 'Groupe Professeurs',    description: 'Échanges entre tous les professeurs de l’établissement', type: 'professeurs' },
 ];
 
 (async () => {
   try {
-    for (const c of CANAUX) {
-      const { rowCount } = await pool.query(
-        `INSERT INTO canaux (id, nom, description, type)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (id) DO NOTHING`,
-        [c.id, c.nom, c.description, c.type]
-      );
-      console.log(rowCount ? `Canal ${c.id} « ${c.nom} » créé.` : `Canal ${c.id} « ${c.nom} » existe déjà.`);
-    }
-    // Réaligner la séquence après insertion d'ids explicites
-    await pool.query(`SELECT setval(pg_get_serial_sequence('canaux', 'id'), (SELECT MAX(id) FROM canaux))`);
-    console.log('Terminé.');
+    const { error } = await supabase
+      .from('canaux')
+      .upsert(CANAUX, { onConflict: 'id', ignoreDuplicates: true });
+    if (error) throw error;
+    console.log('Canaux initialisés.');
     process.exit(0);
   } catch (err) {
     console.error('Erreur seed canaux :', err.message);

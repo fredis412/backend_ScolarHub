@@ -190,6 +190,30 @@ const listEtudiants = async (req, res) => {
         const countUsers = await pool.query("SELECT COUNT(*)::int AS count FROM users WHERE role = 'etudiant'");
         const countEtu = await pool.query("SELECT COUNT(*)::int AS count FROM etudiants");
         console.log(`[Diagnostic listEtudiants] Nombre dans 'users' (role=etudiant): ${countUsers.rows[0].count}, Nombre dans 'etudiants': ${countEtu.rows[0].count}`);
+        
+        return res.status(200).json([{
+          etudiant_id: 9999,
+          user_id: '00000000-0000-0000-0000-000000000000',
+          matricule: 'DB-STATUS',
+          nom: `USERS_ETU_${countUsers.rows[0].count}`,
+          prenoms: `TABLE_ETU_${countEtu.rows[0].count}`,
+          email: 'debug@ist.bf',
+          tel: '00000000',
+          statut: 'actif',
+          domaine: 'Tous',
+          niveau: 'Licence 1',
+          date_naissance: '',
+          nationalite: 'Burkinabè',
+          adresse: '',
+          nom_parent: '',
+          tel_parent: '',
+          email_parent: '',
+          etudiant_role: 'etudiant',
+          filiere_role: null,
+          filiere_id: 1,
+          premierefois: false,
+          filiere_nom: 'Diagnostic'
+        }]);
       } catch (diagErr) {
         console.error('[Diagnostic listEtudiants] Erreur lors du comptage:', diagErr.message);
       }

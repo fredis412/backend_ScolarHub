@@ -19,7 +19,7 @@ router.get('/:id', optionalAuth, annonceController.getAnnonceById);
 router.post(
   '/',
   authMiddleware,
-  requireRole('admin', 'professeur', 'etudiant'),
+  requireRole('admin', 'administrateur', 'administrator', 'admi', 'super_admin', 'professeur', 'etudiant'),
   annonceController.createAnnonce
 );
 

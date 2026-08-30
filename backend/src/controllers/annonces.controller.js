@@ -157,6 +157,8 @@ exports.createAnnonce = async (req, res) => {
 
     const newAnnonce = await AnnonceModel.create(annonceData);
 
+    if (newAnnonce && (newAnnonce.statut === 'publie' || annonceData.statut === 'publie')) {
+      syncAnnonceToCanalAndNotify(newAnnonce || annonceData, req.app);
     if (annonceData.statut === 'publie') {
       await notifierPublication(newAnnonce);
     }
@@ -175,6 +177,110 @@ exports.createAnnonce = async (req, res) => {
     });
   }
 };
+
+async function syncAnnonceToCanalAndNotify(annonce, app) {
+  try {
+    const io = app?.get('io');
+    let extra = '';
+    if (annonce.filiere_nom) extra += `\n\n📍 Filière : ${annonce.filiere_nom}`;
+    if (annonce.niveau) extra += `\n🎓 Niveau : ${annonce.niveau}`;
+
+    const messageContenu = `📢 **${annonce.titre}**\n\n${annonce.contenu}${extra}`;
+
+    let authorName = { nom: 'IST', prenoms: 'Administration' };
+    if (annonce.auteur) {
+      try {
+        const { rows } = await pool.query('SELECT nom, prenoms FROM users WHERE id = $1', [annonce.auteur]);
+        if (rows[0]) authorName = rows[0];
+      } catch (_) {}
+    }
+
+    const socketMsg = {
+      id: 'ann_' + annonce.id,
+      canal_id: 1,
+      canalId: 1,
+      auteur_id: annonce.auteur,
+      prenoms: authorName.prenoms || 'Administration',
+      nom: authorName.nom || 'IST',
+      contenu: messageContenu,
+      type: 'annonce',
+      created_at: new Date().toISOString(),
+      reactions: []
+    };
+
+    // 1. Récupérer les étudiants ciblés
+    try {
+      let notifQuery = `
+        SELECT u.id, u.filiere_nom, u.niveau, e.filiere_id as e_fid, e.filiere_nom as e_fnom, e.niveau as e_niv
+        FROM users u
+        LEFT JOIN etudiants e ON e.user_id = u.id
+        WHERE LOWER(COALESCE(u.role, 'etudiant')) IN ('etudiant', 'delegue', 'delegue_adjoint')
+      `;
+      const notifParams = [];
+      if (annonce.filiere) {
+        notifParams.push(annonce.filiere);
+        // Matcher: table etudiants (filiere_id), ou user.filiere_nom via acronyme ou nom complet
+        notifQuery += ` AND (
+          e.filiere_id = $${notifParams.length}
+          OR u.filiere_nom ILIKE (SELECT nom FROM filieres WHERE id = $${notifParams.length})
+          OR (u.filiere_nom = 'RIT' AND $${notifParams.length}::int = 1)
+          OR (u.filiere_nom = 'ELT' AND $${notifParams.length}::int = 2)
+          OR (u.filiere_nom = 'MC'  AND $${notifParams.length}::int = 3)
+          OR (u.filiere_nom = 'GCF' AND $${notifParams.length}::int = 4)
+          OR (u.filiere_nom = 'GC'  AND $${notifParams.length}::int = 5)
+          OR (u.filiere_nom = 'FC'  AND $${notifParams.length}::int = 6)
+        )`;
+      }
+      if (annonce.niveau) {
+        notifParams.push(annonce.niveau);
+        notifQuery += ` AND (
+          e.niveau = $${notifParams.length}
+          OR u.niveau = $${notifParams.length}
+          OR (u.niveau = 'L1' AND $${notifParams.length} = 'Licence 1')
+          OR (u.niveau = 'L2' AND $${notifParams.length} = 'Licence 2')
+          OR (u.niveau = 'L3' AND $${notifParams.length} = 'Licence 3')
+          OR (u.niveau = 'M1' AND $${notifParams.length} = 'Master 1')
+          OR (u.niveau = 'M2' AND $${notifParams.length} = 'Master 2')
+        )`;
+      }
+      const { rows: students } = await pool.query(notifQuery, notifParams);
+
+      if (io) {
+        if (!annonce.filiere && !annonce.niveau) {
+          // Annonce globale : diffuser à tout le canal
+          io.to('canal:1').emit('message:canal', socketMsg);
+        } else {
+          // Annonce ciblée : diffuser uniquement aux étudiants concernés
+          for (const s of students) {
+            io.to(`user:${s.id}`).emit('message:canal', socketMsg);
+          }
+          if (annonce.filiere) {
+            io.to(`filiere:${annonce.filiere}`).emit('message:canal', socketMsg);
+            io.to('canal:2').emit('message:canal', { ...socketMsg, canal_id: 2, canalId: 2 });
+          }
+        }
+
+        // Envoyer les notifications
+        for (const s of students) {
+          pool.query(
+            `INSERT INTO notifications (user_id, titre, corps, created_at) VALUES ($1, $2, $3, NOW())`,
+            [s.id, `Annonce : ${annonce.titre}`, annonce.contenu]
+          ).catch(() => {});
+
+          io.to(`user:${s.id}`).emit('notification', {
+            titre: `Annonce : ${annonce.titre}`,
+            corps: annonce.contenu,
+            created_at: new Date().toISOString(),
+          });
+        }
+      }
+    } catch (notifErr) {
+      console.warn('[syncAnnonce] Erreur notification/socket ciblé:', notifErr.message);
+    }
+  } catch (err) {
+    console.error('[syncAnnonceToCanalAndNotify] Erreur :', err);
+  }
+}
 
 // PUT /api/annonces/:id - Modifier une annonce
 exports.updateAnnonce = async (req, res) => {
@@ -223,6 +329,10 @@ exports.updateAnnonce = async (req, res) => {
     }
 
     const updatedAnnonce = await AnnonceModel.update(id, updateData);
+
+    if (updatedAnnonce && (updatedAnnonce.statut === 'publie' || updateData.statut === 'publie')) {
+      syncAnnonceToCanalAndNotify(updatedAnnonce || { ...annonce, ...updateData }, req.app);
+    }
 
     res.status(200).json({
       success: true,
@@ -311,6 +421,7 @@ exports.publishAnnonce = async (req, res) => {
 
     const publishedAnnonce = await AnnonceModel.publish(id);
 
+    syncAnnonceToCanalAndNotify(publishedAnnonce || { ...annonce, statut: 'publie' }, req.app);
     // Persister puis pousser la notification afin que le flux soit disponible
     // même pour les étudiants qui n'étaient pas connectés au moment du push.
     await notifierPublication(publishedAnnonce);

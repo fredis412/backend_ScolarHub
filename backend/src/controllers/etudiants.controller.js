@@ -184,48 +184,6 @@ const listEtudiants = async (req, res) => {
 
     const result = await pool.query(queryText, params);
     console.log('[listEtudiants] retour:', result.rows.length, 'étudiant(s)');
-    
-    if (result.rows.length === 0) {
-      try {
-        // 1. Nombre de comptes étudiants dans users
-        const countUsers = await pool.query("SELECT COUNT(*)::int AS count FROM users WHERE role = 'etudiant'");
-        // 2. Nombre de lignes dans etudiants
-        const countEtu = await pool.query("SELECT COUNT(*)::int AS count FROM etudiants");
-        // 3. Nombre d'orphelins (etudiants pointant vers aucun user)
-        const countOrphans = await pool.query("SELECT COUNT(*)::int AS count FROM etudiants e LEFT JOIN users u ON u.id = e.user_id WHERE u.id IS NULL");
-        // 4. Rôles des users liés dans la table etudiants
-        const rolesLinked = await pool.query("SELECT u.role, COUNT(*)::int AS count FROM etudiants e INNER JOIN users u ON u.id = e.user_id GROUP BY u.role");
-        
-        const rolesStr = rolesLinked.rows.map(r => `${r.role}:${r.count}`).join(', ') || 'aucun';
-        
-        return res.status(200).json([{
-          etudiant_id: 9999,
-          user_id: '00000000-0000-0000-0000-000000000000',
-          matricule: 'DIAGNOSTIC',
-          nom: `ORPHANS_${countOrphans.rows[0].count} ROLES_[${rolesStr}]`,
-          prenoms: `USERS_ETU_${countUsers.rows[0].count} TAB_ETU_${countEtu.rows[0].count}`,
-          email: 'debug@ist.bf',
-          tel: '00000000',
-          statut: 'actif',
-          domaine: 'Tous',
-          niveau: 'Licence 1',
-          date_naissance: '',
-          nationalite: 'Burkinabè',
-          adresse: '',
-          nom_parent: '',
-          tel_parent: '',
-          email_parent: '',
-          etudiant_role: 'etudiant',
-          filiere_role: null,
-          filiere_id: 1,
-          premierefois: false,
-          filiere_nom: 'Diagnostic'
-        }]);
-      } catch (diagErr) {
-        console.error('[Diagnostic listEtudiants] Erreur lors du comptage:', diagErr.message);
-      }
-    }
-
     return res.status(200).json(result.rows.map(mapRowToEtudiant));
   } catch (err) {
     console.error('[listEtudiants] ERREUR:', err.message);

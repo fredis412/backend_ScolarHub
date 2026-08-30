@@ -1,8 +1,9 @@
 const supabase = require('../config/supabase');
+const pool = require('../config/db');
 
 /**
  * Modèle de données pour les Annonces
- * Gère les interactions Supabase pour la table 'annonces'.
+ * Gère les interactions Supabase et PostgreSQL pour la table 'annonces'.
  */
 const AnnonceModel = {
   /**
@@ -10,10 +11,25 @@ const AnnonceModel = {
    */
   async findAll(filters = {}) {
     try {
-      let query = supabase
-        .from('annonces')
-        .select('*, users(id, nom, prenoms, role)');
+      if (supabase && typeof supabase.from === 'function') {
+        try {
+          let query = supabase
+            .from('annonces')
+            .select('*, users(id, nom, prenoms, role)');
 
+          if (filters.filiere) query = query.eq('filiere', filters.filiere);
+          if (filters.niveau) query = query.eq('niveau', filters.niveau);
+          if (filters.cibleRole) query = query.eq('cibleRole', filters.cibleRole);
+          if (filters.statut) query = query.eq('statut', filters.statut);
+
+          query = query.order('createdAt', { ascending: false });
+
+          if (filters.limit) query = query.limit(filters.limit);
+          if (filters.offset) query = query.offset(filters.offset);
+
+          const { data, error } = await query;
+          if (!error && data) return data;
+        } catch (_) {}
       // Filtrer par filière si fournie
       if (filters.filiere) {
         query = filters.includeGlobal
@@ -21,40 +37,44 @@ const AnnonceModel = {
           : query.eq('filiere', filters.filiere);
       }
 
-      // Filtrer par niveau si fourni
+      // Fallback PostgreSQL pool
+      let pgQuery = `
+        SELECT a.id, a.titre, a.contenu, a.filiere, a.filiere_nom, a.niveau, a."cibleRole", a.categorie, a.statut, a.fichiers, a.auteur,
+               COALESCE(a."createdAt", a."updatedAt", NOW()) AS "createdAt",
+               JSON_BUILD_OBJECT('id', u.id, 'nom', u.nom, 'prenoms', u.prenoms, 'role', u.role) AS users
+        FROM annonces a
+        LEFT JOIN users u ON u.id = a.auteur
+        WHERE 1=1
+      `;
+      const params = [];
+      if (filters.filiere) {
+        params.push(filters.filiere);
+        pgQuery += ` AND (a.filiere = $${params.length} OR a.filiere IS NULL)`;
+      }
       if (filters.niveau) {
-        query = query.eq('niveau', filters.niveau);
+        params.push(filters.niveau);
+        pgQuery += ` AND a.niveau = $${params.length}`;
       }
-
-      // Filtrer par rôle cible si fourni
       if (filters.cibleRole) {
-        query = query.eq('cibleRole', filters.cibleRole);
+        params.push(filters.cibleRole);
+        pgQuery += ` AND a."cibleRole" = $${params.length}`;
       }
-
-      // Filtrer par statut
       if (filters.statut) {
-        query = query.eq('statut', filters.statut);
+        params.push(filters.statut);
+        pgQuery += ` AND a.statut = $${params.length}`;
       }
-
-      // Ordonner par date de création (plus récentes d'abord)
-      query = query.order('createdAt', { ascending: false });
-
-      // Pagination
+      pgQuery += ` ORDER BY a."createdAt" DESC`;
       if (filters.limit) {
-        query = query.limit(filters.limit);
+        params.push(filters.limit);
+        pgQuery += ` LIMIT $${params.length}`;
       }
       if (filters.offset) {
-        query = query.offset(filters.offset);
+        params.push(filters.offset);
+        pgQuery += ` OFFSET $${params.length}`;
       }
 
-      const { data, error } = await query;
-
-      if (error) {
-        console.error('[AnnonceModel.findAll] Erreur :', error.message);
-        throw error;
-      }
-
-      return data;
+      const { rows } = await pool.query(pgQuery, params);
+      return rows;
     } catch (error) {
       console.error('[AnnonceModel.findAll] Erreur :', error);
       throw error;
@@ -66,18 +86,28 @@ const AnnonceModel = {
    */
   async findById(id) {
     try {
-      const { data, error } = await supabase
-        .from('annonces')
-        .select('*, users(id, nom, prenoms, role)')
-        .eq('id', id)
-        .single();
+      if (supabase && typeof supabase.from === 'function') {
+        try {
+          const { data, error } = await supabase
+            .from('annonces')
+            .select('*, users(id, nom, prenoms, role)')
+            .eq('id', id)
+            .single();
 
-      if (error) {
-        console.error('[AnnonceModel.findById] Erreur :', error.message);
-        throw error;
+          if (!error && data) return data;
+        } catch (_) {}
       }
 
-      return data;
+      const { rows } = await pool.query(
+        `SELECT a.id, a.titre, a.contenu, a.filiere, a.filiere_nom, a.niveau, a."cibleRole", a.categorie, a.statut, a.fichiers, a.auteur,
+                COALESCE(a."createdAt", a."updatedAt", NOW()) AS "createdAt",
+                JSON_BUILD_OBJECT('id', u.id, 'nom', u.nom, 'prenoms', u.prenoms, 'role', u.role) AS users
+         FROM annonces a
+         LEFT JOIN users u ON u.id = a.auteur
+         WHERE a.id = $1`,
+        [id]
+      );
+      return rows[0] || null;
     } catch (error) {
       console.error('[AnnonceModel.findById] Erreur :', error);
       throw error;
@@ -89,17 +119,35 @@ const AnnonceModel = {
    */
   async create(annonceData) {
     try {
-      const { data, error } = await supabase
-        .from('annonces')
-        .insert([annonceData])
-        .select();
+      if (supabase && typeof supabase.from === 'function') {
+        try {
+          const { data, error } = await supabase
+            .from('annonces')
+            .insert([annonceData])
+            .select();
 
-      if (error) {
-        console.error('[AnnonceModel.create] Erreur :', error.message);
-        throw error;
+          if (!error && data && data.length) return data[0];
+        } catch (_) {}
       }
 
-      return data[0];
+      const { rows } = await pool.query(
+        `INSERT INTO annonces (titre, contenu, filiere, filiere_nom, niveau, "cibleRole", categorie, statut, fichiers, auteur, "createdAt", "updatedAt")
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+         RETURNING *`,
+        [
+          annonceData.titre,
+          annonceData.contenu,
+          annonceData.filiere || null,
+          annonceData.filiere_nom || null,
+          annonceData.niveau || null,
+          annonceData.cibleRole || 'tous',
+          annonceData.categorie || null,
+          annonceData.statut || 'brouillon',
+          JSON.stringify(annonceData.fichiers || []),
+          annonceData.auteur || null,
+        ]
+      );
+      return rows[0];
     } catch (error) {
       console.error('[AnnonceModel.create] Erreur :', error);
       throw error;
@@ -111,18 +159,34 @@ const AnnonceModel = {
    */
   async update(id, annonceData) {
     try {
-      const { data, error } = await supabase
-        .from('annonces')
-        .update(annonceData)
-        .eq('id', id)
-        .select();
+      if (supabase && typeof supabase.from === 'function') {
+        try {
+          const { data, error } = await supabase
+            .from('annonces')
+            .update(annonceData)
+            .eq('id', id)
+            .select();
 
-      if (error) {
-        console.error('[AnnonceModel.update] Erreur :', error.message);
-        throw error;
+          if (!error && data && data.length) return data[0];
+        } catch (_) {}
       }
 
-      return data[0];
+      const sets = [];
+      const params = [id];
+      if (annonceData.titre) { params.push(annonceData.titre); sets.push(`titre = $${params.length}`); }
+      if (annonceData.contenu) { params.push(annonceData.contenu); sets.push(`contenu = $${params.length}`); }
+      if (annonceData.filiere !== undefined) { params.push(annonceData.filiere || null); sets.push(`filiere = $${params.length}`); }
+      if (annonceData.filiere_nom !== undefined) { params.push(annonceData.filiere_nom || null); sets.push(`filiere_nom = $${params.length}`); }
+      if (annonceData.niveau !== undefined) { params.push(annonceData.niveau || null); sets.push(`niveau = $${params.length}`); }
+      if (annonceData.cibleRole !== undefined) { params.push(annonceData.cibleRole); sets.push(`"cibleRole" = $${params.length}`); }
+      if (annonceData.statut !== undefined) { params.push(annonceData.statut); sets.push(`statut = $${params.length}`); }
+      sets.push(`"updatedAt" = NOW()`);
+
+      const { rows } = await pool.query(
+        `UPDATE annonces SET ${sets.join(', ')} WHERE id = $1 RETURNING *`,
+        params
+      );
+      return rows[0] || null;
     } catch (error) {
       console.error('[AnnonceModel.update] Erreur :', error);
       throw error;
@@ -134,18 +198,20 @@ const AnnonceModel = {
    */
   async delete(id) {
     try {
-      const { data, error } = await supabase
-        .from('annonces')
-        .delete()
-        .eq('id', id)
-        .select();
+      if (supabase && typeof supabase.from === 'function') {
+        try {
+          const { data, error } = await supabase
+            .from('annonces')
+            .delete()
+            .eq('id', id)
+            .select();
 
-      if (error) {
-        console.error('[AnnonceModel.delete] Erreur :', error.message);
-        throw error;
+          if (!error && data && data.length) return data[0];
+        } catch (_) {}
       }
 
-      return data[0];
+      const { rows } = await pool.query(`DELETE FROM annonces WHERE id = $1 RETURNING *`, [id]);
+      return rows[0] || null;
     } catch (error) {
       console.error('[AnnonceModel.delete] Erreur :', error);
       throw error;

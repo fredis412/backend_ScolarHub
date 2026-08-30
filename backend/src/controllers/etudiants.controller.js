@@ -184,6 +184,17 @@ const listEtudiants = async (req, res) => {
 
     const result = await pool.query(queryText, params);
     console.log('[listEtudiants] retour:', result.rows.length, 'étudiant(s)');
+    
+    if (result.rows.length === 0) {
+      try {
+        const countUsers = await pool.query("SELECT COUNT(*)::int AS count FROM users WHERE role = 'etudiant'");
+        const countEtu = await pool.query("SELECT COUNT(*)::int AS count FROM etudiants");
+        console.log(`[Diagnostic listEtudiants] Nombre dans 'users' (role=etudiant): ${countUsers.rows[0].count}, Nombre dans 'etudiants': ${countEtu.rows[0].count}`);
+      } catch (diagErr) {
+        console.error('[Diagnostic listEtudiants] Erreur lors du comptage:', diagErr.message);
+      }
+    }
+
     return res.status(200).json(result.rows.map(mapRowToEtudiant));
   } catch (err) {
     console.error('[listEtudiants] ERREUR:', err.message);

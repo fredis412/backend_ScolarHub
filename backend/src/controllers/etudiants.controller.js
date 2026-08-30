@@ -158,8 +158,8 @@ const listEtudiants = async (req, res) => {
         COALESCE(e.nom_parent, u.nom_parent) AS nom_parent,
         COALESCE(e.tel_parent, u.tel_parent) AS tel_parent,
         COALESCE(e.email_parent, u.email_parent) AS email_parent,
-        u.role AS etudiant_role,
-        NULL AS filiere_role,
+        u.etudiant_role,
+        u.filiere_role,
         e.filiere_id,
         e.premierefois,
         COALESCE(e.filiere_nom, f.nom) AS filiere_nom

@@ -187,16 +187,23 @@ const listEtudiants = async (req, res) => {
     
     if (result.rows.length === 0) {
       try {
+        // 1. Nombre de comptes étudiants dans users
         const countUsers = await pool.query("SELECT COUNT(*)::int AS count FROM users WHERE role = 'etudiant'");
+        // 2. Nombre de lignes dans etudiants
         const countEtu = await pool.query("SELECT COUNT(*)::int AS count FROM etudiants");
-        console.log(`[Diagnostic listEtudiants] Nombre dans 'users' (role=etudiant): ${countUsers.rows[0].count}, Nombre dans 'etudiants': ${countEtu.rows[0].count}`);
+        // 3. Nombre d'orphelins (etudiants pointant vers aucun user)
+        const countOrphans = await pool.query("SELECT COUNT(*)::int AS count FROM etudiants e LEFT JOIN users u ON u.id = e.user_id WHERE u.id IS NULL");
+        // 4. Rôles des users liés dans la table etudiants
+        const rolesLinked = await pool.query("SELECT u.role, COUNT(*)::int AS count FROM etudiants e INNER JOIN users u ON u.id = e.user_id GROUP BY u.role");
+        
+        const rolesStr = rolesLinked.rows.map(r => `${r.role}:${r.count}`).join(', ') || 'aucun';
         
         return res.status(200).json([{
           etudiant_id: 9999,
           user_id: '00000000-0000-0000-0000-000000000000',
-          matricule: 'DB-STATUS',
-          nom: `USERS_ETU_${countUsers.rows[0].count}`,
-          prenoms: `TABLE_ETU_${countEtu.rows[0].count}`,
+          matricule: 'DIAGNOSTIC',
+          nom: `ORPHANS_${countOrphans.rows[0].count} ROLES_[${rolesStr}]`,
+          prenoms: `USERS_ETU_${countUsers.rows[0].count} TAB_ETU_${countEtu.rows[0].count}`,
           email: 'debug@ist.bf',
           tel: '00000000',
           statut: 'actif',

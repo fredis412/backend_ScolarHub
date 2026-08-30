@@ -17,7 +17,11 @@ const AnnonceModel = {
             .from('annonces')
             .select('*, users(id, nom, prenoms, role)');
 
-          if (filters.filiere) query = query.eq('filiere', filters.filiere);
+          if (filters.filiere) {
+            query = filters.includeGlobal
+              ? query.or(`filiere.eq.${filters.filiere},filiere.is.null`)
+              : query.eq('filiere', filters.filiere);
+          }
           if (filters.niveau) query = query.eq('niveau', filters.niveau);
           if (filters.cibleRole) query = query.eq('cibleRole', filters.cibleRole);
           if (filters.statut) query = query.eq('statut', filters.statut);
@@ -30,11 +34,6 @@ const AnnonceModel = {
           const { data, error } = await query;
           if (!error && data) return data;
         } catch (_) {}
-      // Filtrer par filière si fournie
-      if (filters.filiere) {
-        query = filters.includeGlobal
-          ? query.or(`filiere.eq.${filters.filiere},filiere.is.null`)
-          : query.eq('filiere', filters.filiere);
       }
 
       // Fallback PostgreSQL pool

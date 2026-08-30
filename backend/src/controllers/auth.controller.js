@@ -61,10 +61,12 @@ const login = async (req, res) => {
     if (user.statut === 'renvoye') return res.status(403).json({ message: 'Compte desactive.' });
 
     const motDePasseExiste = user.mot_de_passe && user.mot_de_passe.trim() !== '' && user.mot_de_passe !== 'null';
-    const estPremiereFois = user.premierefois === true || user.premiere_fois === true || !motDePasseExiste;
+    // Les admins/profs/parents ne passent jamais par le flux « première connexion étudiant »
+    const isStudentRole = !user.role || user.role === 'etudiant' || user.role === 'bde';
+    const estPremiereFois = isStudentRole && (user.premierefois === true || user.premiere_fois === true || !motDePasseExiste);
 
-    // Première connexion : pas encore de mot de passe défini en base
-    if (estPremiereFois || !motDePasseExiste) {
+    // Première connexion : pas encore de mot de passe défini en base (étudiants uniquement)
+    if (estPremiereFois || (isStudentRole && !motDePasseExiste)) {
       // Si l'étudiant n'a pas soumis de mot de passe, on renvoie le signal de première connexion
       if (!mdp || mdp.trim() === '') {
         return res.status(200).json({

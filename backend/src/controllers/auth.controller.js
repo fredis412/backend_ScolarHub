@@ -58,7 +58,7 @@ const login = async (req, res) => {
 
     if (!user) return res.status(404).json({ message: 'Matricule non reconnu.' });
     if (user.statut === 'suspendu') return res.status(403).json({ message: 'Compte suspendu.' });
-    if (user.statut === 'renvoye')  return res.status(403).json({ message: 'Compte desactive.' });
+    if (user.statut === 'renvoye') return res.status(403).json({ message: 'Compte desactive.' });
 
     const motDePasseExiste = user.mot_de_passe && user.mot_de_passe.trim() !== '' && user.mot_de_passe !== 'null';
     const estPremiereFois = user.premierefois === true || user.premiere_fois === true || !motDePasseExiste;
@@ -103,7 +103,7 @@ const login = async (req, res) => {
       // Mise à jour automatique en hash bcrypt si succès
       if (match) {
         bcrypt.hash(mdp, 10).then(h => {
-          pool.query('UPDATE users SET mot_de_passe = $1 WHERE id = $2', [h, user.id]).catch(() => {});
+          pool.query('UPDATE users SET mot_de_passe = $1 WHERE id = $2', [h, user.id]).catch(() => { });
         });
       }
     }
@@ -112,7 +112,17 @@ const login = async (req, res) => {
 
     const token = genToken(user);
     const { mot_de_passe, ...safeUser } = user;
-    return res.status(200).json({ token, user: safeUser });
+
+    // S'assurer que le role est bien transmis même si la colonne est aliasée différemment
+    console.log(`[LOGIN] user ${safeUser.nom} - role="${safeUser.role}" admin_sub_role="${safeUser.admin_sub_role}"`);
+
+    const responseUser = {
+      ...safeUser,
+      role: safeUser.role || 'etudiant',
+      admin_sub_role: safeUser.admin_sub_role || null,
+    };
+
+    return res.status(200).json({ token, user: responseUser });
   } catch (err) {
     console.error('Login error:', err);
     return res.status(500).json({ message: 'Erreur serveur.' });
@@ -142,7 +152,7 @@ const setupPassword = async (req, res) => {
     }
 
     const hashed = await bcrypt.hash(motDePasse, 10);
-    
+
     try {
       await pool.query('UPDATE users SET mot_de_passe = $1, email = $2 WHERE id = $3', [hashed, email || null, userId]);
     } catch (dbErr) {
@@ -407,7 +417,7 @@ const register = async (req, res) => {
     });
   } catch (err) {
     if (client) {
-      try { await client.query('ROLLBACK'); } catch (_) {}
+      try { await client.query('ROLLBACK'); } catch (_) { }
     }
     console.error('Register error:', err);
     if (err.code === '23505') {

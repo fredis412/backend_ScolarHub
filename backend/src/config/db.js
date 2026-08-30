@@ -74,13 +74,20 @@ async function query(text, params) {
   });
 
   if (!error) {
+    let parsedData = data;
+    if (typeof parsedData === 'string') {
+      try {
+        parsedData = JSON.parse(parsedData);
+      } catch (_) {}
+    }
+
     // SELECT → tableau JSON ; DML → { success, rowCount }
-    if (Array.isArray(data)) {
-      return { rows: data, rowCount: data.length };
-    } else if (data && typeof data === 'object' && 'rowCount' in data) {
-      return { rows: [], rowCount: data.rowCount || 0 };
-    } else if (data) {
-      return { rows: [data], rowCount: 1 };
+    if (Array.isArray(parsedData)) {
+      return { rows: parsedData, rowCount: parsedData.length };
+    } else if (parsedData && typeof parsedData === 'object' && 'rowCount' in parsedData) {
+      return { rows: [], rowCount: parsedData.rowCount || 0 };
+    } else if (parsedData) {
+      return { rows: [parsedData], rowCount: 1 };
     }
     return { rows: [], rowCount: 0 };
   }

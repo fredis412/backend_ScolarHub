@@ -81,6 +81,12 @@ async function query(text, params) {
       } catch (_) {}
     }
 
+    // Si execute_sql a attrapé une erreur SQL interne (ex: column does not exist)
+    if (parsedData && typeof parsedData === 'object' && !Array.isArray(parsedData) && parsedData.error) {
+      console.error('[DB EXECUTE_SQL SQL_ERROR]:', parsedData.error);
+      throw new Error('[DB SQL Erreur]: ' + parsedData.error);
+    }
+
     // SELECT → tableau JSON ; DML → { success, rowCount }
     if (Array.isArray(parsedData)) {
       return { rows: parsedData, rowCount: parsedData.length };

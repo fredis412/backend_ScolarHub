@@ -149,7 +149,7 @@ const listEtudiants = async (req, res) => {
         COALESCE(e.prenoms, u.prenoms) AS prenoms,
         COALESCE(e.email, u.email) AS email,
         COALESCE(e.tel, u.tel) AS tel,
-        COALESCE(e.statut, u.statut, 'actif') AS statut,
+        COALESCE(u.statut, 'actif') AS statut,
         COALESCE(e.domaine, u.domaine) AS domaine,
         COALESCE(e.niveau, u.niveau) AS niveau,
         COALESCE(e.date_naissance, u.date_naissance) AS date_naissance,

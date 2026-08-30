@@ -1,4 +1,4 @@
-﻿const db = require('../config/db');
+const db = require('../config/db');
 const bcrypt = require('bcryptjs');
 
 // ── Générer un matricule unique PROF-XXXX ─────────────────────────────────────
@@ -21,18 +21,10 @@ exports.getAllProfesseurs = async (req, res) => {
     const db = require('../config/db');
     const result = await db.query(
       `SELECT u.id, u.nom, u.prenoms, u.matricule, u.email, u.tel,
-              u.statut, u.domaine,
-              COALESCE(
-                json_agg(
-                  json_build_object('id', f.id, 'nom', f.nom)
-                ) FILTER (WHERE f.id IS NOT NULL),
-                '[]'
-              ) AS filieres
+              u.statut, u.domaine
        FROM users u
-       LEFT JOIN professeur_filieres pf ON pf.professeur_id = u.id
-       LEFT JOIN filieres f ON f.id = pf.filiere_id
        WHERE u.role = 'professeur'
-       GROUP BY u.id ORDER BY u.nom ASC`
+       ORDER BY u.nom ASC`
     );
     res.json(result.rows);
   } catch (err) {
@@ -94,40 +86,32 @@ exports.createProfesseur = async (req, res) => {
   }
   const client = await db.connect();
   try {
-    await client.query('BEGIN');
-
+    // Note: pas de BEGIN/COMMIT - ne fonctionne pas avec Supabase RPC execute_sql
     const matricule = await genMatricule();
     const motDePasse = await bcrypt.hash(tel.trim(), 10);
 
-    // 1. Insérer dans users
-    const userRes = await client.query(
+    // 1. Insérer dans users sans RETURNING
+    await client.query(
       `INSERT INTO users (nom, prenoms, matricule, email, tel, role, domaine, statut, mot_de_passe)
-       VALUES ($1, $2, $3, $4, $5, 'professeur', $6, 'actif', $7)
-       RETURNING id, nom, prenoms, matricule, email, tel, role, domaine, statut`,
+       VALUES ($1, $2, $3, $4, $5, 'professeur', $6, 'actif', $7)`,
       [nom.trim().toUpperCase(), prenoms.trim(), matricule,
        email?.trim() || null, tel.trim(), domaine?.trim() || null, motDePasse]
     );
-    const user = userRes.rows[0];
+
+    // Récupérer l'utilisateur inséré
+    const userRow = await client.query(
+      `SELECT id, nom, prenoms, matricule, email, tel, role, domaine, statut FROM users WHERE matricule = $1`,
+      [matricule]
+    );
+    const user = userRow.rows[0];
+    if (!user) throw new Error('Impossible de récupérer le professeur après insertion.');
 
     // 2. Insérer dans professeurs
     await client.query(
-      `INSERT INTO professeurs (user_id, matricule, prenom, numero, specialite)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [user.id, matricule, prenoms.trim(), tel.trim(), domaine?.trim() || null]
+      `INSERT INTO professeurs (user_id, specialite)
+       VALUES ($1, $2)`,
+      [user.id, domaine?.trim() || null]
     );
-
-    // 3. Insérer les filières
-    if (filieres_ids && filieres_ids.length > 0) {
-      for (const filiereId of filieres_ids) {
-        await client.query(
-          `INSERT INTO professeur_filieres (professeur_id, filiere_id)
-           VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-          [user.id, filiereId]
-        );
-      }
-    }
-
-    await client.query('COMMIT');
 
     res.status(201).json({
       message: 'Professeur créé avec succès.',
@@ -139,7 +123,7 @@ exports.createProfesseur = async (req, res) => {
       },
     });
   } catch (err) {
-    await client.query('ROLLBACK');
+    // Pas de ROLLBACK car pas de BEGIN avec Supabase RPC
     console.error('createProfesseur:', err.message);
     if (err.code === '23505') return res.status(409).json({ error: 'Email ou matricule déjà utilisé.' });
     res.status(500).json({ error: err.message });
@@ -151,40 +135,30 @@ exports.createProfesseur = async (req, res) => {
 // ── PUT /api/professeurs/:id ──────────────────────────────────────────────────
 exports.updateProfesseur = async (req, res) => {
   const { id } = req.params;
-  const { nom, prenoms, email, tel, domaine, statut, filieres_ids } = req.body;
+  const { nom, prenoms, email, tel, domaine, statut } = req.body;
+  // Note: filieres_ids ignoré car professeur_filieres n'existe pas dans le schéma
   const client = await require('../config/db').connect();
   try {
-    await client.query('BEGIN');
- 
-    const result = await client.query(
+    // Pas de BEGIN/COMMIT avec Supabase RPC
+    await client.query(
       `UPDATE users SET nom=COALESCE($1,nom), prenoms=COALESCE($2,prenoms),
        email=COALESCE($3,email), tel=COALESCE($4,tel),
        domaine=COALESCE($5,domaine), statut=COALESCE($6,statut)
-       WHERE id=$7 AND role='professeur'
-       RETURNING id, nom, prenoms, matricule, email, tel, role, domaine, statut`,
+       WHERE id=$7 AND role='professeur'`,
       [nom, prenoms, email, tel, domaine, statut, id]
     );
+
+    // Récupérer l'utilisateur mis à jour
+    const result = await client.query(
+      `SELECT id, nom, prenoms, matricule, email, tel, role, domaine, statut FROM users WHERE id=$1 AND role='professeur'`,
+      [id]
+    );
     if (result.rows.length === 0) {
-      await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Professeur non trouvé.' });
     }
- 
-    // Mettre à jour les filières
-    if (filieres_ids !== undefined) {
-      await client.query('DELETE FROM professeur_filieres WHERE professeur_id=$1', [id]);
-      for (const filiereId of filieres_ids) {
-        await client.query(
-          `INSERT INTO professeur_filieres (professeur_id, filiere_id)
-           VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-          [id, filiereId]
-        );
-      }
-    }
- 
-    await client.query('COMMIT');
+
     res.json(result.rows[0]);
   } catch (err) {
-    await client.query('ROLLBACK');
     console.error('updateProfesseur:', err.message);
     res.status(500).json({ error: err.message });
   } finally {
@@ -231,10 +205,14 @@ exports.getProfile = async (req, res) => {
 exports.updateProfile = async (req, res) => {
   const { email, tel, domaine } = req.body;
   try {
-    const result = await db.query(
+    await db.query(
       `UPDATE users SET email=COALESCE($1,email), tel=COALESCE($2,tel), domaine=COALESCE($3,domaine)
-       WHERE id=$4 RETURNING id, nom, prenoms, matricule, email, tel, domaine`,
+       WHERE id=$4`,
       [email, tel, domaine, req.user.id]
+    );
+    const result = await db.query(
+      `SELECT id, nom, prenoms, matricule, email, tel, domaine FROM users WHERE id=$1`,
+      [req.user.id]
     );
     res.json(result.rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }

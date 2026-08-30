@@ -57,11 +57,15 @@ async function query(text, params) {
     if (typeof value === 'number' && Number.isFinite(value)) return String(value);
     if (typeof value === 'boolean') return value ? 'TRUE' : 'FALSE';
     if (Array.isArray(value)) {
+      if (value.length === 0) return `ARRAY[]::text[]`;
       return `ARRAY[${value.map((item) => `'${String(item).replace(/'/g, "''")}'`).join(', ')}]`;
     }
     if (value instanceof Date) return `'${value.toISOString().replace(/'/g, "''")}'`;
     return `'${String(value).replace(/'/g, "''")}'`;
   });
+
+  // Log query for debugging syntax errors
+  console.log('[DB QUERY]:', sql);
 
   // Tentative via RPC execute_sql (fonction SQL stockée côté Supabase)
   const { data, error } = await supabase.rpc('execute_sql', {

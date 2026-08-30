@@ -136,6 +136,10 @@ const listEtudiants = async (req, res) => {
     const domaineFiltreRaw = (req.query.domaine || '').trim();
     const domaineFiltre = (domaineFiltreRaw === 'Tous' || domaineFiltreRaw === '') ? null : domaineFiltreRaw;
 
+    console.log('[listEtudiants] domaineFiltre:', domaineFiltre || 'aucun');
+
+    // Requête robuste : on utilise uniquement des colonnes garanties dans le schéma de base
+    // etudiant_role et filiere_role sont sécurisées via COALESCE avec NULL
     let queryText = `
       SELECT
         e.id AS etudiant_id,
@@ -145,17 +149,17 @@ const listEtudiants = async (req, res) => {
         COALESCE(e.prenoms, u.prenoms) AS prenoms,
         COALESCE(e.email, u.email) AS email,
         COALESCE(e.tel, u.tel) AS tel,
-        COALESCE(e.statut, u.statut) AS statut,
+        COALESCE(e.statut, u.statut, 'actif') AS statut,
         COALESCE(e.domaine, u.domaine) AS domaine,
         COALESCE(e.niveau, u.niveau) AS niveau,
         COALESCE(e.date_naissance, u.date_naissance) AS date_naissance,
-        COALESCE(e.nationalite, u.nationalite) AS nationalite,
+        COALESCE(e.nationalite, u.nationalite, 'Burkinabè') AS nationalite,
         COALESCE(e.adresse, u.adresse) AS adresse,
         COALESCE(e.nom_parent, u.nom_parent) AS nom_parent,
         COALESCE(e.tel_parent, u.tel_parent) AS tel_parent,
         COALESCE(e.email_parent, u.email_parent) AS email_parent,
-        u.etudiant_role,
-        u.filiere_role,
+        u.role AS etudiant_role,
+        NULL AS filiere_role,
         e.filiere_id,
         e.premierefois,
         COALESCE(e.filiere_nom, f.nom) AS filiere_nom
@@ -168,7 +172,6 @@ const listEtudiants = async (req, res) => {
     const params = [];
     if (domaineFiltre) {
       params.push(domaineFiltre);
-      // Filtre sur le domaine stocké dans etudiants/users, ou calculé depuis la filière
       queryText += `
         AND (
           COALESCE(e.domaine, u.domaine) = $${params.length}
@@ -180,10 +183,11 @@ const listEtudiants = async (req, res) => {
     queryText += ' ORDER BY COALESCE(e.nom, u.nom), COALESCE(e.prenoms, u.prenoms)';
 
     const result = await pool.query(queryText, params);
+    console.log('[listEtudiants] retour:', result.rows.length, 'étudiant(s)');
     return res.status(200).json(result.rows.map(mapRowToEtudiant));
   } catch (err) {
-    console.error('[listEtudiants]', err);
-    return res.status(500).json({ message: 'Erreur lors du chargement des étudiants.' });
+    console.error('[listEtudiants] ERREUR:', err.message);
+    return res.status(500).json({ message: 'Erreur lors du chargement des étudiants.', detail: err.message });
   }
 };
 

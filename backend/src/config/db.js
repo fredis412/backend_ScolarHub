@@ -74,8 +74,15 @@ async function query(text, params) {
   });
 
   if (!error) {
-    const rows = Array.isArray(data) ? data : (data ? [data] : []);
-    return { rows, rowCount: rows.length };
+    // SELECT → tableau JSON ; DML → { success, rowCount }
+    if (Array.isArray(data)) {
+      return { rows: data, rowCount: data.length };
+    } else if (data && typeof data === 'object' && 'rowCount' in data) {
+      return { rows: [], rowCount: data.rowCount || 0 };
+    } else if (data) {
+      return { rows: [data], rowCount: 1 };
+    }
+    return { rows: [], rowCount: 0 };
   }
 
   // Si la fonction RPC n'existe pas, on log l'erreur pour le debug

@@ -132,7 +132,11 @@ const integrerDansGroupeFiliere = async (client, userId, filiereId, filiere, mat
 // ── GET /api/etudiants ────────────────────────────────────────────────────────
 const listEtudiants = async (req, res) => {
   try {
-    const result = await pool.query(`
+    // Filtre domaine : si l'admin est restreint à un domaine, on ne retourne que ses étudiants
+    const domaineFiltreRaw = (req.query.domaine || '').trim();
+    const domaineFiltre = (domaineFiltreRaw === 'Tous' || domaineFiltreRaw === '') ? null : domaineFiltreRaw;
+
+    let queryText = `
       SELECT
         e.id AS etudiant_id,
         e.user_id,
@@ -159,14 +163,30 @@ const listEtudiants = async (req, res) => {
       INNER JOIN users u ON u.id = e.user_id
       LEFT JOIN filieres f ON f.id = e.filiere_id
       WHERE u.role = 'etudiant'
-      ORDER BY COALESCE(e.nom, u.nom), COALESCE(e.prenoms, u.prenoms)
-    `);
-    return res.status(200).json(result.rows.map(mapRowToEtudiant));
+    `;
+
+    const params = [];
+    if (domaineFiltre) {
+      params.push(domaineFiltre);
+      // Filtre sur le domaine stocké dans etudiants/users, ou calculé depuis la filière
+      queryText += `
+        AND (
+          COALESCE(e.domaine, u.domaine) = $${params.length}
+          OR COALESCE(e.filiere_nom, f.nom) ILIKE '%' || $${params.length} || '%'
+        )
+      `;
+    }
+
+    queryText += ' ORDER BY COALESCE(e.nom, u.nom), COALESCE(e.prenoms, u.prenoms)';
+
+    const result = await pool.query(queryText, params);
+    return res.status(200).json({ success: true, data: result.rows.map(mapRowToEtudiant) });
   } catch (err) {
     console.error('[listEtudiants]', err);
     return res.status(500).json({ message: 'Erreur lors du chargement des étudiants.' });
   }
 };
+
 
 // ── POST /api/etudiants ───────────────────────────────────────────────────────
 const inscrireEtudiant = async (req, res) => {

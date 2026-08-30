@@ -24,8 +24,11 @@ const login = async (req, res) => {
                   COALESCE(e.filiere_nom, u.filiere_nom) AS filiere,
                   COALESCE(e.niveau, u.niveau) AS niveau_etudiant,
                   COALESCE(e.email, u.email) AS email_etudiant,
-                  COALESCE(e.tel, u.tel) AS tel_etudiant
-           FROM users u LEFT JOIN etudiants e ON u.id = e.user_id
+                  COALESCE(e.tel, u.tel) AS tel_etudiant,
+                  COALESCE(m.permissions->>'domaine', u.admin_domaine, 'Tous') AS admin_domaine
+           FROM users u
+           LEFT JOIN etudiants e ON u.id = e.user_id
+           LEFT JOIN membres m ON u.id = m.user_id
            WHERE LOWER(u.matricule) = $1 OR LOWER(u.email) = $1`,
           [matClean]
         );
@@ -122,6 +125,7 @@ const login = async (req, res) => {
       ...safeUser,
       role: safeUser.role || 'etudiant',
       admin_sub_role: safeUser.admin_sub_role || null,
+      admin_domaine: safeUser.admin_domaine || 'Tous',
     };
 
     return res.status(200).json({ token, user: responseUser });

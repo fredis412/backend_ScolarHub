@@ -159,6 +159,7 @@ exports.createAnnonce = async (req, res) => {
 
     if (newAnnonce && (newAnnonce.statut === 'publie' || annonceData.statut === 'publie')) {
       syncAnnonceToCanalAndNotify(newAnnonce || annonceData, req.app);
+    }
     if (annonceData.statut === 'publie') {
       await notifierPublication(newAnnonce);
     }

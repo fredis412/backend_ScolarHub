@@ -370,11 +370,11 @@ exports.envoyerEdt = async (req, res) => {
     // Étudiants actifs de cette filière (et de ce niveau si renseigné).
     const r = await pool.query(
       `SELECT u.id, u.prenoms, u.nom
-         FROM etudiants e
-         JOIN users u ON u.id = e.user_id
-        WHERE e.filiere_id = $1
+         FROM users u
+         LEFT JOIN etudiants e ON u.id = e.user_id
+        WHERE (e.filiere_id = $1 OR u.filiere_id = $1)
           AND ($2::text IS NULL OR e.niveau = $2 OR u.niveau = $2)
-          AND u.role = 'etudiant'
+          AND (u.role ILIKE '%etudiant%' OR u.role ILIKE '%delegue%' OR u.role ILIKE '%bde%')
           AND COALESCE(u.statut, 'actif') NOT IN ('suspendu', 'renvoye')`,
       [filiereId, niveau]
     );

@@ -95,7 +95,7 @@ exports.createProfesseur = async (req, res) => {
       `INSERT INTO users (nom, prenoms, matricule, email, tel, role, domaine, statut, mot_de_passe)
        VALUES ($1, $2, $3, $4, $5, 'professeur', $6, 'actif', $7)`,
       [nom.trim().toUpperCase(), prenoms.trim(), matricule,
-       email?.trim() || null, tel.trim(), domaine?.trim() || null, motDePasse]
+      email?.trim() || null, tel.trim(), domaine?.trim() || null, motDePasse]
     );
 
     // Récupérer l'utilisateur inséré
@@ -258,8 +258,8 @@ exports.getStudentsByFiliere = async (req, res) => {
   try {
     const result = await db.query(
       `SELECT u.id, u.nom, u.prenoms, u.matricule, u.email, u.tel, u.statut
-       FROM users u JOIN etudiants e ON e.user_id=u.id
-       WHERE e.filiere_id=$1 AND u.role='etudiant' ORDER BY u.nom`,
+       FROM users u LEFT JOIN etudiants e ON e.user_id=u.id
+       WHERE (e.filiere_id=$1 OR u.filiere_id=$1) AND (u.role ILIKE '%etudiant%' OR u.role ILIKE '%delegue%' OR u.role ILIKE '%bde%') ORDER BY u.nom`,
       [req.params.filiere_id]
     );
     res.json(result.rows);

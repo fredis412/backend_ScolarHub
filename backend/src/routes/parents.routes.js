@@ -14,16 +14,44 @@ router.post('/', authMiddleware, requireRole('admin', 'direction'), parentsContr
 router.get('/mon-enfant', authMiddleware, async (req, res) => {
   try {
     const parentUserId = req.user.id;
-    const r = await pool.query(
-      `SELECT e.id AS etudiant_id, e.matricule, e.nom, e.prenoms, e.filiere_nom, e.niveau, e.domaine, e.email, e.tel,
-              p.relation, p.statut_compte
-       FROM users u
-       LEFT JOIN parents p ON (p.user_id = u.id OR REPLACE(COALESCE(p.telephone, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
-       LEFT JOIN etudiants e ON (e.matricule = p.matricule_enfant OR e.id = p.etudiant_id OR REPLACE(COALESCE(e.tel_parent, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', '') OR e.matricule = u.matricule)
-       WHERE u.id::text = $1 AND e.id IS NOT NULL
+
+    // Stratégie 1 : liaison directe via user_id dans la table parents
+    let r = await pool.query(
+      `SELECT e.id AS etudiant_id, e.matricule, e.nom, e.prenoms, e.filiere_nom, e.niveau, e.domaine,
+              p.relation
+       FROM parents p
+       LEFT JOIN etudiants e ON (e.matricule = p.matricule_enfant OR e.id = p.etudiant_id)
+       WHERE p.user_id::text = $1 AND e.id IS NOT NULL
        LIMIT 1`,
       [parentUserId.toString()]
     );
+
+    // Stratégie 2 : liaison via numéro de téléphone (user.tel = parents.telephone)
+    if (!r.rows[0]) {
+      r = await pool.query(
+        `SELECT e.id AS etudiant_id, e.matricule, e.nom, e.prenoms, e.filiere_nom, e.niveau, e.domaine,
+                p.relation
+         FROM users u
+         JOIN parents p ON REPLACE(COALESCE(p.telephone, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', '')
+         LEFT JOIN etudiants e ON (e.matricule = p.matricule_enfant OR e.id = p.etudiant_id)
+         WHERE u.id::text = $1 AND e.id IS NOT NULL
+         LIMIT 1`,
+        [parentUserId.toString()]
+      );
+    }
+
+    // Stratégie 3 : liaison via etudiants.tel_parent = user.tel (fallback si pas de table parents)
+    if (!r.rows[0]) {
+      r = await pool.query(
+        `SELECT e.id AS etudiant_id, e.matricule, e.nom, e.prenoms, e.filiere_nom, e.niveau, e.domaine,
+                'Parent' AS relation
+         FROM users u
+         JOIN etudiants e ON REPLACE(COALESCE(e.tel_parent, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', '')
+         WHERE u.id::text = $1 AND e.id IS NOT NULL
+         LIMIT 1`,
+        [parentUserId.toString()]
+      );
+    }
 
     if (!r.rows[0]) {
       return res.status(404).json({ success: false, message: 'Aucun enfant rattache trouve.' });

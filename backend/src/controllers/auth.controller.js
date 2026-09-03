@@ -171,6 +171,19 @@ const login = async (req, res) => {
     // S'assurer que le role est bien transmis même si la colonne est aliasée différemment
     console.log(`[LOGIN] user ${safeUser.nom} - role="${safeUser.role}" admin_sub_role="${safeUser.admin_sub_role}"`);
 
+    // Si c'est un parent : synchroniser automatiquement le user_id dans la table parents
+    // pour que /parents/mon-enfant puisse toujours retrouver l'enfant lié
+    if (safeUser.role === 'parent' || safeUser.role === 'tuteur') {
+      const telClean = (safeUser.tel || '').trim().replace(/\s+/g, '');
+      pool.query(
+        `UPDATE parents SET user_id = $1
+         WHERE user_id IS NULL
+           AND (REPLACE(COALESCE(telephone,''),' ','') = $2
+            OR LOWER(nom) = LOWER($3))`,
+        [safeUser.id, telClean, safeUser.nom || '']
+      ).catch(e => console.warn('[LOGIN] Sync parents.user_id:', e.message));
+    }
+
     const responseUser = {
       ...safeUser,
       role: safeUser.role || 'etudiant',

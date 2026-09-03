@@ -203,7 +203,21 @@ const createParent = async (req, res) => {
       }
     }
 
-    // 4. Mettre à jour l'étudiant
+    // 4. S'assurer que la ligne parents a bien le user_id lié (pour que /mon-enfant fonctionne)
+    if (userId) {
+      try {
+        await pool.query(
+          `UPDATE parents SET user_id = $1
+           WHERE (telephone = $2 OR REPLACE(COALESCE(telephone,''),' ','') = $3)
+             AND (user_id IS NULL OR user_id::text != $1::text)`,
+          [userId, telClean, telClean]
+        );
+      } catch (linkErr) {
+        console.warn('[parents] Mise à jour user_id dans parents:', linkErr.message);
+      }
+    }
+
+    // 5. Mettre à jour l'étudiant avec les infos du parent
     const nomParentFull = (`${nom.trim().toUpperCase()} ${prenoms.trim()}`).replace(/'/g, "''");
 
     await pool.query(

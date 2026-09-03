@@ -33,10 +33,23 @@ const login = async (req, res) => {
           [matClean]
         );
         user = r.rows[0];
-      } else if (nom && tel) {
+      } else if (nom && (tel || req.body.telephone)) {
+        const telVal = (tel || req.body.telephone).trim().replace(/\s+/g, '');
+        const prenomVal = (req.body.prenom || req.body.prenoms || '').trim();
         const r = await pool.query(
-          'SELECT u.*, e.filiere_id FROM users u LEFT JOIN etudiants e ON u.id = e.user_id WHERE LOWER(u.nom) = LOWER($1) AND u.tel = $2',
-          [nom.trim(), tel.trim()]
+          `SELECT u.*, e.filiere_id,
+                  COALESCE(e.filiere_nom, u.filiere_nom) AS filiere,
+                  COALESCE(e.niveau, u.niveau) AS niveau_etudiant,
+                  COALESCE(e.email, u.email) AS email_etudiant,
+                  COALESCE(e.tel, u.tel) AS tel_etudiant
+           FROM users u 
+           LEFT JOIN etudiants e ON u.id = e.user_id 
+           WHERE LOWER(TRIM(u.nom)) = LOWER(TRIM($1)) 
+             AND (REPLACE(COALESCE(u.tel, ''), ' ', '') = $2 OR REPLACE(COALESCE(u.tel, ''), ' ', '') LIKE $3)
+             ${prenomVal ? "AND (LOWER(TRIM(u.prenoms)) = LOWER(TRIM($4)) OR LOWER(u.prenoms) LIKE $5)" : ""}`,
+          prenomVal 
+            ? [nom.trim(), telVal, `%${telVal}%`, prenomVal, `%${prenomVal}%`] 
+            : [nom.trim(), telVal, `%${telVal}%`]
         );
         user = r.rows[0];
       } else {
@@ -64,13 +77,12 @@ const login = async (req, res) => {
     if (user.statut === 'renvoye') return res.status(403).json({ message: 'Compte desactive.' });
 
     const motDePasseExiste = user.mot_de_passe && user.mot_de_passe.trim() !== '' && user.mot_de_passe !== 'null';
-    // Les admins/profs/parents ne passent jamais par le flux « première connexion étudiant »
-    const isStudentRole = !user.role || user.role === 'etudiant' || user.role === 'bde';
-    const estPremiereFois = isStudentRole && (user.premierefois === true || user.premiere_fois === true || !motDePasseExiste);
+    const isFirstTimeRole = !user.role || user.role === 'etudiant' || user.role === 'bde' || user.role === 'parent';
+    const estPremiereFois = isFirstTimeRole && (user.premierefois === true || user.premiere_fois === true || !motDePasseExiste);
 
-    // Première connexion : pas encore de mot de passe défini en base (étudiants uniquement)
-    if (estPremiereFois || (isStudentRole && !motDePasseExiste)) {
-      // Si l'étudiant n'a pas soumis de mot de passe, on renvoie le signal de première connexion
+    // Première connexion : pas encore de mot de passe défini en base (étudiants et parents)
+    if (estPremiereFois || (isFirstTimeRole && !motDePasseExiste)) {
+      // Si l'utilisateur n'a pas soumis de mot de passe, on renvoie le signal de première connexion
       if (!mdp || mdp.trim() === '') {
         return res.status(200).json({
           premiereFois: true,
@@ -235,10 +247,10 @@ const lookup = async (req, res) => {
                   COALESCE(e.niveau, u.niveau)          AS niveau
            FROM users u
            LEFT JOIN etudiants e ON u.id = e.user_id
-           WHERE LOWER(u.nom) = LOWER($1)
-             AND (LOWER(u.prenoms) = LOWER($2) OR LOWER(u.prenoms) LIKE LOWER($3))
-             AND (REPLACE(u.tel, ' ', '') = $4 OR REPLACE(u.tel, ' ', '') LIKE $5 OR u.tel IS NULL)`,
-          [nom, prenom, `%${prenom}%`, tel, `%${tel}%`]
+           WHERE LOWER(TRIM(u.nom)) = LOWER(TRIM($1))
+             AND (LOWER(TRIM(u.prenoms)) = LOWER(TRIM($2)) OR LOWER(u.prenoms) LIKE LOWER($3) OR LOWER(u.nom) LIKE LOWER($3))
+             AND (REPLACE(COALESCE(u.tel, ''), ' ', '') = $4 OR REPLACE(COALESCE(u.tel, ''), ' ', '') LIKE $5 OR $4 LIKE ('%' || REPLACE(COALESCE(u.tel, ''), ' ', '') || '%')`,
+          [nom.trim(), prenom.trim(), `%${prenom.trim()}%`, tel.trim().replace(/\s+/g, ''), `%${tel.trim().replace(/\s+/g, '')}%`]
         );
         row = r.rows[0];
       } catch (dbErr) {

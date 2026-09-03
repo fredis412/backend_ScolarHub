@@ -73,76 +73,103 @@ const getParents = async (req, res) => {
 
 const createParent = async (req, res) => {
   try {
-    const { nom, prenoms, email, telephone, relation, matriculeEnfant } = req.body;
+    const { nom, prenoms, email, telephone, relation, matriculeEnfant, motDePasse } = req.body;
 
     console.log('[parents] createParent body:', { nom, prenoms, email, telephone, relation, matriculeEnfant });
 
     if (!nom || !prenoms || !matriculeEnfant) {
-      return res.status(400).json({ success: false, message: 'Donnees manquantes (nom, prenoms, matriculeEnfant obligatoires).' });
+      return res.status(400).json({ success: false, message: 'Données manquantes (nom, prénoms et matricule enfant sont obligatoires).' });
     }
 
     const matriculeUp = matriculeEnfant.trim().toUpperCase().replace(/'/g, "''");
+    const telClean = (telephone || '').trim().replace(/\s+/g, '');
+    const nomUp = nom.trim().toUpperCase().replace(/'/g, "''");
+    const prenomsSafe = prenoms.trim().replace(/'/g, "''");
+    const emailVal = email?.trim() ? `'${email.trim().replace(/'/g, "''")}'` : 'NULL';
+    const telVal = telClean ? `'${telClean.replace(/'/g, "''")}'` : 'NULL';
 
-    // 1. Verifier si l'etudiant existe
+    // 1. Vérifier si l'étudiant existe
     const etuResult = await pool.query(
       `SELECT id, matricule FROM etudiants WHERE UPPER(matricule) = '${matriculeUp}'`
     );
     if (!etuResult.rows || etuResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: `Etudiant introuvable avec le matricule: ${matriculeEnfant}` });
+      return res.status(404).json({ success: false, message: `Étudiant introuvable avec le matricule: ${matriculeEnfant}` });
     }
     const etudiantId = etuResult.rows[0].id;
-    console.log('[parents] Etudiant trouve, id:', etudiantId);
+    console.log('[parents] Étudiant trouvé, id:', etudiantId);
 
-    // 2. Creer le compte utilisateur Parent dans users
+    // 2. Créer ou mettre à jour le compte utilisateur dans `users`
+    // Le mot de passe est laissé à NULL (première connexion) pour que le parent le définisse lui-même
+    let mdpSafe = 'NULL';
+    if (motDePasse && motDePasse.trim() !== '') {
+      const mdpHashe = await bcrypt.hash(motDePasse.trim(), 10);
+      mdpSafe = `'${mdpHashe.replace(/'/g, "''")}'`;
+    }
+
     let userId = null;
 
+    // Vérifier si un utilisateur existe déjà par email ou téléphone
     if (email && email.trim() !== '') {
       try {
         const emailCheck = await pool.query(
-          `SELECT id FROM users WHERE email = '${email.trim().replace(/'/g, "''")}'`
+          `SELECT id FROM users WHERE LOWER(email) = '${email.trim().toLowerCase().replace(/'/g, "''")}'`
         );
         if (emailCheck.rows && emailCheck.rows.length > 0) {
           userId = emailCheck.rows[0].id;
-          console.log('[parents] Email existant, userId reutilise:', userId);
         }
       } catch (e) {
-        console.warn('[parents] Verification email failed:', e.message);
+        console.warn('[parents] Vérification email:', e.message);
       }
     }
 
-    if (!userId) {
-      const mdpHashe = await bcrypt.hash('parent123', 10);
-      const matriculeParent = `PAR-${Date.now().toString().slice(-6)}`;
-      const nomUp = nom.trim().toUpperCase().replace(/'/g, "''");
-      const prenomsSafe = prenoms.trim().replace(/'/g, "''");
-      const emailVal = email?.trim() ? `'${email.trim().replace(/'/g, "''")}'` : 'NULL';
-      const telVal = telephone?.trim() ? `'${telephone.trim().replace(/'/g, "''")}'` : 'NULL';
-      const mdpSafe = mdpHashe.replace(/'/g, "''");
+    if (!userId && telClean) {
+      try {
+        const telCheck = await pool.query(
+          `SELECT id FROM users WHERE REPLACE(COALESCE(tel, ''), ' ', '') = '${telClean}'`
+        );
+        if (telCheck.rows && telCheck.rows.length > 0) {
+          userId = telCheck.rows[0].id;
+        }
+      } catch (e) {
+        console.warn('[parents] Vérification tel:', e.message);
+      }
+    }
 
+    if (userId) {
+      // Mettre à jour l'utilisateur existant
+      console.log('[parents] Compte users existant réutilisé, mise à jour userId:', userId);
+      try {
+        await pool.query(`
+          UPDATE users 
+          SET nom = '${nomUp}', prenoms = '${prenomsSafe}', tel = ${telVal}, email = ${emailVal}, role = 'parent'
+          WHERE id = '${userId}'
+        `);
+      } catch (uUpdateErr) {
+        console.warn('[parents] Mise à jour users:', uUpdateErr.message);
+      }
+    } else {
+      // Créer un nouveau compte utilisateur (mot_de_passe à NULL pour première connexion)
+      const matriculeParent = `PAR-${Date.now().toString().slice(-6)}`;
       try {
         const userResult = await pool.query(
           `INSERT INTO users (matricule, nom, prenoms, email, tel, role, mot_de_passe, statut)
-           VALUES ('${matriculeParent}', '${nomUp}', '${prenomsSafe}', ${emailVal}, ${telVal}, 'parent', '${mdpSafe}', 'actif')
+           VALUES ('${matriculeParent}', '${nomUp}', '${prenomsSafe}', ${emailVal}, ${telVal}, 'parent', ${mdpSafe}, 'actif')
            RETURNING id`
         );
         if (userResult.rows && userResult.rows.length > 0) {
           userId = userResult.rows[0].id;
-          console.log('[parents] Compte users cree, userId:', userId);
+          console.log('[parents] Nouveau compte users créé avec première connexion activée, userId:', userId);
         }
       } catch (userErr) {
-        console.warn('[parents] Creation users echouee:', userErr.message);
+        console.warn('[parents] Création users échouée:', userErr.message);
       }
     }
 
-    // 3. Inserer dans la table parents
+    // 3. Insérer dans la table parents (auto-détection colonnes)
     const cols = await getParentsColumns();
     console.log('[parents] Colonnes table parents:', cols);
 
     if (cols.length > 0) {
-      const nomUp = nom.trim().toUpperCase().replace(/'/g, "''");
-      const prenomsSafe = prenoms.trim().replace(/'/g, "''");
-      const emailSafe = email?.trim() ? `'${email.trim().replace(/'/g, "''")}'` : 'NULL';
-      const telSafe = telephone?.trim() ? `'${telephone.trim().replace(/'/g, "''")}'` : 'NULL';
       const relationSafe = (relation || 'Parent').replace(/'/g, "''");
 
       const insertCols = [];
@@ -158,8 +185,8 @@ const createParent = async (req, res) => {
       addCol('user_id', userId ? `'${userId}'` : 'NULL');
       addCol('nom', `'${nomUp}'`);
       addCol('prenoms', `'${prenomsSafe}'`);
-      addCol('email', emailSafe);
-      addCol('telephone', telSafe);
+      addCol('email', emailVal);
+      addCol('telephone', telVal);
       addCol('relation', `'${relationSafe}'`);
       addCol('matricule_enfant', `'${matriculeUp}'`);
       addCol('etudiant_id', etudiantId !== null && etudiantId !== undefined ? `${etudiantId}` : 'NULL');
@@ -169,24 +196,22 @@ const createParent = async (req, res) => {
         console.log('[parents] Insert query:', insertQuery);
         try {
           await pool.query(insertQuery);
-          console.log('[parents] Insertion parents reussie.');
+          console.log('[parents] Insertion parents réussie.');
         } catch (insertErr) {
-          console.error('[parents] Insertion parents echouee:', insertErr.message);
+          console.error('[parents] Insertion parents échouée:', insertErr.message);
         }
       }
     }
 
-    // 4. Mettre a jour etudiants
-    const nomParentFull = (nom.trim().toUpperCase() + ' ' + prenoms.trim()).replace(/'/g, "''");
-    const telParentSafe = telephone?.trim() ? `'${telephone.trim().replace(/'/g, "''")}'` : 'NULL';
-    const emailParentSafe = email?.trim() ? `'${email.trim().replace(/'/g, "''")}'` : 'NULL';
+    // 4. Mettre à jour l'étudiant
+    const nomParentFull = (`${nom.trim().toUpperCase()} ${prenoms.trim()}`).replace(/'/g, "''");
 
     await pool.query(
-      `UPDATE etudiants SET nom_parent = '${nomParentFull}', tel_parent = ${telParentSafe}, email_parent = ${emailParentSafe} WHERE UPPER(matricule) = '${matriculeUp}'`
+      `UPDATE etudiants SET nom_parent = '${nomParentFull}', tel_parent = ${telVal}, email_parent = ${emailVal} WHERE UPPER(matricule) = '${matriculeUp}'`
     );
 
-    console.log('[parents] Etudiant mis a jour avec les infos parent.');
-    res.json({ success: true, message: 'Parent cree avec succes. Mot de passe par defaut: parent123' });
+    console.log('[parents] Étudiant mis à jour avec les infos parent.');
+    res.json({ success: true, message: 'Parent créé avec succès.' });
 
   } catch (err) {
     console.error('[parents.controller] POST / ERREUR:', err.message);

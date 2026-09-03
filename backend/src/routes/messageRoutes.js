@@ -13,6 +13,8 @@ const {
   getConversationsPrivees,
   getMessagesPrives,
   envoyerMessagePrive,
+  marquerMessagesPrivesLus,
+  ajouterMembreCanal,
   getMessagesGroupe,
   envoyerMessageGroupe,
   ajouterReaction,
@@ -33,6 +35,10 @@ router.post('/canal/:id',        envoyerMessageCanal);
 router.get('/prives',            getConversationsPrivees);
 router.get('/prives/:userId',    getMessagesPrives);
 router.post('/prives/:userId',   envoyerMessagePrive);
+router.post('/prives/read/:userId', marquerMessagesPrivesLus);
+
+// ── Gestion des membres de canaux ─────────────────────────
+router.post('/canaux/:id/membres', ajouterMembreCanal);
 
 // ── Groupe filière ────────────────────────────────────────
 router.get('/groupe/:filiereId', getMessagesGroupe);

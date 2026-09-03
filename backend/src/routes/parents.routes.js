@@ -2,25 +2,13 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
 const { authMiddleware, requireRole } = require('../middleware/auth.middleware');
+const parentsController = require('../controllers/parents.controller');
 
 // GET /api/parents - Liste des parents avec leurs enfants
-router.get('/', authMiddleware, requireRole('admin', 'direction'), async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT DISTINCT
-        e.nom_parent, e.tel_parent, e.email_parent,
-        e.nom AS etudiant_nom, e.prenoms AS etudiant_prenoms, e.matricule,
-        e.filiere_nom, e.niveau
-      FROM etudiants e
-      WHERE e.nom_parent IS NOT NULL AND e.nom_parent != ''
-      ORDER BY e.nom_parent
-    `);
-    res.json({ success: true, data: result.rows });
-  } catch (err) {
-    console.error('[parents] GET /', err);
-    res.status(500).json({ success: false, message: 'Erreur serveur.' });
-  }
-});
+router.get('/', authMiddleware, requireRole('admin', 'direction'), parentsController.getParents);
+
+// POST /api/parents - Créer un parent
+router.post('/', authMiddleware, requireRole('admin', 'direction'), parentsController.createParent);
 
 // GET /api/parents/enfant/:etudiantId - Info parent pour un etudiant
 router.get('/enfant/:etudiantId', authMiddleware, async (req, res) => {

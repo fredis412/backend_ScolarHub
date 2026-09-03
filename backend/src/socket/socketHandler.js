@@ -145,6 +145,31 @@ function initSocket(io) {
       }
     });
 
+    // ── Événement : accusé de lecture ────────────────────
+    socket.on('message:read', async (data, callback) => {
+      const { expediteurId } = data;
+      if (!expediteurId) return callback?.({ error: 'expediteurId requis' });
+
+      try {
+        await pool.query(
+          `UPDATE messages_prives 
+           SET is_read = TRUE 
+           WHERE expediteur_id = $1 AND destinataire_id = $2 AND is_read = FALSE`,
+          [expediteurId, userId]
+        );
+
+        // Notifier l'expéditeur que ses messages ont été lus
+        io.to(`user:${expediteurId}`).emit('message:read', {
+          destinataire_id: userId,
+          expediteur_id: expediteurId,
+        });
+        callback?.({ success: true });
+      } catch (err) {
+        console.error('[Socket] message:read erreur:', err.message);
+        callback?.({ error: 'Erreur serveur' });
+      }
+    });
+
     // ── Événement : message dans groupe filière ───────────
     socket.on('message:groupe', async (data, callback) => {
       const { filiereId, contenu } = data;

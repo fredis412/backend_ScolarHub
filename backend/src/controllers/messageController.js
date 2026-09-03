@@ -12,7 +12,7 @@ const { resolveFiliere, normalizeNiveau } = require('../utils/filieres');
 // Types de canaux « publics » : lisibles par tout utilisateur authentifié,
 // sans inscription préalable dans canal_membres (les droits d'écriture
 // restent gérés par rôle côté app / canal_membres).
-const CANAUX_PUBLICS = ['administration', 'admin_filiere', 'bde', 'general', 'professeurs'];
+const CANAUX_PUBLICS = ['administration', 'admin_filiere', 'bde', 'general', 'professeurs', 'prof_admin', 'admin_profs'];
 
 // Vérifie l'accès d'un utilisateur à un canal : membre, ou canal public.
 async function accesCanal(canalId, userId) {
@@ -24,7 +24,7 @@ async function accesCanal(canalId, userId) {
   const { rows: canal } = await pool.query(
     `SELECT 1 FROM canaux
      WHERE id = $1
-        AND (type IN ('administration', 'admin_filiere', 'bde', 'general', 'professeurs')
+        AND (type IN ('administration', 'admin_filiere', 'bde', 'general', 'professeurs', 'prof_admin', 'admin_profs')
           OR type LIKE 'prof_delegues:%')`,
     [canalId]
   );
@@ -42,7 +42,7 @@ const getCanaux = async (req, res) => {
        FROM canaux c
              LEFT JOIN canal_membres cm ON cm.canal_id = c.id AND cm.user_id = $1
              WHERE cm.user_id IS NOT NULL
-                OR c.type IN ('administration', 'admin_filiere', 'bde', 'general', 'professeurs')
+                OR c.type IN ('administration', 'admin_filiere', 'bde', 'general', 'professeurs', 'prof_admin', 'admin_profs')
        ORDER BY c.nom ASC`,
             [req.user.id]
     );
@@ -220,11 +220,13 @@ const getConversationsPrivees = async (req, res) => {
               correspondant_id,
               u.prenoms, u.nom,
               mp.contenu AS dernier_message,
-              mp.created_at
+              mp.created_at,
+              mp.is_read,
+              mp.expediteur_id
        FROM (
          SELECT
            CASE WHEN expediteur_id = $1 THEN destinataire_id ELSE expediteur_id END AS correspondant_id,
-           contenu, created_at
+           contenu, created_at, is_read, expediteur_id
          FROM messages_prives
          WHERE expediteur_id = $1 OR destinataire_id = $1
        ) mp
@@ -247,7 +249,7 @@ const getMessagesPrives = async (req, res) => {
 
   try {
     const { rows } = await pool.query(
-      `SELECT mp.id, mp.contenu, mp.created_at,
+      `SELECT mp.id, mp.contenu, mp.created_at, mp.is_read,
               mp.expediteur_id, mp.destinataire_id,
               u.prenoms, u.nom
        FROM messages_prives mp
@@ -294,7 +296,57 @@ const envoyerMessagePrive = async (req, res) => {
   }
 };
 
-// ── GET /api/messages/groupe/:filiereId ──────────────────
+// ── POST /api/messages/prives/read/:userId ──────────────────
+// Marquer les messages d'une conversation comme lus
+const marquerMessagesPrivesLus = async (req, res) => {
+  const { userId } = req.params;
+  try {
+    await pool.query(
+      `UPDATE messages_prives 
+       SET is_read = TRUE 
+       WHERE expediteur_id = $1 AND destinataire_id = $2 AND is_read = FALSE`,
+      [userId, req.user.id]
+    );
+
+    const io = req.app.get('io');
+    if (io) notifierUser(io, userId, 'message:read', { destinataire_id: req.user.id });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+};
+
+// ── POST /api/messages/canaux/:id/membres ─────────────────
+// Ajouter un utilisateur à un canal (ex: prof, admin)
+const ajouterMembreCanal = async (req, res) => {
+  const { id } = req.params;
+  const { userId, role } = req.body; // role = 'membre' ou 'admin'
+
+  if (!userId) {
+    return res.status(400).json({ success: false, error: 'User ID requis' });
+  }
+
+  try {
+    // Vérification basique des droits (seul un admin ou prof devrait faire ça, à affiner selon logique métier)
+    if (req.user.role !== 'admin' && req.user.role !== 'professeur') {
+      return res.status(403).json({ success: false, error: 'Accès refusé' });
+    }
+
+    await pool.query(
+      `INSERT INTO canal_membres (canal_id, user_id, role)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (canal_id, user_id) DO NOTHING`,
+      [id, userId, role || 'membre']
+    );
+
+    res.json({ success: true, message: 'Membre ajouté' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+};
 // Messages du groupe filière
 const getMessagesGroupe = async (req, res) => {
   const { filiereId } = req.params;
@@ -465,6 +517,8 @@ module.exports = {
   getConversationsPrivees,
   getMessagesPrives,
   envoyerMessagePrive,
+  marquerMessagesPrivesLus,
+  ajouterMembreCanal,
   getMessagesGroupe,
   envoyerMessageGroupe,
   ajouterReaction,

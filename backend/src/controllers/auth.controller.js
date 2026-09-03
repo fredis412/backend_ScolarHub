@@ -12,12 +12,34 @@ const genToken = (user) => jwt.sign(
 
 const login = async (req, res) => {
   try {
-    const { matricule, nom, tel, motDePasse, password } = req.body;
+    const { matricule, nom, tel, motDePasse, password, userId, prenom, prenoms } = req.body;
     const mdp = password || motDePasse; // Accepter les deux formats
     let user = null;
 
     try {
-      if (matricule) {
+      if (userId) {
+        const r = await pool.query(
+          `SELECT u.*, e.filiere_id,
+                  COALESCE(e.filiere_nom, p_etu.filiere_nom, u.filiere_nom) AS filiere,
+                  COALESCE(e.niveau, p_etu.niveau, u.niveau) AS niveau_etudiant,
+                  COALESCE(e.email, u.email) AS email_etudiant,
+                  COALESCE(e.tel, u.tel) AS tel_etudiant,
+                  COALESCE(m.permissions->>'domaine', u.admin_domaine, 'Tous') AS admin_domaine,
+                  COALESCE(p.matricule_enfant, p_etu.matricule) AS matricule_enfant,
+                  CASE 
+                    WHEN p_etu.nom IS NOT NULL THEN TRIM(COALESCE(p_etu.prenoms, '') || ' ' || p_etu.nom)
+                    ELSE NULL 
+                  END AS enfant_nom
+           FROM users u
+           LEFT JOIN etudiants e ON u.id = e.user_id
+           LEFT JOIN parents p ON (p.user_id = u.id OR REPLACE(COALESCE(p.telephone, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
+           LEFT JOIN etudiants p_etu ON (p.matricule_enfant = p_etu.matricule OR p.etudiant_id = p_etu.id OR REPLACE(COALESCE(p_etu.tel_parent, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
+           LEFT JOIN membres m ON u.id = m.user_id
+           WHERE u.id::text = $1`,
+          [userId.toString()]
+        );
+        user = r.rows[0];
+      } else if (matricule) {
         const matClean = matricule.trim().toLowerCase();
         const r = await pool.query(
           `SELECT u.*, e.filiere_id,
@@ -42,7 +64,7 @@ const login = async (req, res) => {
         user = r.rows[0];
       } else if (nom && (tel || req.body.telephone)) {
         const telVal = (tel || req.body.telephone).trim().replace(/\s+/g, '');
-        const prenomVal = (req.body.prenom || req.body.prenoms || '').trim();
+        const prenomVal = (prenom || prenoms || req.body.prenom || req.body.prenoms || '').trim();
         const r = await pool.query(
           `SELECT u.*, e.filiere_id,
                   COALESCE(e.filiere_nom, p_etu.filiere_nom, u.filiere_nom) AS filiere,
@@ -73,11 +95,13 @@ const login = async (req, res) => {
       console.warn('Direct PG failed in login, fallback to Supabase SDK:', dbErr.message);
       if (supabase && typeof supabase.from === 'function') {
         let query = supabase.from('users').select('*');
-        if (matricule) {
+        if (userId) {
+          query = query.eq('id', userId);
+        } else if (matricule) {
           const matClean = matricule.trim().toLowerCase();
           query = query.or(`matricule.ilike.${matClean},email.ilike.${matClean}`);
         } else if (nom && tel) {
-          query = query.ilike('nom', nom.trim()).eq('tel', tel.trim());
+          query = query.ilike('nom', `%${nom.trim()}%`);
         }
         const { data, error } = await query.maybeSingle();
         if (!error && data) {

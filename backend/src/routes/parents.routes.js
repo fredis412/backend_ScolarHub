@@ -10,6 +10,48 @@ router.get('/', authMiddleware, requireRole('admin', 'direction'), parentsContro
 // POST /api/parents - Créer un parent
 router.post('/', authMiddleware, requireRole('admin', 'direction'), parentsController.createParent);
 
+// GET /api/parents/mon-enfant - Informations de l'enfant pour le parent connecté
+router.get('/mon-enfant', authMiddleware, async (req, res) => {
+  try {
+    const parentUserId = req.user.id;
+    const r = await pool.query(
+      `SELECT e.id AS etudiant_id, e.matricule, e.nom, e.prenoms, e.filiere_nom, e.niveau, e.domaine, e.email, e.tel,
+              p.relation, p.statut_compte
+       FROM users u
+       LEFT JOIN parents p ON (p.user_id = u.id OR REPLACE(COALESCE(p.telephone, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
+       LEFT JOIN etudiants e ON (e.matricule = p.matricule_enfant OR e.id = p.etudiant_id OR REPLACE(COALESCE(e.tel_parent, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', '') OR e.matricule = u.matricule)
+       WHERE u.id::text = $1 AND e.id IS NOT NULL
+       LIMIT 1`,
+      [parentUserId.toString()]
+    );
+
+    if (!r.rows[0]) {
+      return res.status(404).json({ success: false, message: 'Aucun enfant rattache trouve.' });
+    }
+
+    const etu = r.rows[0];
+    const nomComplet = `${etu.prenoms || ''} ${etu.nom || ''}`.trim();
+
+    res.json({
+      success: true,
+      data: {
+        etudiantId: etu.etudiant_id,
+        matricule: etu.matricule,
+        nom: etu.nom,
+        prenoms: etu.prenoms,
+        nomComplet: nomComplet,
+        filiere: etu.filiere_nom || '',
+        niveau: etu.niveau || '',
+        domaine: etu.domaine || '',
+        relation: etu.relation || 'Parent',
+      }
+    });
+  } catch (err) {
+    console.error('[parents] GET /mon-enfant', err);
+    res.status(500).json({ success: false, message: 'Erreur serveur.' });
+  }
+});
+
 // GET /api/parents/enfant/:etudiantId - Info parent pour un etudiant
 router.get('/enfant/:etudiantId', authMiddleware, async (req, res) => {
   try {

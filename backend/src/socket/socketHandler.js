@@ -56,12 +56,20 @@ function initSocket(io) {
       socket.join(`filiere:${socket.filiere}`);
     }
 
+    // ── Rejoindre une room dynamiquement ──────────────────────
+    socket.on('join_room', (data) => {
+      if (data?.roomId) {
+        socket.join(data.roomId);
+        console.log(`[Socket] user:${userId} a rejoint la room: ${data.roomId}`);
+      }
+    });
+
     // Rejoindre toutes les rooms des canaux accessibles :
     // adhésions explicites + canaux publics (lisibles par tous)
     try {
       const { rows: canaux } = await pool.query(
           `SELECT c.id AS canal_id FROM canaux c
-          WHERE c.type IN ('administration', 'admin_filiere', 'bde', 'general', 'professeurs')
+          WHERE c.type IN ('administration', 'admin_filiere', 'bde', 'general', 'professeurs', 'admin_profs', 'admin_delegues', 'prof_admin', 'prof_prof')
             OR ($2 = 'admin' AND c.type LIKE 'prof_delegues:%')
             OR (c.type LIKE 'prof_delegues:%' AND (
               $1::text IN (SELECT user_id::text FROM professeurs p
@@ -90,23 +98,39 @@ function initSocket(io) {
 
       try {
         // Vérifier que l'utilisateur a le droit d'écrire
-        const { rows: access } = await pool.query(
-           `SELECT 1 FROM canal_membres WHERE canal_id = $1 AND user_id = $2
-           UNION ALL
-           SELECT 1 FROM canaux WHERE id = $1
-             AND type IN ('administration', 'admin_filiere', 'bde', 'general', 'professeurs')`,
-           [canalId, userId]
-        );
-        if (!access.length) return callback?.({ error: 'Accès refusé à ce canal' });
+        const normRole = String(socket.userRole || '').toLowerCase().trim();
+        const isStaff = ['admin', 'professeur', 'prof', 'enseignant', 'teacher'].includes(normRole);
+
+        if (!isStaff) {
+          const { rows: access } = await pool.query(
+             `SELECT 1 FROM canal_membres WHERE canal_id = $1 AND user_id = $2
+             UNION ALL
+             SELECT 1 FROM canaux WHERE id = $1
+               AND (type IN ('administration', 'admin_filiere', 'bde', 'general', 'professeurs', 'admin_profs', 'admin_delegues', 'prof_admin', 'prof_prof')
+                 OR type LIKE 'prof_delegues:%')`,
+             [canalId, userId]
+          );
+          if (!access.length) return callback?.({ error: 'Accès refusé à ce canal' });
+        }
 
         // Persister le message
-        const { rows } = await pool.query(
+        const { rows: inserted } = await pool.query(
           `INSERT INTO messages (canal_id, auteur_id, contenu, type, created_at)
            VALUES ($1, $2, $3, 'canal', NOW())
            RETURNING id, canal_id, auteur_id, contenu, created_at`,
           [canalId, userId, contenu.trim()]
         );
-        const message = rows[0];
+        const msgId = inserted[0].id;
+
+        const { rows: fullMsgs } = await pool.query(
+          `SELECT m.id, m.canal_id, m.auteur_id, m.contenu, m.type, m.created_at,
+                  u.prenoms, u.nom, u.role
+           FROM messages m
+           JOIN users u ON u.id = m.auteur_id
+           WHERE m.id = $1`,
+          [msgId]
+        );
+        const message = fullMsgs[0] || inserted[0];
 
         // Diffuser à tous les membres du canal
         io.to(`canal:${canalId}`).emit('message:canal', message);

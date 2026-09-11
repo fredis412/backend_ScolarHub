@@ -1,52 +1,25 @@
-require('dotenv').config();
-
-// ─────────────────────────────────────────────────────────────────────────────
-// db.js — Couche d'accès aux données via Supabase JS client
-//
-// On utilise directement @supabase/supabase-js (déjà fonctionnel) avec une
-// interface compatible pool.query() pour que tous les controllers existants
-// fonctionnent sans modification.
-//
-// Pourquoi pas pg directement ?
-//   Le host db.PROJECT.supabase.co ne résout qu'en IPv6 (pas de record A),
-//   et le pooler aws-0-eu-central-1 rejette le tenant sur ce réseau.
-// ─────────────────────────────────────────────────────────────────────────────
-
 const { createClient } = require('@supabase/supabase-js');
-const ws = require('ws');
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
-let _supabase = null;
+let supabase = null;
+
 function getSupabase() {
-  if (!_supabase) {
+  if (!supabase) {
     const url = process.env.SUPABASE_URL;
-    const key = process.env.SUPABASE_SERVICE_KEY ||
-                process.env.SUPABASE_SECRET_KEY ||
-                process.env.SUPABASE_ANON_KEY ||
-                process.env.SUPABASE_KEY ||
-                process.env.SUPABASE_PUBLISHABLE_KEY;
-
+    const key = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
     if (!url || !key) {
-      throw new Error(
-        '[DB Config] SUPABASE_URL ou la cle Supabase (SUPABASE_SERVICE_KEY / SUPABASE_ANON_KEY) ' +
-        'est manquante dans les variables d\'environnement Render.'
-      );
+      throw new Error('[DB] SUPABASE_URL et SUPABASE_SECRET_KEY (ou SUPABASE_SERVICE_ROLE_KEY) sont requis dans .env');
     }
-
-    _supabase = createClient(url, key, { realtime: { transport: ws } });
+    supabase = createClient(url, key, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
   }
-  return _supabase;
+  return supabase;
 }
 
-// ─── Wrapper compatible pool.query(text, params) ──────────────────────────
-//
-// Stratégie : utiliser supabase.rpc('execute_sql', {query, params}) si la
-// fonction existe dans la DB, sinon fallback sur l'ORM Supabase.
-//
-// Pour les requêtes SELECT simples, on peut aussi parser le SQL basique.
-// ─────────────────────────────────────────────────────────────────────────────
-
 async function query(text, params) {
-  const supabase = getSupabase();
+  const client = getSupabase();
 
   // La fonction RPC execute_sql actuellement déployée n'applique pas son
   // tableau sql_params aux placeholders PostgreSQL. On injecte donc des
@@ -67,8 +40,7 @@ async function query(text, params) {
   // Log query for debugging syntax errors
   console.log('[DB QUERY]:', sql);
 
-  // Tentative via RPC execute_sql (fonction SQL stockée côté Supabase)
-  const { data, error } = await supabase.rpc('execute_sql', {
+  const { data, error } = await client.rpc('execute_sql', {
     sql_query: sql,
     sql_params: [],
   });
@@ -81,10 +53,26 @@ async function query(text, params) {
       } catch (_) {}
     }
 
-    // Si execute_sql a attrapé une erreur SQL interne (ex: column does not exist)
-    if (parsedData && typeof parsedData === 'object' && !Array.isArray(parsedData) && parsedData.error) {
-      console.error('[DB EXECUTE_SQL SQL_ERROR]:', parsedData.error);
-      throw new Error('[DB SQL Erreur]: ' + parsedData.error);
+    // ✅ CORRIGÉ — bug critique trouvé : la fonction PostgreSQL execute_sql
+    // avale ses propres erreurs SQL dans son bloc EXCEPTION et renvoie
+    // { error, sqlstate } au lieu de lever une vraie exception. Ce code
+    // traitait auparavant CET OBJET D'ERREUR comme s'il s'agissait d'une
+    // ligne de résultat valide (branche `else if (parsedData)` plus bas),
+    // renvoyant silencieusement une "ligne" contenant error/sqlstate au
+    // lieu des vraies colonnes attendues (matricule, nom, module_id...).
+    // Ni Node ni Flutter ne voyaient jamais l'erreur SQL réelle — juste
+    // une liste vide ou incohérente en bout de chaîne. On détecte
+    // maintenant explicitement ce cas et on fait remonter l'erreur.
+    if (
+      parsedData &&
+      typeof parsedData === 'object' &&
+      !Array.isArray(parsedData) &&
+      'error' in parsedData &&
+      'sqlstate' in parsedData
+    ) {
+      console.error('[DB] execute_sql a renvoyé une erreur SQL:', parsedData.error, '(sqlstate ' + parsedData.sqlstate + ')');
+      console.error('[DB] Requete fautive:', sql);
+      throw new Error('[SQL] ' + parsedData.error + ' (sqlstate ' + parsedData.sqlstate + ')');
     }
 
     // SELECT → tableau JSON ; DML → { success, rowCount }
@@ -100,7 +88,6 @@ async function query(text, params) {
 
   // Si la fonction RPC n'existe pas, on log l'erreur pour le debug
   if (error.code === '42883' || error.message.includes('execute_sql')) {
-    // Fonction execute_sql non créée — on relaie l'erreur clairement
     throw new Error(
       '[DB] La fonction SQL execute_sql() est requise dans Supabase.\n' +
       'Créez-la avec : CREATE OR REPLACE FUNCTION execute_sql(sql_query text, sql_params text[] DEFAULT \'{}\')\n' +
@@ -117,10 +104,9 @@ const pool = {
   query,
   // connect() simulé pour les controllers qui utilisent des transactions
   connect: async () => {
-    let released = false;
     return {
       query,
-      release: () => { released = true; },
+      release: () => {},
     };
   },
 };

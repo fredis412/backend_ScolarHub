@@ -4,14 +4,39 @@ const pool = require('../config/db');
 const getNotesEtudiant = async (req, res) => {
     try {
         const userId = req.user.id;
+        const { semestre, annee_academique } = req.query;
+
+        const params = [userId];
+        let filtreSemestre = '';
+        if (semestre) {
+            params.push(semestre);
+            filtreSemestre += ` AND sn.semestre = $${params.length}`;
+        }
+        if (annee_academique) {
+            params.push(annee_academique);
+            filtreSemestre += ` AND sn.annee_academique = $${params.length}`;
+        }
+
+        // Ne renvoie que les notes des sessions validées par l'administration
+        // (sn.statut = 'validee'), et toujours filtrées par l'étudiant
+        // connecté (e.user_id = req.user.id, via le JWT) — jamais celles
+        // d'un autre étudiant. Filtre semestre/annee_academique optionnel,
+        // utilisé par bulletin_screen.dart pour afficher le détail des
+        // modules d'un semestre publié précis.
+        // ✅ Ajout de prof_nom/prof_prenoms/date_session — nécessaires pour
+        // remplacer entièrement vue_notes_etudiants (RLS bloquée) côté
+        // notes_tab.dart étudiant, sans rien perdre à l'affichage.
         const result = await pool.query(`
-            SELECT n.id, n.valeur AS note, m.nom AS module_nom, m.coefficient
+            SELECT n.id, n.valeur AS note, m.nom AS module_nom, m.coefficient,
+                   sn.date_session, u.nom AS prof_nom, u.prenoms AS prof_prenoms
             FROM notes n
             JOIN modules m ON n.module_id = m.id
             JOIN etudiants e ON n.etudiant_id = e.id
-            WHERE e.user_id = $1
+            JOIN sessions_notes sn ON n.session_id = sn.id
+            LEFT JOIN users u ON sn.professeur_id = u.id
+            WHERE e.user_id = $1 AND sn.statut = 'validee'${filtreSemestre}
             ORDER BY m.nom
-        `, [userId]);
+        `, params);
 
         res.json({ success: true, data: result.rows });
     } catch (error) {
@@ -24,6 +49,14 @@ const generateBulletinPdf = async (req, res) => {
     try {
         const etudiantId = req.params.etudiantId;
 
+        // ✅ CORRIGÉ (sécurité) : sans ce contrôle, n'importe quel utilisateur
+        // connecté pouvait télécharger le bulletin de n'importe quel autre
+        // étudiant en changeant l'id dans l'URL. Seul l'étudiant concerné
+        // (req.user.id === etudiantId) ou un admin peut générer ce bulletin.
+        if (req.user.role !== 'admin' && req.user.id !== etudiantId) {
+            return res.status(403).json({ error: "Accès refusé : vous ne pouvez générer que votre propre bulletin." });
+        }
+
         // Fetch student details
         const studentQuery = `SELECT nom, prenoms, matricule FROM users WHERE id = $1 AND (role ILIKE '%etudiant%' OR role ILIKE '%delegue%' OR role ILIKE '%bde%')`;
         const studentResult = await pool.query(studentQuery, [etudiantId]);
@@ -35,12 +68,17 @@ const generateBulletinPdf = async (req, res) => {
         const etudiant = studentResult.rows[0];
 
         // Fetch notes
+        // ✅ CORRIGÉ : n'inclut désormais que les notes des sessions
+        // validées par l'administration (sn.statut = 'validee'). Avant,
+        // un étudiant pouvait recevoir un bulletin incluant des notes
+        // jamais publiées.
         const notesQuery = `
             SELECT m.nom AS matiere, m.coefficient, n.valeur AS note
             FROM notes n
             JOIN modules m ON n.module_id = m.id
             JOIN etudiants e ON n.etudiant_id = e.id
-            WHERE e.user_id = $1
+            JOIN sessions_notes sn ON n.session_id = sn.id
+            WHERE e.user_id = $1 AND sn.statut = 'validee'
         `;
 
         const notesResult = await pool.query(notesQuery, [etudiantId]);
@@ -98,6 +136,12 @@ const generateBulletinPdf = async (req, res) => {
 
         let moyenneGenerale = sumCoefs > 0 ? (sumNotes / sumCoefs) : 0;
 
+        // ⚠️ TODO(business) : la mention de la moyenne GÉNÉRALE (bulletin)
+        // doit utiliser Validé/Ajourné/Invalidé, pas Très Bien/Bien/...
+        // (ces dernières s'appliquent aux notes/moyennes de CHAQUE module,
+        // pas à la moyenne générale). En attente des seuils exacts
+        // (ex. Validé >= 10 ? Ajourné entre X et 10 ? Invalidé < Y ?)
+        // avant de remplacer la ligne ci-dessous.
         let mention = "Passable";
         if (moyenneGenerale >= 16) mention = "Très Bien";
         else if (moyenneGenerale >= 14) mention = "Bien";
@@ -121,18 +165,27 @@ const generateBulletinPdf = async (req, res) => {
 
 const createGradeSession = async (req, res) => {
     try {
-        const { filiere_id, filiere_nom, niveau, module_id, notes, statut } = req.body;
+        const { filiere_id, filiere_nom, niveau, module_id, notes, statut, mention, semestre, annee_academique } = req.body;
         const professeur_id = req.user.id;
         const statutFinal = statut === 'validee' ? 'validee' : 'en_attente';
 
         if (!filiere_id || !module_id) {
             return res.status(400).json({ success: false, message: 'filiere_id et module_id sont requis.' });
         }
+        if (!semestre || !annee_academique) {
+            return res.status(400).json({ success: false, message: 'semestre et annee_academique sont requis.' });
+        }
 
+        // La mention (Très Bien/Bien/Assez Bien/Passable/Insuffisant) est
+        // choisie par le professeur pour l'ensemble de la session — elle
+        // qualifie la performance globale de la classe sur ce module, pas
+        // une note individuelle. semestre/annee_academique sont requis pour
+        // que la préparation du bulletin (moyenne générale du semestre)
+        // puisse retrouver les bonnes notes.
         const sessionResult = await pool.query(`
-            INSERT INTO sessions_notes (filiere_id, filiere_nom, niveau, module_id, professeur_id, statut, is_sent)
-            VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
-        `, [filiere_id, filiere_nom || '', niveau || 'Tous', module_id, professeur_id, statutFinal, statutFinal === 'validee']);
+            INSERT INTO sessions_notes (filiere_id, filiere_nom, niveau, module_id, professeur_id, statut, is_sent, mention, semestre, annee_academique)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id
+        `, [filiere_id, filiere_nom || '', niveau || 'Tous', module_id, professeur_id, statutFinal, statutFinal === 'validee', mention || null, semestre, annee_academique]);
 
         const session_id = sessionResult.rows[0].id;
         const skippedStudents = [];
@@ -169,6 +222,8 @@ const createGradeSession = async (req, res) => {
 };
 
 // GET /api/notes/sessions/admin/all - Toutes les sessions (admin), avec notes détaillées
+// ✅ CORRIGÉ : jointure vers filieres ajoutée pour exposer le vrai champ
+// domaine (au lieu de laisser le Flutter deviner via le nom de la filière).
 const getAllSessionsAdmin = async (req, res) => {
     try {
         const { statut } = req.query;
@@ -183,7 +238,8 @@ const getAllSessionsAdmin = async (req, res) => {
             SELECT sn.id, sn.filiere_id, sn.filiere_nom, sn.niveau, sn.module_id,
                    m.nom AS module_nom, m.coefficient,
                    sn.professeur_id, u.nom AS prof_nom, u.prenoms AS prof_prenoms,
-                   sn.date_session, sn.statut, sn.is_sent,
+                   sn.date_session, sn.statut, sn.is_sent, sn.mention,
+                   f.domaine AS domaine,
                    COALESCE(
                      json_agg(
                        json_build_object(
@@ -195,10 +251,11 @@ const getAllSessionsAdmin = async (req, res) => {
             FROM sessions_notes sn
             JOIN modules m ON sn.module_id = m.id
             JOIN users u ON sn.professeur_id = u.id
+            LEFT JOIN filieres f ON f.id = sn.filiere_id
             LEFT JOIN notes n ON n.session_id = sn.id
             LEFT JOIN etudiants e ON n.etudiant_id = e.id
             ${where}
-            GROUP BY sn.id, m.nom, m.coefficient, u.nom, u.prenoms
+            GROUP BY sn.id, m.nom, m.coefficient, u.nom, u.prenoms, f.domaine
             ORDER BY sn.date_session DESC
         `, params);
 
@@ -329,11 +386,13 @@ const updateGradeSession = async (req, res) => {
 };
 
 // GET /api/notes/moyennes - Moyennes générales de tous les étudiants (admin), basées sur les notes validées
+// ✅ CORRIGÉ : ajout de f.domaine dans le SELECT et le GROUP BY.
 const getMoyennesAdmin = async (req, res) => {
     try {
         const result = await pool.query(`
             SELECT e.id AS etudiant_id, e.matricule, e.nom, e.prenoms,
                    COALESCE(e.filiere_nom, f.nom) AS filiere_nom, e.niveau,
+                   f.domaine AS domaine,
                    ROUND(SUM(n.valeur * m.coefficient) / NULLIF(SUM(m.coefficient), 0), 2) AS moyenne,
                    COUNT(n.id) AS nb_notes
             FROM notes n
@@ -342,7 +401,7 @@ const getMoyennesAdmin = async (req, res) => {
             JOIN sessions_notes sn ON n.session_id = sn.id
             LEFT JOIN filieres f ON f.id = e.filiere_id
             WHERE sn.statut = 'validee'
-            GROUP BY e.id, e.matricule, e.nom, e.prenoms, e.filiere_nom, f.nom, e.niveau
+            GROUP BY e.id, e.matricule, e.nom, e.prenoms, e.filiere_nom, f.nom, f.domaine, e.niveau
             HAVING SUM(m.coefficient) > 0
             ORDER BY moyenne DESC
         `);
@@ -386,6 +445,66 @@ const markSessionSent = async (req, res) => {
     }
 };
 
+// GET /api/notes/mon-apercu (étudiant connecté)
+// ✅ NOUVEAU — remplace les requêtes Supabase directes de home_tab.dart
+// (moyenne + taux de présence), bloquées silencieusement par RLS activé
+// sans politique sur `etudiants`/`notes`/`sessions_notes` (découvert le
+// 03/09 : relrowsecurity = true sur la quasi-totalité des tables). Toujours
+// scopé par req.user.id (JWT) — jamais les données d'un autre étudiant.
+const getMonApercu = async (req, res) => {
+    try {
+        const userId = req.user.id;
+
+        const etudiantResult = await pool.query(
+            `SELECT id FROM etudiants WHERE user_id = $1`,
+            [userId]
+        );
+        const etudiant = etudiantResult.rows[0];
+        if (!etudiant) {
+            return res.status(404).json({ success: false, message: 'Profil étudiant introuvable.' });
+        }
+
+        // Moyenne pondérée par coefficient, toutes notes validées confondues
+        // (pas de filtre semestre — reflète l'ensemble de l'année en cours,
+        // cohérent avec l'ancien calcul client-side qu'on remplace).
+        const notesResult = await pool.query(`
+            SELECT n.valeur, m.coefficient
+            FROM notes n
+            JOIN modules m ON n.module_id = m.id
+            JOIN sessions_notes sn ON n.session_id = sn.id AND sn.statut = 'validee'
+            WHERE n.etudiant_id = $1
+        `, [etudiant.id]);
+
+        let moyenne = null;
+        if (notesResult.rows.length > 0) {
+            let sommePonderee = 0;
+            let sommeCoef = 0;
+            for (const n of notesResult.rows) {
+                sommePonderee += Number(n.valeur) * Number(n.coefficient);
+                sommeCoef += Number(n.coefficient);
+            }
+            if (sommeCoef > 0) moyenne = Math.round((sommePonderee / sommeCoef) * 100) / 100;
+        }
+
+        // Taux de présence via la vue vue_presences_etudiants (déjà utilisée
+        // ailleurs dans le projet).
+        const presResult = await pool.query(`
+            SELECT presence_statut FROM vue_presences_etudiants WHERE etudiant_id = $1
+        `, [etudiant.id]);
+
+        let tauxPresence = null;
+        if (presResult.rows.length > 0) {
+            const presents = presResult.rows.filter(p => p.presence_statut === 'present').length;
+            tauxPresence = Math.round((presents / presResult.rows.length) * 10000) / 100;
+        }
+
+        res.json({ success: true, data: { moyenne, tauxPresence } });
+    } catch (error) {
+        console.error('[getMonApercu]', error);
+        res.status(500).json({ success: false, message: 'Erreur lors du calcul de l\'aperçu.' });
+    }
+};
+
 module.exports = {
     getNotesEtudiant,
     generateBulletinPdf,
@@ -397,5 +516,6 @@ module.exports = {
     getAllSessionsAdmin,
     validateSessionAdmin,
     rejectSessionAdmin,
-    getMoyennesAdmin
+    getMoyennesAdmin,
+    getMonApercu,
 };

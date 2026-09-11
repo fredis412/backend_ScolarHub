@@ -6,6 +6,10 @@ const { authMiddleware, requireRole } = require('../middleware/auth.middleware')
 // Notes de l'étudiant connecté
 router.get('/etudiant', authMiddleware, notesController.getNotesEtudiant);
 
+// ✅ NOUVEAU — moyenne + taux de présence de l'étudiant connecté (remplace
+// les requêtes Supabase directes de home_tab.dart, bloquées par RLS).
+router.get('/mon-apercu', authMiddleware, notesController.getMonApercu);
+
 // Export PDF des bulletins
 router.get('/bulletin/:etudiantId', authMiddleware, notesController.generateBulletinPdf);
 

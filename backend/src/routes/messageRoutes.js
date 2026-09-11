@@ -17,6 +17,7 @@ const {
   ajouterMembreCanal,
   getMessagesGroupe,
   envoyerMessageGroupe,
+  getProfFilieres,
   ajouterReaction,
   supprimerMessage,
   getAdminContact,
@@ -40,9 +41,10 @@ router.post('/prives/read/:userId', marquerMessagesPrivesLus);
 // ── Gestion des membres de canaux ─────────────────────────
 router.post('/canaux/:id/membres', ajouterMembreCanal);
 
-// ── Groupe filière ────────────────────────────────────────
-router.get('/groupe/:filiereId', getMessagesGroupe);
-router.post('/groupe/:filiereId',envoyerMessageGroupe);
+// ── Groupe filière ───────────────────────────────────────
+router.get('/groupe/mes-filieres', getProfFilieres);  // lister filières du prof
+router.get('/groupe/:filiereId',   getMessagesGroupe);
+router.post('/groupe/:filiereId',  envoyerMessageGroupe);
 
 // ── Réactions & suppression ───────────────────────────────
 router.post('/:id/reaction',     ajouterReaction);

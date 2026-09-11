@@ -12,24 +12,78 @@ const { resolveFiliere, normalizeNiveau } = require('../utils/filieres');
 // Types de canaux « publics » : lisibles par tout utilisateur authentifié,
 // sans inscription préalable dans canal_membres (les droits d'écriture
 // restent gérés par rôle côté app / canal_membres).
-const CANAUX_PUBLICS = ['administration', 'admin_filiere', 'bde', 'general', 'professeurs', 'prof_admin', 'admin_profs'];
+const STANDARD_CANAUX = {
+  1: { nom: 'Administration', type: 'administration', description: 'Annonces officielles de l\'administration' },
+  2: { nom: 'Admin & Filière', type: 'admin_filiere', description: 'Échanges entre l\'administration et les délégués de filière' },
+  3: { nom: 'Bureau des Étudiants', type: 'bde', description: 'Annonces et activités du BDE' },
+  4: { nom: 'Salle des Professeurs', type: 'professeurs', description: 'Canal d\'échanges entre professeurs' },
+  5: { nom: 'Administration & Professeurs', type: 'admin_profs', description: 'Canal officiel Admin ↔ Tous les professeurs' },
+  6: { nom: 'Administration & Délégués', type: 'admin_delegues', description: 'Canal officiel Admin ↔ Délégués de filières' },
+};
+
+async function ensureCanalExists(canalId) {
+  const numId = parseInt(canalId, 10);
+  if (!numId) return null;
+  const { rows: existing } = await pool.query('SELECT id, type, nom FROM canaux WHERE id = $1', [numId]);
+  if (existing.length) return existing[0];
+
+  // Si c'est un canal standard manquant, le créer automatiquement dans la base
+  if (STANDARD_CANAUX[numId]) {
+    const std = STANDARD_CANAUX[numId];
+    try {
+      const { rows } = await pool.query(
+        `INSERT INTO canaux (id, nom, description, type)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (id) DO UPDATE SET type = EXCLUDED.type
+         RETURNING id, type, nom`,
+        [numId, std.nom, std.description, std.type]
+      );
+      return rows[0];
+    } catch (e) {
+      console.error('[ensureCanalExists] Erreur création canal standard:', e.message);
+    }
+  }
+  return null;
+}
 
 // Vérifie l'accès d'un utilisateur à un canal : membre, ou canal public.
-async function accesCanal(canalId, userId) {
+// Accepte aussi les professeurs sur les canaux prof/admin par rôle JWT.
+async function accesCanal(canalId, userId, userRole) {
+  const normRole = String(userRole || '').toLowerCase().trim();
+
+  // 1. Admin ou Professeur : accès automatique à tous les canaux de communication
+  if (['admin', 'professeur', 'prof', 'enseignant', 'teacher'].includes(normRole)) {
+    return true;
+  }
+
+  // 2. Vérifier si membre explicite du canal
   const { rows: membre } = await pool.query(
     `SELECT role FROM canal_membres WHERE canal_id = $1 AND user_id = $2`,
     [canalId, userId]
   );
   if (membre.length) return true;
-  const { rows: canal } = await pool.query(
-    `SELECT 1 FROM canaux
-     WHERE id = $1
-        AND (type IN ('administration', 'admin_filiere', 'bde', 'general', 'professeurs', 'prof_admin', 'admin_profs')
-          OR type LIKE 'prof_delegues:%')`,
-    [canalId]
-  );
-  return canal.length > 0;
+
+  // 3. S'assurer que le canal existe en BDD
+  const canal = await ensureCanalExists(canalId);
+  const numId = parseInt(canalId, 10);
+  const type = canal ? canal.type : (STANDARD_CANAUX[numId] ? STANDARD_CANAUX[numId].type : null);
+
+  if (!type) return false;
+
+  // Canaux lisibles/éditables par tous
+  if (['administration', 'admin_filiere', 'bde', 'general'].includes(type)) return true;
+
+  // Canaux délégués
+  if (type === 'admin_delegues') {
+    return ['delegue', 'delegue_adjoint'].includes(normRole);
+  }
+
+  // Canaux prof_delegues par filière
+  if (type.startsWith('prof_delegues:')) return true;
+
+  return false;
 }
+
 
 // ── GET /api/messages/canaux ──────────────────────────────
 // Liste des canaux accessibles par l'utilisateur connecté
@@ -60,8 +114,8 @@ const getMessagesCanal = async (req, res) => {
   const avant  = req.query.avant || null; // pour la pagination
 
   try {
-    // Vérifier l'accès (membre ou canal public)
-    if (!(await accesCanal(id, req.user.id))) {
+    // Vérifier l'accès (membre, canal public, ou rôle autorisé)
+    if (!(await accesCanal(id, req.user.id, req.user.role))) {
       return res.status(403).json({ success: false, error: 'Accès refusé à ce canal' });
     }
 
@@ -188,17 +242,28 @@ const envoyerMessageCanal = async (req, res) => {
   }
 
   try {
-    // Vérifier les droits d'écriture (membre ou canal public)
-    if (!(await accesCanal(id, req.user.id))) {
+    // Vérifier les droits d'écriture (membre, canal public, ou rôle autorisé)
+    if (!(await accesCanal(id, req.user.id, req.user.role))) {
       return res.status(403).json({ success: false, error: 'Accès refusé' });
     }
 
-    const { data: message, error } = await supabase
-      .from('messages')
-      .insert({ canal_id: id, auteur_id: req.user.id, contenu: contenu.trim(), type: 'canal' })
-      .select('id, canal_id, auteur_id, contenu, created_at')
-      .single();
-    if (error) throw error;
+    const { rows: inserted } = await pool.query(
+      `INSERT INTO messages (canal_id, auteur_id, contenu, type, created_at)
+       VALUES ($1, $2, $3, 'canal', NOW())
+       RETURNING id, canal_id, auteur_id, contenu, created_at`,
+      [id, req.user.id, contenu.trim()]
+    );
+    const msgId = inserted[0].id;
+
+    const { rows: fullMsgs } = await pool.query(
+      `SELECT m.id, m.canal_id, m.auteur_id, m.contenu, m.type, m.created_at,
+              u.prenoms, u.nom, u.role
+       FROM messages m
+       JOIN users u ON u.id = m.auteur_id
+       WHERE m.id = $1`,
+      [msgId]
+    );
+    const message = fullMsgs[0] || inserted[0];
 
     // Émettre via Socket.io si disponible
     const io = req.app.get('io');
@@ -347,22 +412,56 @@ const ajouterMembreCanal = async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 };
+// ── GET /api/messages/groupe/mes-filieres ────────────────
+// Filières enseignées par le professeur connecté
+const getProfFilieres = async (req, res) => {
+  try {
+    const role = String(req.user.role || '').toLowerCase();
+    if (!['admin', 'professeur', 'prof', 'enseignant', 'teacher'].includes(role)) {
+      return res.status(403).json({ success: false, error: 'Accès réservé aux professeurs' });
+    }
+    // Récupère les filières via module_professeur → modules → filieres
+    const { rows } = await pool.query(
+      `SELECT DISTINCT f.id, f.nom, f.description
+       FROM filieres f
+       JOIN modules mo ON mo.filiere_id = f.id
+       JOIN module_professeur mp ON mp.module_id = mo.id
+       JOIN professeurs p ON p.id = mp.professeur_id
+       WHERE p.user_id = $1
+       ORDER BY f.nom`,
+      [req.user.id]
+    );
+    // Si aucune filière via modules, renvoyer toutes les filières (si admin ou prof sans affectation)
+    if (!rows.length && (role === 'admin' || role === 'professeur' || role === 'prof')) {
+      const { rows: all } = await pool.query('SELECT id, nom, description FROM filieres ORDER BY nom');
+      return res.json({ success: true, data: all });
+    }
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error('[getProfFilieres]', err);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+};
+
 // Messages du groupe filière
 const getMessagesGroupe = async (req, res) => {
   const { filiereId } = req.params;
   const limite = parseInt(req.query.limite) || 50;
 
   try {
-    // Vérifier que l'utilisateur appartient à la filière
+    const role = String(req.user.role || '').toLowerCase();
+    const isStaff = ['admin', 'professeur', 'prof', 'enseignant', 'teacher'].includes(role);
+
+    // Vérifier que l'utilisateur appartient à la filière (étudiant) ou est staff
     const appartientJwt = req.user.filiere_id != null &&
       String(req.user.filiere_id) === String(filiereId);
-    const { rows: check } = appartientJwt
+    const { rows: check } = (appartientJwt || isStaff)
       ? { rows: [{ ok: true }] }
       : await pool.query(
           `SELECT 1 FROM etudiants WHERE user_id = $1 AND filiere_id = $2`,
           [req.user.id, filiereId]
         );
-    if (!check.length && req.user.role !== 'admin' && req.user.role !== 'professeur') {
+    if (!check.length) {
       return res.status(403).json({ success: false, error: 'Accès refusé' });
     }
 
@@ -394,29 +493,37 @@ const envoyerMessageGroupe = async (req, res) => {
   }
 
   try {
+    const role = String(req.user.role || '').toLowerCase();
+    const isStaff = ['admin', 'professeur', 'prof', 'enseignant', 'teacher'].includes(role);
+
     const appartientJwt = req.user.filiere_id != null &&
       String(req.user.filiere_id) === String(filiereId);
-    const { rows: check } = appartientJwt
+    const { rows: check } = (appartientJwt || isStaff)
       ? { rows: [{ ok: true }] }
       : await pool.query(
           `SELECT 1 FROM etudiants WHERE user_id = $1 AND filiere_id = $2`,
           [req.user.id, filiereId]
         );
-    if (!check.length && req.user.role !== 'admin' && req.user.role !== 'professeur') {
+    if (!check.length) {
       return res.status(403).json({ success: false, error: 'Vous n\'appartenez pas à cette filière' });
     }
 
-    const { data: message, error } = await supabase
-      .from('messages_groupe')
-      .insert({ filiere_id: filiereId, auteur_id: req.user.id, contenu: contenu.trim() })
-      .select('id, filiere_id, auteur_id, contenu, created_at, users(prenoms, nom)')
-      .single();
-    if (error) throw error;
+    const { rows: inserted } = await pool.query(
+      `INSERT INTO messages_groupe (filiere_id, auteur_id, contenu, created_at)
+       VALUES ($1, $2, $3, NOW())
+       RETURNING id, filiere_id, auteur_id, contenu, created_at`,
+      [filiereId, req.user.id, contenu.trim()]
+    );
+
+    const { rows: userRows } = await pool.query(
+      `SELECT prenoms, nom FROM users WHERE id = $1`,
+      [req.user.id]
+    );
 
     const messageAvecAuteur = {
-      ...message,
-      prenoms: message.users?.prenoms,
-      nom: message.users?.nom,
+      ...inserted[0],
+      prenoms: userRows[0]?.prenoms,
+      nom: userRows[0]?.nom,
     };
 
     const io = req.app.get('io');
@@ -521,6 +628,7 @@ module.exports = {
   ajouterMembreCanal,
   getMessagesGroupe,
   envoyerMessageGroupe,
+  getProfFilieres,
   ajouterReaction,
   supprimerMessage,
   getAdminContact,

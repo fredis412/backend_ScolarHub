@@ -21,6 +21,7 @@ router.get('/modules',    authMiddleware, ctrl.getModules);
 router.get('/:id',        authMiddleware, ctrl.getProfesseurById);
 router.get('/:id/modules', authMiddleware, ctrl.getModulesByProfesseur);
 router.get('/classes/:filiere_id/students', authMiddleware, ctrl.getStudentsByFiliere);
+router.get('/classes/:filiere_id/students/pdf', authMiddleware, ctrl.getStudentsByFilierePdf);
 
 // ── Disponibilités ────────────────────────────────────────────────────────────
 router.get('/disponibilites/all', authMiddleware, requireRole('admin'), ctrl.getAllDisponibilites);

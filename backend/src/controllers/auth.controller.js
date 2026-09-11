@@ -25,15 +25,15 @@ const login = async (req, res) => {
                   COALESCE(e.email, u.email) AS email_etudiant,
                   COALESCE(e.tel, u.tel) AS tel_etudiant,
                   COALESCE(m.permissions->>'domaine', u.admin_domaine, 'Tous') AS admin_domaine,
-                  COALESCE(p.matricule_enfant, p_etu.matricule) AS matricule_enfant,
+                  COALESCE(p.matricule, p_etu.matricule) AS matricule_enfant,
                   CASE 
                     WHEN p_etu.nom IS NOT NULL THEN TRIM(COALESCE(p_etu.prenoms, '') || ' ' || p_etu.nom)
                     ELSE NULL 
                   END AS enfant_nom
            FROM users u
            LEFT JOIN etudiants e ON u.id = e.user_id
-           LEFT JOIN parents p ON (p.user_id = u.id OR REPLACE(COALESCE(p.telephone, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
-           LEFT JOIN etudiants p_etu ON (p.matricule_enfant = p_etu.matricule OR p.etudiant_id = p_etu.id OR REPLACE(COALESCE(p_etu.tel_parent, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
+           LEFT JOIN parents p ON (p.user_id = u.id OR REPLACE(COALESCE(p.tel, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
+           LEFT JOIN etudiants p_etu ON (p.matricule = p_etu.matricule OR REPLACE(COALESCE(p_etu.tel_parent, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
            LEFT JOIN membres m ON u.id = m.user_id
            WHERE u.id::text = $1`,
           [userId.toString()]
@@ -48,15 +48,15 @@ const login = async (req, res) => {
                   COALESCE(e.email, u.email) AS email_etudiant,
                   COALESCE(e.tel, u.tel) AS tel_etudiant,
                   COALESCE(m.permissions->>'domaine', u.admin_domaine, 'Tous') AS admin_domaine,
-                  COALESCE(p.matricule_enfant, p_etu.matricule) AS matricule_enfant,
+                  COALESCE(p.matricule, p_etu.matricule) AS matricule_enfant,
                   CASE 
                     WHEN p_etu.nom IS NOT NULL THEN TRIM(COALESCE(p_etu.prenoms, '') || ' ' || p_etu.nom)
                     ELSE NULL 
                   END AS enfant_nom
            FROM users u
            LEFT JOIN etudiants e ON u.id = e.user_id
-           LEFT JOIN parents p ON (p.user_id = u.id OR REPLACE(COALESCE(p.telephone, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
-           LEFT JOIN etudiants p_etu ON (p.matricule_enfant = p_etu.matricule OR p.etudiant_id = p_etu.id OR REPLACE(COALESCE(p_etu.tel_parent, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
+           LEFT JOIN parents p ON (p.user_id = u.id OR REPLACE(COALESCE(p.tel, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
+           LEFT JOIN etudiants p_etu ON (p.matricule = p_etu.matricule OR REPLACE(COALESCE(p_etu.tel_parent, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
            LEFT JOIN membres m ON u.id = m.user_id
            WHERE LOWER(u.matricule) = $1 OR LOWER(u.email) = $1`,
           [matClean]
@@ -71,15 +71,15 @@ const login = async (req, res) => {
                   COALESCE(e.niveau, p_etu.niveau, u.niveau) AS niveau_etudiant,
                   COALESCE(e.email, u.email) AS email_etudiant,
                   COALESCE(e.tel, u.tel) AS tel_etudiant,
-                  COALESCE(p.matricule_enfant, p_etu.matricule) AS matricule_enfant,
+                  COALESCE(p.matricule, p_etu.matricule) AS matricule_enfant,
                   CASE 
                     WHEN p_etu.nom IS NOT NULL THEN TRIM(COALESCE(p_etu.prenoms, '') || ' ' || p_etu.nom)
                     ELSE NULL 
                   END AS enfant_nom
            FROM users u 
            LEFT JOIN etudiants e ON u.id = e.user_id 
-           LEFT JOIN parents p ON (p.user_id = u.id OR REPLACE(COALESCE(p.telephone, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
-           LEFT JOIN etudiants p_etu ON (p.matricule_enfant = p_etu.matricule OR p.etudiant_id = p_etu.id OR REPLACE(COALESCE(p_etu.tel_parent, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
+           LEFT JOIN parents p ON (p.user_id = u.id OR REPLACE(COALESCE(p.tel, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
+           LEFT JOIN etudiants p_etu ON (p.matricule = p_etu.matricule OR REPLACE(COALESCE(p_etu.tel_parent, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
            WHERE LOWER(TRIM(u.nom)) = LOWER(TRIM($1)) 
              AND (REPLACE(COALESCE(u.tel, ''), ' ', '') = $2 OR REPLACE(COALESCE(u.tel, ''), ' ', '') LIKE $3)
              ${prenomVal ? "AND (LOWER(TRIM(u.prenoms)) = LOWER(TRIM($4)) OR LOWER(u.prenoms) LIKE $5)" : ""}`,
@@ -115,7 +115,7 @@ const login = async (req, res) => {
     if (user.statut === 'renvoye') return res.status(403).json({ message: 'Compte desactive.' });
 
     const motDePasseExiste = user.mot_de_passe && user.mot_de_passe.trim() !== '' && user.mot_de_passe !== 'null';
-    const isFirstTimeRole = !user.role || user.role === 'etudiant' || user.role === 'bde' || user.role === 'parent';
+    const isFirstTimeRole = !user.role || user.role === 'etudiant' || user.role === 'bde' || user.role === 'parent' || user.role === 'professeur';
     const estPremiereFois = isFirstTimeRole && (user.premierefois === true || user.premiere_fois === true || !motDePasseExiste);
 
     // Première connexion : pas encore de mot de passe défini en base (étudiants et parents)
@@ -178,7 +178,7 @@ const login = async (req, res) => {
       pool.query(
         `UPDATE parents SET user_id = $1
          WHERE user_id IS NULL
-           AND (REPLACE(COALESCE(telephone,''),' ','') = $2
+           AND (REPLACE(COALESCE(tel,''),' ','') = $2
             OR LOWER(nom) = LOWER($3))`,
         [safeUser.id, telClean, safeUser.nom || '']
       ).catch(e => console.warn('[LOGIN] Sync parents.user_id:', e.message));
@@ -257,13 +257,13 @@ const lookup = async (req, res) => {
                   COALESCE(e.filiere_nom, p_etu.filiere_nom, u.filiere_nom) AS filiere_nom,
                   COALESCE(e.domaine, p_etu.domaine, u.domaine)        AS domaine,
                   COALESCE(e.niveau, p_etu.niveau, u.niveau)          AS niveau,
-                  COALESCE(p.matricule_enfant, p_etu.matricule) AS matricule_enfant,
+                  COALESCE(p.matricule, p_etu.matricule) AS matricule_enfant,
                   p_etu.nom AS enfant_nom,
                   p_etu.prenoms AS enfant_prenoms
            FROM users u
            LEFT JOIN etudiants e ON u.id = e.user_id
-           LEFT JOIN parents p ON (p.user_id = u.id OR REPLACE(COALESCE(p.telephone, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
-           LEFT JOIN etudiants p_etu ON (p.matricule_enfant = p_etu.matricule OR p.etudiant_id = p_etu.id OR REPLACE(COALESCE(p_etu.tel_parent, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
+           LEFT JOIN parents p ON (p.user_id = u.id OR REPLACE(COALESCE(p.tel, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
+           LEFT JOIN etudiants p_etu ON (p.matricule = p_etu.matricule OR REPLACE(COALESCE(p_etu.tel_parent, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
            WHERE UPPER(TRIM(u.matricule)) = $1 OR LOWER(TRIM(u.email)) = LOWER(TRIM($1))`,
           [matricule]
         );
@@ -301,13 +301,13 @@ const lookup = async (req, res) => {
                   COALESCE(e.filiere_nom, p_etu.filiere_nom, u.filiere_nom) AS filiere_nom,
                   COALESCE(e.domaine, p_etu.domaine, u.domaine)        AS domaine,
                   COALESCE(e.niveau, p_etu.niveau, u.niveau)          AS niveau,
-                  COALESCE(p.matricule_enfant, p_etu.matricule) AS matricule_enfant,
+                  COALESCE(p.matricule, p_etu.matricule) AS matricule_enfant,
                   p_etu.nom AS enfant_nom,
                   p_etu.prenoms AS enfant_prenoms
            FROM users u
            LEFT JOIN etudiants e ON u.id = e.user_id
-           LEFT JOIN parents p ON (p.user_id = u.id OR REPLACE(COALESCE(p.telephone, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
-           LEFT JOIN etudiants p_etu ON (p.matricule_enfant = p_etu.matricule OR p.etudiant_id = p_etu.id OR REPLACE(COALESCE(p_etu.tel_parent, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
+           LEFT JOIN parents p ON (p.user_id = u.id OR REPLACE(COALESCE(p.tel, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
+           LEFT JOIN etudiants p_etu ON (p.matricule = p_etu.matricule OR REPLACE(COALESCE(p_etu.tel_parent, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
            WHERE LOWER(TRIM(u.nom)) = LOWER(TRIM($1))
              AND (LOWER(TRIM(u.prenoms)) = LOWER(TRIM($2)) OR LOWER(u.prenoms) LIKE LOWER($3) OR LOWER(u.nom) LIKE LOWER($3))
              AND (REPLACE(COALESCE(u.tel, ''), ' ', '') = $4 OR REPLACE(COALESCE(u.tel, ''), ' ', '') LIKE $5 OR $4 LIKE ('%' || REPLACE(COALESCE(u.tel, ''), ' ', '') || '%'))`,

@@ -165,7 +165,7 @@ const listEtudiants = async (req, res) => {
         COALESCE(e.filiere_nom, f.nom) AS filiere_nom
       FROM users u
       LEFT JOIN etudiants e ON u.id = e.user_id
-      LEFT JOIN filieres f ON f.id = COALESCE(e.filiere_id, u.filiere_id)
+      LEFT JOIN filieres f ON f.id = e.filiere_id
       WHERE u.role ILIKE '%etudiant%' OR u.role ILIKE '%delegue%' OR u.role ILIKE '%bde%'
     `;
 

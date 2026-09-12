@@ -88,8 +88,8 @@ const login = async (req, res) => {
            WHERE LOWER(TRIM(u.nom)) = LOWER(TRIM($1)) 
              AND (REPLACE(COALESCE(u.tel, ''), ' ', '') = $2 OR REPLACE(COALESCE(u.tel, ''), ' ', '') LIKE $3)
              ${prenomVal ? "AND (LOWER(TRIM(u.prenoms)) = LOWER(TRIM($4)) OR LOWER(u.prenoms) LIKE $5)" : ""}`,
-          prenomVal 
-            ? [nom.trim(), telVal, `%${telVal}%`, prenomVal, `%${prenomVal}%`] 
+          prenomVal
+            ? [nom.trim(), telVal, `%${telVal}%`, prenomVal, `%${prenomVal}%`]
             : [nom.trim(), telVal, `%${telVal}%`]
         );
         user = r.rows[0];
@@ -112,6 +112,37 @@ const login = async (req, res) => {
         if (!error && data) {
           user = data;
         }
+      }
+    }
+
+    // ── Fallback 2 : chercher directement dans administrateurs si pas trouvé ──
+    // (cas des admins créés uniquement dans Supabase, sans entrée dans users)
+    if (!user) {
+      try {
+        let admQuery = supabase.from('administrateurs')
+          .select('id, nom, prenoms, email, tel, matricule, role, admin_sub_role, statut, mot_de_passe, permissions, domaine_admin');
+        if (matricule) {
+          const matClean = matricule.trim().toLowerCase();
+          admQuery = admQuery.or(`matricule.ilike.${matClean},email.ilike.${matClean}`);
+        } else if (nom && tel) {
+          const telClean = tel.trim().replace(/\s+/g, '');
+          admQuery = admQuery.ilike('nom', `%${nom.trim()}%`).or(`tel.eq.${telClean},tel.ilike.%25${telClean}%25`);
+        }
+        const { data: admData, error: admErr } = await admQuery.limit(1);
+        const adm = Array.isArray(admData) ? admData[0] : admData;
+        if (!admErr && adm) {
+          const perms = typeof adm.permissions === 'string' ? JSON.parse(adm.permissions || '{}') : (adm.permissions || {});
+          user = {
+            ...adm,
+            role: adm.role || 'admin',
+            admin_sub_role: adm.admin_sub_role || perms.role || 'Administration',
+            admin_domaine: adm.domaine_admin || perms.domaine || 'Tous',
+            statut: adm.statut || 'actif',
+          };
+          console.log('[LOGIN] Trouvé dans administrateurs :', adm.nom, adm.matricule);
+        }
+      } catch (admErr2) {
+        console.warn('[LOGIN] Fallback administrateurs échoué :', admErr2.message);
       }
     }
 
@@ -153,7 +184,7 @@ const login = async (req, res) => {
     let match = false;
     if (user.mot_de_passe && (user.mot_de_passe.startsWith('$2a$') || user.mot_de_passe.startsWith('$2b$'))) {
       try {
-        match = await bcrypt.compare(mdp, user.mot_de_passe); 
+        match = await bcrypt.compare(mdp, user.mot_de_passe);
       } catch (_) {
         match = false;
       }
@@ -354,8 +385,8 @@ const lookup = async (req, res) => {
       return res.status(403).json({ found: false, message: 'Compte désactivé. Contactez l\'administration.' });
     }
 
-    const enfantNomComplet = (row.enfant_prenoms || row.enfant_nom) 
-      ? `${row.enfant_prenoms || ''} ${row.enfant_nom || ''}`.trim() 
+    const enfantNomComplet = (row.enfant_prenoms || row.enfant_nom)
+      ? `${row.enfant_prenoms || ''} ${row.enfant_nom || ''}`.trim()
       : (row.enfant_nom || '');
 
     return res.status(200).json({
@@ -623,4 +654,4 @@ module.exports = {
   lookup,
   forgotPassword,
   resetPassword,
-};
+};

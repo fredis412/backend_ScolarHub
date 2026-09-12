@@ -122,7 +122,7 @@ const createMembre = async (req, res) => {
 
       await client.query('COMMIT');
     } catch (dbErr) {
-      if (client) try { await client.query('ROLLBACK'); } catch (_) {}
+      if (client) try { await client.query('ROLLBACK'); } catch (_) { }
       console.warn('Direct PG failed in createMembre, fallback to Supabase SDK:', dbErr.message);
 
       if (supabase && typeof supabase.from === 'function') {

@@ -24,7 +24,7 @@ const login = async (req, res) => {
                   COALESCE(e.niveau, p_etu.niveau, u.niveau) AS niveau_etudiant,
                   COALESCE(e.email, u.email) AS email_etudiant,
                   COALESCE(e.tel, u.tel) AS tel_etudiant,
-                  COALESCE(m.permissions->>'domaine', u.admin_domaine, 'Tous') AS admin_domaine,
+                  COALESCE(adm.domaine_admin, adm.permissions->>'domaine', m.permissions->>'domaine', u.admin_domaine, 'Tous') AS admin_domaine,
                   COALESCE(p.matricule, p_etu.matricule) AS matricule_enfant,
                   CASE 
                     WHEN p_etu.nom IS NOT NULL THEN TRIM(COALESCE(p_etu.prenoms, '') || ' ' || p_etu.nom)
@@ -35,6 +35,7 @@ const login = async (req, res) => {
            LEFT JOIN parents p ON (p.user_id = u.id OR REPLACE(COALESCE(p.tel, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
            LEFT JOIN etudiants p_etu ON (p.matricule = p_etu.matricule OR REPLACE(COALESCE(p_etu.tel_parent, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
            LEFT JOIN membres m ON u.id = m.user_id
+           LEFT JOIN administrateurs adm ON (adm.user_id = u.id OR adm.email = u.email OR adm.tel = u.tel)
            WHERE u.id::text = $1`,
           [userId.toString()]
         );
@@ -47,7 +48,7 @@ const login = async (req, res) => {
                   COALESCE(e.niveau, p_etu.niveau, u.niveau) AS niveau_etudiant,
                   COALESCE(e.email, u.email) AS email_etudiant,
                   COALESCE(e.tel, u.tel) AS tel_etudiant,
-                  COALESCE(m.permissions->>'domaine', u.admin_domaine, 'Tous') AS admin_domaine,
+                  COALESCE(adm.domaine_admin, adm.permissions->>'domaine', m.permissions->>'domaine', u.admin_domaine, 'Tous') AS admin_domaine,
                   COALESCE(p.matricule, p_etu.matricule) AS matricule_enfant,
                   CASE 
                     WHEN p_etu.nom IS NOT NULL THEN TRIM(COALESCE(p_etu.prenoms, '') || ' ' || p_etu.nom)
@@ -58,6 +59,7 @@ const login = async (req, res) => {
            LEFT JOIN parents p ON (p.user_id = u.id OR REPLACE(COALESCE(p.tel, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
            LEFT JOIN etudiants p_etu ON (p.matricule = p_etu.matricule OR REPLACE(COALESCE(p_etu.tel_parent, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
            LEFT JOIN membres m ON u.id = m.user_id
+           LEFT JOIN administrateurs adm ON (adm.user_id = u.id OR adm.email = u.email OR adm.tel = u.tel)
            WHERE LOWER(u.matricule) = $1 OR LOWER(u.email) = $1`,
           [matClean]
         );
@@ -71,6 +73,7 @@ const login = async (req, res) => {
                   COALESCE(e.niveau, p_etu.niveau, u.niveau) AS niveau_etudiant,
                   COALESCE(e.email, u.email) AS email_etudiant,
                   COALESCE(e.tel, u.tel) AS tel_etudiant,
+                  COALESCE(adm.domaine_admin, adm.permissions->>'domaine', m.permissions->>'domaine', u.admin_domaine, 'Tous') AS admin_domaine,
                   COALESCE(p.matricule, p_etu.matricule) AS matricule_enfant,
                   CASE 
                     WHEN p_etu.nom IS NOT NULL THEN TRIM(COALESCE(p_etu.prenoms, '') || ' ' || p_etu.nom)
@@ -80,6 +83,8 @@ const login = async (req, res) => {
            LEFT JOIN etudiants e ON u.id = e.user_id 
            LEFT JOIN parents p ON (p.user_id = u.id OR REPLACE(COALESCE(p.tel, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
            LEFT JOIN etudiants p_etu ON (p.matricule = p_etu.matricule OR REPLACE(COALESCE(p_etu.tel_parent, ''), ' ', '') = REPLACE(COALESCE(u.tel, ''), ' ', ''))
+           LEFT JOIN membres m ON u.id = m.user_id
+           LEFT JOIN administrateurs adm ON (adm.user_id = u.id OR adm.email = u.email OR adm.tel = u.tel)
            WHERE LOWER(TRIM(u.nom)) = LOWER(TRIM($1)) 
              AND (REPLACE(COALESCE(u.tel, ''), ' ', '') = $2 OR REPLACE(COALESCE(u.tel, ''), ' ', '') LIKE $3)
              ${prenomVal ? "AND (LOWER(TRIM(u.prenoms)) = LOWER(TRIM($4)) OR LOWER(u.prenoms) LIKE $5)" : ""}`,

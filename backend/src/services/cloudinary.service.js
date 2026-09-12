@@ -19,9 +19,11 @@ const CloudinaryService = {
    * @param {string} folder - Dossier Cloudinary où stocker le fichier
    * @returns {Promise<string>} URL du fichier uploadé
    */
-  async uploadFile(fileBuffer, fileName, folder = 'scolarhub') {
+  async uploadFile(fileBuffer, fileName, folder = 'scolarhub', mimeType = 'image/png') {
     if (!process.env.CLOUDINARY_API_KEY || process.env.CLOUDINARY_API_KEY === 'your_cloudinary_api_key') {
-      throw new Error('Les identifiants Cloudinary ne sont pas configurés dans le fichier .env');
+      console.warn('[CloudinaryService] Clés Cloudinary non configurées -> Utilisation du fallback Base64 Data URL');
+      const b64 = fileBuffer.toString('base64');
+      return `data:${mimeType || 'image/png'};base64,${b64}`;
     }
 
     try {

@@ -15,5 +15,6 @@ router.post('/qr/:sessionId/cloturer', authMiddleware, requireRole('professeur',
 router.post('/', authMiddleware, appelsController.createAppel);
 router.get('/', authMiddleware, appelsController.getAppels);
 router.get('/:id', authMiddleware, appelsController.getAppelDetail);
+router.put('/:id', authMiddleware, appelsController.updateAppel);
 
 module.exports = router;

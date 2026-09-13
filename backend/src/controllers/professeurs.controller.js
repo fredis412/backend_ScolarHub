@@ -316,7 +316,8 @@ exports.getStudentsByFiliere = async (req, res) => {
       filtreNiveau = ` AND e.niveau = $${params.length}`;
     }
     const result = await db.query(
-      `SELECT u.id, u.nom, u.prenoms, u.matricule, u.email, u.tel, u.statut
+      `SELECT u.id, u.nom, u.prenoms, u.matricule, u.email, u.tel, u.statut,
+              (SELECT COUNT(*) FROM appel_presences ap WHERE ap.etudiant_id = e.id AND ap.statut = 'absent')::int AS total_absences
        FROM users u LEFT JOIN etudiants e ON e.user_id=u.id
        WHERE e.filiere_id=$1${filtreNiveau} AND (u.role ILIKE '%etudiant%' OR u.role ILIKE '%delegue%' OR u.role ILIKE '%bde%') ORDER BY u.nom`,
       params

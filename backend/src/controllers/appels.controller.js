@@ -118,4 +118,40 @@ const getAppelDetail = async (req, res) => {
     }
 };
 
-module.exports = { createAppel, getAppels, getAppelDetail };
+// PUT /api/appels/:id - Modifier un appel
+const updateAppel = async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { id } = req.params;
+        const { presences } = req.body;
+        const professeur_id = req.user.id;
+
+        const appelResult = await client.query('SELECT professeur_id FROM appels WHERE id = $1', [id]);
+        if (appelResult.rows.length === 0) return res.status(404).json({ success: false, message: 'Appel non trouvé.' });
+        if (appelResult.rows[0].professeur_id !== professeur_id && req.user.role !== 'admin') {
+            return res.status(403).json({ success: false, message: 'Accès refusé.' });
+        }
+
+        if (presences && presences.length > 0) {
+            await client.query('BEGIN');
+            for (const p of presences) {
+                if (!p.matricule) continue;
+                const statut = p.statut || 'present';
+                await client.query(`
+                    UPDATE appel_presences SET statut = $1 
+                    WHERE appel_id = $2 AND matricule = $3
+                `, [statut, id, p.matricule]);
+            }
+            await client.query('COMMIT');
+        }
+        res.json({ success: true, message: 'Appel mis à jour avec succès.' });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('[updateAppel]', error);
+        res.status(500).json({ success: false, message: 'Erreur lors de la mise à jour de l\'appel.' });
+    } finally {
+        client.release();
+    }
+};
+
+module.exports = { createAppel, getAppels, getAppelDetail, updateAppel };

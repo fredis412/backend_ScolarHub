@@ -7,5 +7,6 @@ const { upload, uploadToCloudinary } = require('../middleware/upload.middleware'
 router.post('/', authMiddleware, upload.single('file'), coursController.uploadCours);
 router.get('/', authMiddleware, coursController.getCours);
 router.get('/:id/download', coursController.downloadCours);
+router.delete('/:id', authMiddleware, coursController.deleteCours);
 
 module.exports = router;

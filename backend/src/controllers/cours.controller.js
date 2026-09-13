@@ -87,3 +87,20 @@ exports.getCours = async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 };
+
+exports.deleteCours = async (req, res) => {
+  try {
+    const coursId = req.params.id;
+    const professeur_id = req.user.id;
+    const result = await db.query(
+      'DELETE FROM supports_cours WHERE id = $1 AND professeur_id = $2 RETURNING id',
+      [coursId, professeur_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Cours introuvable ou non autorisé.' });
+    }
+    res.json({ success: true, message: 'Cours supprimé.' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+};

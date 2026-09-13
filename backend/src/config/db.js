@@ -34,6 +34,7 @@ async function query(text, params) {
       return `ARRAY[${value.map((item) => `'${String(item).replace(/'/g, "''")}'`).join(', ')}]`;
     }
     if (value instanceof Date) return `'${value.toISOString().replace(/'/g, "''")}'`;
+    if (Buffer.isBuffer(value)) return `decode('${value.toString('base64')}', 'base64')`;
     return `'${String(value).replace(/'/g, "''")}'`;
   });
 

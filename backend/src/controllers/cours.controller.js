@@ -53,14 +53,34 @@ exports.downloadCours = async (req, res) => {
 
 exports.getCours = async (req, res) => {
   try {
-    const professeur_id = req.user.id;
-    const result = await db.query(`
-      SELECT sc.*, m.nom as module_nom 
-      FROM supports_cours sc
-      JOIN modules m ON sc.module_id = m.id
-      WHERE sc.professeur_id = $1
-      ORDER BY sc.date_creation DESC
-    `, [professeur_id]);
+    const user = req.user;
+    let result;
+
+    if (user.role === 'etudiant') {
+      const etuQuery = await db.query('SELECT filiere_id, niveau FROM etudiants WHERE user_id = $1', [user.id]);
+      if (etuQuery.rows.length === 0) return res.json({ success: true, data: [] });
+      
+      const { filiere_id, niveau } = etuQuery.rows[0];
+      
+      result = await db.query(`
+        SELECT sc.id, sc.titre, sc.description, sc.filiere_id, sc.filiere_nom, sc.niveau, sc.module_id, sc.professeur_id, sc.fichier_url, sc.fichier_nom, sc.fichier_mime, sc.date_creation, m.nom as module_nom, u.nom as prof_nom, u.prenoms as prof_prenoms 
+        FROM supports_cours sc
+        JOIN modules m ON sc.module_id = m.id
+        LEFT JOIN users u ON sc.professeur_id = u.id
+        WHERE sc.filiere_id = $1 AND sc.niveau = $2
+        ORDER BY sc.date_creation DESC
+      `, [filiere_id, niveau]);
+    } else {
+      const professeur_id = user.id;
+      result = await db.query(`
+        SELECT sc.id, sc.titre, sc.description, sc.filiere_id, sc.filiere_nom, sc.niveau, sc.module_id, sc.professeur_id, sc.fichier_url, sc.fichier_nom, sc.fichier_mime, sc.date_creation, m.nom as module_nom, u.nom as prof_nom, u.prenoms as prof_prenoms 
+        FROM supports_cours sc
+        JOIN modules m ON sc.module_id = m.id
+        LEFT JOIN users u ON sc.professeur_id = u.id
+        WHERE sc.professeur_id = $1
+        ORDER BY sc.date_creation DESC
+      `, [professeur_id]);
+    }
 
     res.json({ success: true, data: result.rows });
   } catch (error) {

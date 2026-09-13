@@ -43,8 +43,15 @@ exports.downloadCours = async (req, res) => {
     }
 
     const file = result.rows[0];
-    res.setHeader('Content-Type', file.fichier_mime || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `inline; filename="${file.fichier_nom || 'cours.pdf'}"`);
+    const mimeType = file.fichier_mime || 'application/octet-stream';
+    const rawName = file.fichier_nom || 'cours.pdf';
+    // RFC 5987 : encode le nom pour supporter les accents et caractères spéciaux
+    const encodedName = encodeURIComponent(rawName).replace(/'/g, '%27');
+
+    res.setHeader('Content-Type', mimeType);
+    // filename= pour les anciens clients, filename*= pour les clients modernes (UTF-8)
+    res.setHeader('Content-Disposition', `inline; filename="${rawName.replace(/"/g, '\\"')}"; filename*=UTF-8''${encodedName}`);
+    res.setHeader('Access-Control-Allow-Origin', '*');
     res.send(file.fichier_data);
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });

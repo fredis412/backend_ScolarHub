@@ -11,6 +11,12 @@ const fileFilter = (req, file, cb) => {
     'image/jpeg',
     'image/png',
     'image/jpg',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.ms-powerpoint',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'application/vnd.ms-excel',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   ];
 
   if (allowedMimes.includes(file.mimetype)) {
@@ -18,7 +24,7 @@ const fileFilter = (req, file, cb) => {
   } else {
     cb(
       new Error(
-        `Format de fichier non autorisé. Acceptés : PDF, JPG, JPEG, PNG. Reçu : ${file.mimetype}`
+        `Format de fichier non autorisé. Acceptés : PDF, images, Word, PowerPoint, Excel. Reçu : ${file.mimetype}`
       ),
       false
     );

@@ -72,7 +72,7 @@ app.get('/', (req, res) => res.json({ message: 'ScolarHub API — IST Ouaga 2000
 app.use((err, req, res, next) => {
   console.error('[Global Error]', err.message);
   if (!res.headersSent) {
-    res.status(500).json({ success: false, message: 'Erreur interne du serveur.' });
+    res.status(500).json({ success: false, message: err.message || 'Erreur interne du serveur.' });
   }
 });
  

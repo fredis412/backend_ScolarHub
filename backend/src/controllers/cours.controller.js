@@ -1,6 +1,33 @@
 const db = require('../config/db');
+const { createClient } = require('@supabase/supabase-js');
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const { envoyerNotificationAuto } = require('./notifications.controller');
+
+// Supabase client for Storage (reuse env vars)
+function getSupabaseClient() {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+  return createClient(url, key, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+}
+
+const BUCKET = 'cours';
+
+// Ensure bucket exists (called once lazily)
+let bucketReady = false;
+async function ensureBucket() {
+  if (bucketReady) return;
+  const supabase = getSupabaseClient();
+  const { data: buckets } = await supabase.storage.listBuckets();
+  const exists = buckets?.some(b => b.name === BUCKET);
+  if (!exists) {
+    await supabase.storage.createBucket(BUCKET, { public: false });
+  }
+  bucketReady = true;
+}
 
 exports.uploadCours = async (req, res) => {
   try {
@@ -14,20 +41,33 @@ exports.uploadCours = async (req, res) => {
 
     const fichier_nom = file.originalname;
     const fichier_mime = file.mimetype;
-    const fichier_data = file.buffer;
 
+    // Upload file to Supabase Storage
+    await ensureBucket();
+    const supabase = getSupabaseClient();
+    const storagePath = `${Date.now()}_${fichier_nom.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from(BUCKET)
+      .upload(storagePath, file.buffer, {
+        contentType: fichier_mime,
+        upsert: false,
+      });
+
+    if (uploadError) {
+      console.error('[uploadCours] Storage error:', uploadError);
+      return res.status(500).json({ success: false, message: 'Erreur upload fichier: ' + uploadError.message });
+    }
+
+    // Insert record (no fichier_data, store storage path instead)
     const result = await db.query(`
       INSERT INTO supports_cours 
-      (titre, description, filiere_id, filiere_nom, niveau, module_id, professeur_id, fichier_url, fichier_nom, fichier_mime, fichier_data) 
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) 
+      (titre, description, filiere_id, filiere_nom, niveau, module_id, professeur_id, fichier_url, fichier_nom, fichier_mime) 
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) 
       RETURNING id, titre, description, filiere_id, filiere_nom, niveau, module_id, professeur_id, fichier_url, date_creation
-    `, [titre, description, filiere_id, filiere_nom || '', niveau || 'Tous', module_id, professeur_id, '', fichier_nom, fichier_mime, fichier_data]);
+    `, [titre, description, filiere_id, filiere_nom || '', niveau || 'Tous', module_id, professeur_id, storagePath, fichier_nom, fichier_mime]);
 
     const newCours = result.rows[0];
-    const fichier_url = `/api/cours/${newCours.id}/download`;
-
-    await db.query('UPDATE supports_cours SET fichier_url = $1 WHERE id = $2', [fichier_url, newCours.id]);
-    newCours.fichier_url = fichier_url;
 
     // Send notifications to students in the class
     try {
@@ -61,23 +101,28 @@ exports.uploadCours = async (req, res) => {
 exports.downloadCours = async (req, res) => {
   try {
     const coursId = req.params.id;
-    const result = await db.query('SELECT fichier_data, fichier_mime, fichier_nom FROM supports_cours WHERE id = $1', [coursId]);
+    const result = await db.query('SELECT fichier_url, fichier_mime, fichier_nom FROM supports_cours WHERE id = $1', [coursId]);
     
-    if (result.rows.length === 0 || !result.rows[0].fichier_data) {
+    if (result.rows.length === 0 || !result.rows[0].fichier_url) {
       return res.status(404).json({ success: false, message: 'Fichier introuvable' });
     }
 
     const file = result.rows[0];
-    const mimeType = file.fichier_mime || 'application/octet-stream';
-    const rawName = file.fichier_nom || 'cours.pdf';
-    // RFC 5987 : encode le nom pour supporter les accents et caractères spéciaux
-    const encodedName = encodeURIComponent(rawName).replace(/'/g, '%27');
+    const storagePath = file.fichier_url;
 
-    res.setHeader('Content-Type', mimeType);
-    // filename= pour les anciens clients, filename*= pour les clients modernes (UTF-8)
-    res.setHeader('Content-Disposition', `inline; filename="${rawName.replace(/"/g, '\\"')}"; filename*=UTF-8''${encodedName}`);
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.send(file.fichier_data);
+    // Generate a signed URL (valid 1 hour)
+    const supabase = getSupabaseClient();
+    const { data: signedData, error: signError } = await supabase.storage
+      .from(BUCKET)
+      .createSignedUrl(storagePath, 3600); // 1 hour
+
+    if (signError || !signedData?.signedUrl) {
+      console.error('[downloadCours] Signed URL error:', signError);
+      return res.status(500).json({ success: false, message: 'Erreur génération du lien de téléchargement.' });
+    }
+
+    // Redirect the client to the signed URL
+    res.redirect(signedData.signedUrl);
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }

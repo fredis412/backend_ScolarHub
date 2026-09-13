@@ -50,7 +50,8 @@ const getSessionQr = async (req, res) => {
   try {
     const { sessionId } = req.params;
     const sessionResult = await pool.query(`
-      SELECT s.*, a.filiere_id, a.filiere_nom, a.professeur_id
+      SELECT s.id, s.appel_id, s.code, s.token, s.statut, s.expires_at,
+             a.filiere_id, a.filiere_nom, a.professeur_id
       FROM appel_qr_sessions s
       JOIN appels a ON a.id = s.appel_id
       WHERE s.id = $1
@@ -99,10 +100,11 @@ const checkin = async (req, res) => {
 
     // Le QR encode le token UUID ; la saisie manuelle utilise le code à 6 chiffres.
     const sessionResult = await pool.query(`
-      SELECT s.*, a.filiere_id, a.filiere_nom, a.professeur_id, a.module_id, a.niveau
+      SELECT s.id AS session_id, s.appel_id, s.code, s.token, s.statut, s.expires_at,
+             a.filiere_id, a.filiere_nom, a.professeur_id, a.module_id, a.niveau
       FROM appel_qr_sessions s
       JOIN appels a ON a.id = s.appel_id
-      WHERE (s.code = $1 OR s.token = $1)
+      WHERE (s.code = $1 OR s.token::text = $1)
         AND s.statut = 'ouverte' AND s.expires_at > NOW()
       ORDER BY s.created_at DESC LIMIT 1
     `, [String(code).trim()]);
@@ -156,7 +158,7 @@ const checkin = async (req, res) => {
     // Suivi en direct côté prof
     const io = req.app.get('io');
     if (io) {
-      io.emit(`appel_qr:${session.id}`, {
+      io.emit(`appel_qr:${session.session_id}`, {
         matricule: etudiant.matricule,
         nom: etudiant.nom,
         prenoms: etudiant.prenoms,
@@ -177,7 +179,8 @@ const cloturerSessionQr = async (req, res) => {
   try {
     const { sessionId } = req.params;
     const sessionResult = await pool.query(`
-      SELECT s.*, a.filiere_id, a.filiere_nom, a.professeur_id, m.nom AS module_nom
+      SELECT s.id, s.appel_id, s.code, s.statut, s.expires_at,
+             a.filiere_id, a.filiere_nom, a.professeur_id, m.nom AS module_nom
       FROM appel_qr_sessions s
       JOIN appels a ON a.id = s.appel_id
       JOIN modules m ON m.id = a.module_id

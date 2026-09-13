@@ -1,5 +1,7 @@
 const db = require('../config/db');
 
+const { envoyerNotificationAuto } = require('./notifications.controller');
+
 exports.uploadCours = async (req, res) => {
   try {
     const { titre, description, filiere_id, filiere_nom, niveau, module_id } = req.body;
@@ -26,6 +28,29 @@ exports.uploadCours = async (req, res) => {
 
     await db.query('UPDATE supports_cours SET fichier_url = $1 WHERE id = $2', [fichier_url, newCours.id]);
     newCours.fichier_url = fichier_url;
+
+    // Send notifications to students in the class
+    try {
+      const filtreNiveau = niveau && niveau !== 'Tous' ? ' AND niveau = $2' : '';
+      const params = [filiere_id];
+      if (niveau && niveau !== 'Tous') params.push(niveau);
+
+      const etudiantsRes = await db.query(`SELECT user_id FROM etudiants WHERE filiere_id = $1${filtreNiveau} AND (statut = 'actif' OR statut IS NULL)`, params);
+      const moduleRes = await db.query('SELECT nom FROM modules WHERE id = $1', [module_id]);
+      const module_nom = moduleRes.rows.length > 0 ? moduleRes.rows[0].nom : 'Module';
+
+      for (const e of etudiantsRes.rows) {
+        if (e.user_id) {
+          await envoyerNotificationAuto(
+            e.user_id,
+            'Nouveau support de cours',
+            `Le professeur a publié le support "${titre}" pour le cours de ${module_nom}.`
+          );
+        }
+      }
+    } catch (notifErr) {
+      console.error('[Notification cours]', notifErr);
+    }
 
     res.status(201).json({ success: true, message: 'Cours uploadé avec succès', data: newCours });
   } catch (error) {

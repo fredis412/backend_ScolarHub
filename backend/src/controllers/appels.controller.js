@@ -1,5 +1,8 @@
 const pool = require('../config/db');
 
+const { envoyerNotificationAuto } = require('./notifications.controller');
+const { envoyerSMS } = require('../services/sms.service');
+
 // POST /api/appels - Créer un appel (présences) pour une classe/module
 const createAppel = async (req, res) => {
     try {
@@ -9,6 +12,10 @@ const createAppel = async (req, res) => {
         if (!filiere_id || !module_id) {
             return res.status(400).json({ success: false, message: 'filiere_id et module_id sont requis.' });
         }
+
+        // Fetch module_nom to use in notifications
+        const moduleRes = await pool.query('SELECT nom FROM modules WHERE id = $1', [module_id]);
+        const module_nom = moduleRes.rows.length > 0 ? moduleRes.rows[0].nom : 'Module';
 
         const appelResult = await pool.query(`
             INSERT INTO appels (filiere_id, filiere_nom, niveau, module_id, professeur_id)
@@ -21,15 +28,33 @@ const createAppel = async (req, res) => {
             for (const p of presences) {
                 if (!p.matricule) continue;
                 const etudiantResult = await pool.query(
-                    `SELECT id, nom, prenoms FROM etudiants WHERE matricule = $1`,
+                    `SELECT id, user_id, nom, prenoms, tel_parent FROM etudiants WHERE matricule = $1`,
                     [p.matricule]
                 );
                 const etudiant = etudiantResult.rows[0];
                 if (!etudiant) continue;
+                
+                const statut = p.statut || 'present';
                 await pool.query(`
                     INSERT INTO appel_presences (appel_id, etudiant_id, matricule, nom, prenoms, statut)
                     VALUES ($1, $2, $3, $4, $5, $6)
-                `, [appel_id, etudiant.id, p.matricule, etudiant.nom, etudiant.prenoms, p.statut || 'present']);
+                `, [appel_id, etudiant.id, p.matricule, etudiant.nom, etudiant.prenoms, statut]);
+
+                if (statut === 'absent') {
+                    if (etudiant.user_id) {
+                        await envoyerNotificationAuto(
+                            etudiant.user_id,
+                            'Absence enregistrée',
+                            `Vous avez été marqué(e) absent(e) au cours de ${module_nom} (${filiere_nom || ''}).`
+                        );
+                    }
+                    if (etudiant.tel_parent) {
+                        await envoyerSMS(
+                            etudiant.tel_parent,
+                            `ScolarHub : ${etudiant.prenoms} ${etudiant.nom} a ete marque(e) absent(e) au cours de ${module_nom} aujourd'hui.`
+                        );
+                    }
+                }
             }
         }
 

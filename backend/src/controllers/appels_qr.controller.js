@@ -99,7 +99,7 @@ const checkin = async (req, res) => {
 
     // Le QR encode le token UUID ; la saisie manuelle utilise le code à 6 chiffres.
     const sessionResult = await pool.query(`
-      SELECT s.*, a.filiere_id, a.filiere_nom, a.professeur_id, a.module_id
+      SELECT s.*, a.filiere_id, a.filiere_nom, a.professeur_id, a.module_id, a.niveau
       FROM appel_qr_sessions s
       JOIN appels a ON a.id = s.appel_id
       WHERE (s.code = $1 OR s.token = $1)
@@ -112,15 +112,32 @@ const checkin = async (req, res) => {
     }
 
     const etudiantResult = await pool.query(
-      `SELECT id, matricule, nom, prenoms, filiere_id FROM etudiants WHERE user_id = $1`,
+      `SELECT e.id, e.matricule, e.nom, e.prenoms, e.filiere_id, e.niveau
+       FROM etudiants e
+       WHERE e.user_id = $1`,
       [req.user.id],
     );
     const etudiant = etudiantResult.rows[0];
     if (!etudiant) {
-      return res.status(404).json({ success: false, message: 'Profil étudiant non trouvé.' });
+      console.error('[checkin] Profil étudiant introuvable pour user_id:', req.user.id);
+      return res.status(404).json({ success: false, message: 'Profil étudiant non trouvé. Contactez l\'administration.' });
     }
-    if (etudiant.filiere_id !== session.filiere_id) {
+
+    // Comparaison en parseInt pour éviter les erreurs de type string vs number
+    if (!etudiant.filiere_id) {
+      return res.status(403).json({ success: false, message: 'Votre profil n\'est pas encore affecté à une filière. Contactez l\'administration.' });
+    }
+    const etudiantFiliereId = parseInt(etudiant.filiere_id);
+    const sessionFiliereId = parseInt(session.filiere_id);
+    if (etudiantFiliereId !== sessionFiliereId) {
+      console.error('[checkin] Filière incompatible — étudiant:', etudiantFiliereId, 'session:', sessionFiliereId);
       return res.status(403).json({ success: false, message: 'Cette session ne concerne pas votre classe.' });
+    }
+
+    // Vérification du niveau si la session a un niveau précis (autre que 'Tous')
+    if (session.niveau && session.niveau !== 'Tous' && etudiant.niveau && etudiant.niveau !== session.niveau) {
+      console.error('[checkin] Niveau incompatible — étudiant:', etudiant.niveau, 'session:', session.niveau);
+      return res.status(403).json({ success: false, message: `Cette session est réservée aux étudiants en ${session.niveau}.` });
     }
 
     const dejaPresent = await pool.query(

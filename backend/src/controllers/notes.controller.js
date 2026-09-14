@@ -380,6 +380,33 @@ const getMoyennesAdmin = async (req, res) => {
     }
 };
 
+// ── Notes individuelles très faibles (< 7), récentes ───────────────────
+// "Blâmable" = note individuelle (pas une moyenne) en dessous de 7/20,
+// dans une session validée, saisie au cours des 7 derniers jours.
+// Sert au chip d'alerte du tableau de bord admin (risque de redoublement).
+const getNotesBlamables = async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT n.id, n.valeur, e.nom, e.prenoms, e.matricule,
+                   COALESCE(e.filiere_nom, f.nom) AS filiere_nom, e.niveau,
+                   m.nom AS module_nom, sn.date_session
+            FROM notes n
+            JOIN modules m ON n.module_id = m.id
+            JOIN etudiants e ON n.etudiant_id = e.id
+            JOIN sessions_notes sn ON n.session_id = sn.id
+            LEFT JOIN filieres f ON f.id = e.filiere_id
+            WHERE sn.statut = 'validee'
+              AND n.valeur < 7
+              AND sn.date_session >= NOW() - INTERVAL '7 days'
+            ORDER BY sn.date_session DESC
+        `);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        console.error('[getNotesBlamables]', error);
+        res.status(500).json({ success: false, message: 'Erreur lors du chargement des notes blâmables.' });
+    }
+};
+
 const getGradeSessions = async (req, res) => {
     try {
         const professeur_id = req.user.id;
@@ -474,5 +501,6 @@ module.exports = {
     validateSessionAdmin,
     rejectSessionAdmin,
     getMoyennesAdmin,
+    getNotesBlamables,
     getMonApercu,
 };

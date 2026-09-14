@@ -61,6 +61,54 @@ const getNotesStatistiques = async (req, res) => {
     }
 };
 
+// ── Évolution des inscriptions (12 derniers mois) ──────────────────────
+// Pour chaque mois : nouvelles inscriptions étudiants (created_at) et
+// total cumulé (base = étudiants déjà inscrits avant le début de la
+// fenêtre de 12 mois + nouveaux mois par mois). Sert au graphique du
+// tableau de bord admin.
+const getInscriptionsParMois = async (req, res) => {
+    try {
+        const monthlyResult = await pool.query(`
+            WITH mois AS (
+                SELECT generate_series(
+                    date_trunc('month', now()) - interval '11 months',
+                    date_trunc('month', now()),
+                    interval '1 month'
+                ) AS mois
+            ),
+            inscriptions AS (
+                SELECT date_trunc('month', created_at) AS mois, COUNT(*)::int AS nouveaux
+                FROM users
+                WHERE role ILIKE '%etudiant%' AND created_at IS NOT NULL
+                GROUP BY 1
+            )
+            SELECT to_char(m.mois, 'YYYY-MM') AS mois, COALESCE(i.nouveaux, 0) AS nouveaux
+            FROM mois m
+            LEFT JOIN inscriptions i ON i.mois = m.mois
+            ORDER BY m.mois
+        `);
+
+        const baseResult = await pool.query(`
+            SELECT COUNT(*)::int AS base
+            FROM users
+            WHERE role ILIKE '%etudiant%'
+              AND created_at < date_trunc('month', now()) - interval '11 months'
+        `);
+        let cumule = baseResult.rows[0]?.base || 0;
+
+        const data = monthlyResult.rows.map((row) => {
+            cumule += row.nouveaux;
+            return { mois: row.mois, nouveaux: row.nouveaux, cumule };
+        });
+
+        return res.status(200).json({ success: true, data });
+    } catch (error) {
+        console.error('[getInscriptionsParMois]', error);
+        return res.status(500).json({ success: false, message: 'Erreur lors du calcul des inscriptions.' });
+    }
+};
+
 module.exports = {
-    getNotesStatistiques
+    getNotesStatistiques,
+    getInscriptionsParMois,
 };

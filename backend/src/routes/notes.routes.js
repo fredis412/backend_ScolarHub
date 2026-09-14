@@ -16,6 +16,9 @@ router.get('/bulletin/:etudiantId', authMiddleware, notesController.generateBull
 // Moyennes générales (admin)
 router.get('/moyennes', authMiddleware, requireRole('admin'), notesController.getMoyennesAdmin);
 
+// Notes individuelles très faibles (< 7), récentes — alerte tableau de bord (admin)
+router.get('/blamables', authMiddleware, requireRole('admin'), notesController.getNotesBlamables);
+
 // Sessions de notes — vue admin (toutes les sessions, tous profs confondus)
 router.get('/sessions/admin/all', authMiddleware, requireRole('admin'), notesController.getAllSessionsAdmin);
 router.patch('/sessions/:session_id/valider', authMiddleware, requireRole('admin'), notesController.validateSessionAdmin);

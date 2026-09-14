@@ -8,4 +8,8 @@ router.post('/', authMiddleware, requireRole('admin'), etudiantsController.inscr
 // Route publique — activation du compte lors de la première connexion
 router.post('/finaliser', etudiantsController.finaliserPremiereConnexion);
 
+router.get('/delegues', authMiddleware, etudiantsController.getDelegues);
+router.post('/:id/nommer-delegue', authMiddleware, etudiantsController.nommerDelegue);
+router.patch('/:id/revoquer-delegue', authMiddleware, etudiantsController.revoquerDelegue);
+
 module.exports = router;

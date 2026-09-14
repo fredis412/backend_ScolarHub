@@ -153,7 +153,16 @@ function initSocket(io) {
            RETURNING id, expediteur_id, destinataire_id, contenu, created_at`,
           [userId, destinataireId, contenu.trim()]
         );
-        const message = rows[0];
+        const { rows: senderRows } = await pool.query(
+          `SELECT prenoms, nom, role FROM users WHERE id = $1`,
+          [userId]
+        );
+        const message = {
+          ...rows[0],
+          prenoms: senderRows[0]?.prenoms || '',
+          nom: senderRows[0]?.nom || '',
+          role: senderRows[0]?.role || '',
+        };
 
         // Envoyer au destinataire s'il est en ligne
         const destSocketId = onlineUsers.get(destinataireId);
@@ -199,8 +208,11 @@ function initSocket(io) {
       const { filiereId, contenu } = data;
       if (!contenu?.trim()) return callback?.({ error: 'Contenu vide' });
 
-      // Vérifier que l'utilisateur appartient à la filière
-      if (String(socket.filiere) !== String(filiereId)) {
+      // Staff (admin/prof) peut écrire dans n'importe quelle filière
+      // Les étudiants ne peuvent écrire que dans leur propre filière
+      const normRole = String(socket.userRole || '').toLowerCase().trim();
+      const isStaff = ['admin', 'professeur', 'prof', 'enseignant', 'teacher'].includes(normRole);
+      if (!isStaff && String(socket.filiere) !== String(filiereId)) {
         return callback?.({ error: 'Vous n\'appartenez pas à cette filière' });
       }
 

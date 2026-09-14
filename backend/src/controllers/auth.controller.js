@@ -654,4 +654,4 @@ module.exports = {
   lookup,
   forgotPassword,
   resetPassword,
-};
+};

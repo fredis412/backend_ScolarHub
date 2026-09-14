@@ -119,14 +119,18 @@ const getMessagesCanal = async (req, res) => {
       return res.status(403).json({ success: false, error: 'Accès refusé à ce canal' });
     }
 
+    // ✅ u.etudiant_role + niveau (via etudiants, fallback users.niveau) ajoutés
+    // pour afficher le badge Délégué/Adjoint sur chaque bulle de message.
     const { rows: msgs } = await pool.query(
       `SELECT m.id, m.canal_id, m.contenu, m.type, m.created_at,
-              u.id AS auteur_id, u.prenoms, u.nom,
+              u.id AS auteur_id, u.prenoms, u.nom, u.etudiant_role,
+              COALESCE(MAX(e.niveau), u.niveau) AS niveau,
               COALESCE(
                 JSON_AGG(r.emoji) FILTER (WHERE r.emoji IS NOT NULL), '[]'
               ) AS reactions
        FROM messages m
        JOIN users u ON u.id = m.auteur_id
+       LEFT JOIN etudiants e ON e.user_id = u.id
        LEFT JOIN reactions r ON r.message_id = m.id
        WHERE m.canal_id = $1 AND COALESCE(m.type, 'canal') != 'annonce'
          ${avant ? 'AND m.created_at < $3' : ''}
@@ -247,6 +251,8 @@ const envoyerMessageCanal = async (req, res) => {
       return res.status(403).json({ success: false, error: 'Accès refusé' });
     }
 
+    await ensureCanalExists(id);
+
     const { rows: inserted } = await pool.query(
       `INSERT INTO messages (canal_id, auteur_id, contenu, type, created_at)
        VALUES ($1, $2, $3, 'canal', NOW())
@@ -255,11 +261,15 @@ const envoyerMessageCanal = async (req, res) => {
     );
     const msgId = inserted[0].id;
 
+    // ✅ etudiant_role + niveau ajoutés pour que le badge apparaisse
+    // immédiatement dans le message émis via WebSocket.
     const { rows: fullMsgs } = await pool.query(
       `SELECT m.id, m.canal_id, m.auteur_id, m.contenu, m.type, m.created_at,
-              u.prenoms, u.nom, u.role
+              u.prenoms, u.nom, u.role, u.etudiant_role,
+              COALESCE(e.niveau, u.niveau) AS niveau
        FROM messages m
        JOIN users u ON u.id = m.auteur_id
+       LEFT JOIN etudiants e ON e.user_id = u.id
        WHERE m.id = $1`,
       [msgId]
     );
@@ -283,7 +293,7 @@ const getConversationsPrivees = async (req, res) => {
     const { rows } = await pool.query(
       `SELECT DISTINCT ON (correspondant_id)
               correspondant_id,
-              u.prenoms, u.nom,
+              u.prenoms, u.nom, u.role,
               mp.contenu AS dernier_message,
               mp.created_at,
               mp.is_read,
@@ -316,7 +326,7 @@ const getMessagesPrives = async (req, res) => {
     const { rows } = await pool.query(
       `SELECT mp.id, mp.contenu, mp.created_at, mp.is_read,
               mp.expediteur_id, mp.destinataire_id,
-              u.prenoms, u.nom
+              u.prenoms, u.nom, u.role
        FROM messages_prives mp
        JOIN users u ON u.id = mp.expediteur_id
        WHERE (mp.expediteur_id = $1 AND mp.destinataire_id = $2)
@@ -350,11 +360,23 @@ const envoyerMessagePrive = async (req, res) => {
       [req.user.id, userId, contenu.trim()]
     );
 
+    const { rows: senderRows } = await pool.query(
+      `SELECT prenoms, nom, role FROM users WHERE id = $1`,
+      [req.user.id]
+    );
+
+    const messageComplet = {
+      ...rows[0],
+      prenoms: senderRows[0]?.prenoms || req.user.prenoms || '',
+      nom: senderRows[0]?.nom || req.user.nom || '',
+      role: senderRows[0]?.role || req.user.role || '',
+    };
+
     // userId est un UUID : ne surtout pas le convertir en entier
     const io = req.app.get('io');
-    if (io) notifierUser(io, userId, 'message:prive', rows[0]);
+    if (io) notifierUser(io, userId, 'message:prive', messageComplet);
 
-    res.status(201).json({ success: true, data: rows[0] });
+    res.status(201).json({ success: true, data: messageComplet });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, error: 'Erreur serveur' });
@@ -465,11 +487,14 @@ const getMessagesGroupe = async (req, res) => {
       return res.status(403).json({ success: false, error: 'Accès refusé' });
     }
 
+    // ✅ etudiant_role + niveau ajoutés pour le badge Délégué/Adjoint.
     const { rows } = await pool.query(
       `SELECT mg.id, mg.contenu, mg.created_at,
-              mg.auteur_id, u.prenoms, u.nom
+              mg.auteur_id, u.prenoms, u.nom, u.etudiant_role,
+              COALESCE(e.niveau, u.niveau) AS niveau
        FROM messages_groupe mg
        JOIN users u ON u.id = mg.auteur_id
+       LEFT JOIN etudiants e ON e.user_id = u.id
        WHERE mg.filiere_id = $1
        ORDER BY mg.created_at DESC
        LIMIT $2`,
@@ -515,8 +540,12 @@ const envoyerMessageGroupe = async (req, res) => {
       [filiereId, req.user.id, contenu.trim()]
     );
 
+    // ✅ etudiant_role + niveau ajoutés pour que le badge apparaisse
+    // immédiatement dans le message émis via WebSocket.
     const { rows: userRows } = await pool.query(
-      `SELECT prenoms, nom FROM users WHERE id = $1`,
+      `SELECT u.prenoms, u.nom, u.etudiant_role, COALESCE(e.niveau, u.niveau) AS niveau
+       FROM users u LEFT JOIN etudiants e ON e.user_id = u.id
+       WHERE u.id = $1`,
       [req.user.id]
     );
 
@@ -524,6 +553,8 @@ const envoyerMessageGroupe = async (req, res) => {
       ...inserted[0],
       prenoms: userRows[0]?.prenoms,
       nom: userRows[0]?.nom,
+      etudiant_role: userRows[0]?.etudiant_role,
+      niveau: userRows[0]?.niveau,
     };
 
     const io = req.app.get('io');

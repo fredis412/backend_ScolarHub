@@ -444,4 +444,88 @@ const finaliserPremiereConnexion = async (req, res) => {
   }
 };
 
-module.exports = { listEtudiants, inscrireEtudiant, finaliserPremiereConnexion };
+
+
+  // ── GET /api/etudiants/delegues ────────────────────────────────────────────
+// Liste complète de tous les délégués/adjoints de l'établissement (admin).
+const getDelegues = async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT u.id, u.nom, u.prenoms, u.matricule, u.etudiant_role,
+             COALESCE(e.filiere_nom, u.filiere_nom) AS filiere_nom,
+             COALESCE(e.niveau, u.niveau) AS niveau,
+             COALESCE(e.domaine, u.domaine) AS domaine,
+             e.filiere_id AS filiere_id
+      FROM users u
+      LEFT JOIN etudiants e ON u.id = e.user_id
+      WHERE u.etudiant_role IN ('delegue', 'delegue_adjoint')
+      ORDER BY COALESCE(e.filiere_nom, u.filiere_nom), COALESCE(e.niveau, u.niveau), u.etudiant_role, u.nom
+    `);
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (err) {
+    console.error('[getDelegues]', err);
+    return res.status(500).json({ success: false, message: 'Erreur lors du chargement des délégués.' });
+  }
+};
+
+// ── POST /api/etudiants/:id/nommer-delegue ─────────────────────────────────
+// :id = id de la table etudiants (pas l'UUID users.id) — on résout d'abord
+// le user_id correspondant avant de toucher à users.etudiant_role.
+// body: { role: 'delegue' | 'delegue_adjoint', filiere_id, niveau }
+// Un seul délégué ET un seul adjoint à la fois par (filière, niveau) : le
+// titulaire précédent du même rôle est automatiquement rétrogradé.
+const nommerDelegue = async (req, res) => {
+  const { id } = req.params;
+  const { role, filiere_id, niveau } = req.body;
+  if (!['delegue', 'delegue_adjoint'].includes(role)) {
+    return res.status(400).json({ success: false, message: 'Rôle invalide.' });
+  }
+  if (!filiere_id || !niveau) {
+    return res.status(400).json({ success: false, message: 'filiere_id et niveau requis.' });
+  }
+  const client = await pool.connect();
+  try {
+    const etuRes = await client.query('SELECT user_id FROM etudiants WHERE id = $1', [id]);
+    const userId = etuRes.rows[0]?.user_id;
+    if (!userId) {
+      return res.status(404).json({ success: false, message: 'Étudiant introuvable.' });
+    }
+
+    await client.query(
+      `UPDATE users u SET etudiant_role = NULL
+       FROM etudiants e
+       WHERE u.id = e.user_id
+         AND u.etudiant_role = $1
+         AND e.filiere_id::text = $2::text
+         AND COALESCE(e.niveau, u.niveau) = $3
+         AND u.id != $4`,
+      [role, filiere_id, niveau, userId]
+    );
+    await client.query(`UPDATE users SET etudiant_role = $1 WHERE id = $2`, [role, userId]);
+    return res.status(200).json({ success: true, message: 'Nomination effectuée.' });
+  } catch (err) {
+    console.error('[nommerDelegue]', err);
+    return res.status(500).json({ success: false, message: 'Erreur lors de la nomination.' });
+  } finally {
+    client.release();
+  }
+};
+
+// ── PATCH /api/etudiants/:id/revoquer-delegue ──────────────────────────────
+// :id = id de la table etudiants (pas l'UUID users.id).
+const revoquerDelegue = async (req, res) => {
+  const { id } = req.params;
+  try {
+    const etuRes = await pool.query('SELECT user_id FROM etudiants WHERE id = $1', [id]);
+    const userId = etuRes.rows[0]?.user_id;
+    if (!userId) {
+      return res.status(404).json({ success: false, message: 'Étudiant introuvable.' });
+    }
+    await pool.query(`UPDATE users SET etudiant_role = NULL WHERE id = $1`, [userId]);
+    return res.status(200).json({ success: true, message: 'Statut retiré.' });
+  } catch (err) {
+    console.error('[revoquerDelegue]', err);
+    return res.status(500).json({ success: false, message: 'Erreur lors du retrait.' });
+  }
+};
+module.exports = { listEtudiants, inscrireEtudiant, finaliserPremiereConnexion, getDelegues, nommerDelegue, revoquerDelegue };

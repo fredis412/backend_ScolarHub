@@ -7,7 +7,7 @@ let supabase = null;
 function getSupabase() {
   if (!supabase) {
     const url = process.env.SUPABASE_URL;
-    const key = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+    const key = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
     if (!url || !key) {
       throw new Error('[DB] SUPABASE_URL et SUPABASE_SECRET_KEY (ou SUPABASE_SERVICE_ROLE_KEY) sont requis dans .env');
     }

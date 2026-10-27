@@ -20,6 +20,10 @@ const getEtudiantByUser = async (userId) => {
   return result.rows[0] || null;
 };
 
+// ── Isolation par établissement ─────────────────────────────────────────────
+// Nécessite migration_paiements_etablissement.sql (frais_scolarite.etablissement_id).
+// req.etablissementId vient du jeton ; s'il est absent (anciens jetons), pas de filtre.
+
 // GET /api/paiements - Frais à payer + historique de l'étudiant connecté
 const getMesPaiements = async (req, res) => {
   try {
@@ -28,16 +32,19 @@ const getMesPaiements = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Profil étudiant non trouvé.' });
     }
 
+    const pFrais = [etudiant.niveau, etudiant.id];
+    let filtreFraisEtab = '';
+    if (req.etablissementId) { pFrais.push(req.etablissementId); filtreFraisEtab = ` AND f.etablissement_id = $${pFrais.length}`; }
     const fraisResult = await pool.query(`
       SELECT f.* FROM frais_scolarite f
-      WHERE (f.niveau IS NULL OR f.niveau = $1)
+      WHERE (f.niveau IS NULL OR f.niveau = $1)${filtreFraisEtab}
         AND f.actif = TRUE
         AND NOT EXISTS (
           SELECT 1 FROM paiements p
           WHERE p.frais_id = f.id AND p.etudiant_id = $2 AND p.statut = 'reussi'
         )
       ORDER BY f.echeance NULLS LAST, f.libelle
-    `, [etudiant.niveau, etudiant.id]);
+    `, pFrais);
 
     const historiqueResult = await pool.query(`
       SELECT p.*, f.libelle AS frais_libelle
@@ -84,7 +91,10 @@ const initierPaiement = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Profil étudiant non trouvé.' });
     }
 
-    const fraisResult = await pool.query(`SELECT * FROM frais_scolarite WHERE id = $1`, [frais_id]);
+    const fraisResult = await pool.query(
+      `SELECT * FROM frais_scolarite WHERE id = $1${req.etablissementId ? ' AND etablissement_id = $2' : ''}`,
+      req.etablissementId ? [frais_id, req.etablissementId] : [frais_id]
+    );
     const frais = fraisResult.rows[0];
     if (!frais) {
       return res.status(404).json({ success: false, message: 'Frais non trouvé.' });
@@ -198,9 +208,10 @@ const getPaiementsAdmin = async (req, res) => {
       FROM paiements p
       LEFT JOIN frais_scolarite f ON f.id = p.frais_id
       LEFT JOIN etudiants e ON e.id = p.etudiant_id
+      ${req.etablissementId ? 'WHERE e.etablissement_id = $1' : ''}
       ORDER BY p.created_at DESC
       LIMIT 500
-    `);
+    `, req.etablissementId ? [req.etablissementId] : []);
     res.json({ success: true, data: result.rows });
   } catch (error) {
     console.error('[getPaiementsAdmin]', error);

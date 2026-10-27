@@ -6,6 +6,30 @@
 const jwt = require('jsonwebtoken');
 const pool = require('../config/db');
 
+// ── Multi-établissement ─────────────────────────────────────────────────────
+// Le jeton porte etablissement_id. S'il est absent (anciens jetons), aucun
+// filtre n'est appliqué — comportement historique. Les salles `canal:<id>` /
+// `filiere:<id>` sont vérifiées par rapport à l'établissement du socket, et
+// les présences en ligne ne sont diffusées qu'à l'établissement concerné.
+const canalDeMonEtab = async (canalId, etab) => {
+  if (!etab) return true;
+  if (canalId === undefined || canalId === null || canalId === '') return false;
+  const r = await pool.query('SELECT 1 FROM canaux WHERE id = $1 AND etablissement_id = $2', [canalId, etab]);
+  return r.rows.length > 0;
+};
+const filiereDeMonEtab = async (filiereId, etab) => {
+  if (!etab) return true;
+  if (filiereId === undefined || filiereId === null || filiereId === '') return false;
+  const r = await pool.query('SELECT 1 FROM filieres WHERE id = $1 AND etablissement_id = $2', [filiereId, etab]);
+  return r.rows.length > 0;
+};
+const userDeMonEtab = async (userId, etab) => {
+  if (!etab) return true;
+  if (userId === undefined || userId === null || userId === '') return false;
+  const r = await pool.query('SELECT 1 FROM users WHERE id = $1 AND etablissement_id = $2', [userId, etab]);
+  return r.rows.length > 0;
+};
+
 // Stocke les utilisateurs en ligne : { userId: socketId }
 const onlineUsers = new Map();
 
@@ -23,9 +47,12 @@ function initSocket(io) {
 
     try {
       const payload = jwt.verify(token, process.env.JWT_SECRET);
+      // Jeton sans établissement (ancienne session) : connexion refusée.
+      if (!payload.etablissement_id) return next(new Error('Session expirée : reconnectez-vous'));
       socket.userId   = payload.id;
       socket.userRole = payload.role;
       socket.filiere  = payload.filiere_id;
+      socket.etab     = payload.etablissement_id || null;
       next();
     } catch {
       next(new Error('Token invalide'));
@@ -35,6 +62,9 @@ function initSocket(io) {
   // ── Connexion ─────────────────────────────────────────────
   io.on('connection', async (socket) => {
     const userId = socket.userId;
+    const etab = socket.etab || null;
+    // Diffusion limitée à l'établissement (ou à tous si jeton sans établissement)
+    const diffuserEtab = (event, data) => (etab ? io.to(`etab:${etab}`) : io).emit(event, data);
     console.log(`[Socket] Connecté : userId=${userId}`);
 
     // Enregistrer l'utilisateur en ligne
@@ -42,12 +72,15 @@ function initSocket(io) {
 
     // Rejoindre la room personnelle (notifications)
     socket.join(`user:${userId}`);
+    if (etab) socket.join(`etab:${etab}`);
 
     // Les étudiants rejoignent leur filière. Les comptes de gestion doivent
     // écouter toutes les filières pour recevoir les messages des groupes.
     if (socket.userRole === 'admin' || socket.userRole === 'professeur') {
       try {
-        const { rows: filieres } = await pool.query('SELECT id FROM filieres');
+        const { rows: filieres } = etab
+          ? await pool.query('SELECT id FROM filieres WHERE etablissement_id = $1', [etab])
+          : await pool.query('SELECT id FROM filieres');
         filieres.forEach(({ id }) => socket.join(`filiere:${id}`));
       } catch (err) {
         console.error('[Socket] Erreur chargement filières:', err.message);
@@ -57,8 +90,22 @@ function initSocket(io) {
     }
 
     // ── Rejoindre une room dynamiquement ──────────────────────
-    socket.on('join_room', (data) => {
+    socket.on('join_room', async (data) => {
       if (data?.roomId) {
+        if (etab) {
+          // Une salle de canal / filière / utilisateur d'un autre établissement est refusée.
+          const m = /^(canal|filiere|user|etab):(.+)$/.exec(String(data.roomId));
+          if (m) {
+            let ok = true;
+            try {
+              if (m[1] === 'canal') ok = await canalDeMonEtab(m[2], etab);
+              else if (m[1] === 'filiere') ok = await filiereDeMonEtab(m[2], etab);
+              else if (m[1] === 'user') ok = String(m[2]) === String(userId);
+              else if (m[1] === 'etab') ok = String(m[2]) === String(etab);
+            } catch (_) { ok = false; }
+            if (!ok) return;
+          }
+        }
         socket.join(data.roomId);
         console.log(`[Socket] user:${userId} a rejoint la room: ${data.roomId}`);
       }
@@ -69,7 +116,7 @@ function initSocket(io) {
     try {
       const { rows: canaux } = await pool.query(
           `SELECT c.id AS canal_id FROM canaux c
-          WHERE c.type IN ('administration', 'admin_filiere', 'bde', 'general', 'professeurs', 'admin_profs', 'admin_delegues', 'prof_admin', 'prof_prof')
+          WHERE (${etab ? 'c.etablissement_id = $3' : 'TRUE'} AND (c.type IN ('administration', 'admin_filiere', 'bde', 'general', 'professeurs', 'admin_profs', 'admin_delegues', 'prof_admin', 'prof_prof')
             OR ($2 = 'admin' AND c.type LIKE 'prof_delegues:%')
             OR (c.type LIKE 'prof_delegues:%' AND (
               $1::text IN (SELECT user_id::text FROM professeurs p
@@ -78,10 +125,12 @@ function initSocket(io) {
                       WHERE c.type = 'prof_delegues:' || m.filiere_id)
               OR $1::text IN (SELECT user_id::text FROM etudiants e
                         WHERE c.type = 'prof_delegues:' || e.filiere_id)
-            ))
+            ))))
          UNION
-         SELECT canal_id FROM canal_membres WHERE user_id = $1`,
-          [userId, socket.userRole]
+         SELECT cm.canal_id FROM canal_membres cm
+           ${etab ? 'JOIN canaux cx ON cx.id = cm.canal_id AND cx.etablissement_id = $3' : ''}
+           WHERE cm.user_id = $1`,
+          etab ? [userId, socket.userRole, etab] : [userId, socket.userRole]
       );
       canaux.forEach(({ canal_id }) => socket.join(`canal:${canal_id}`));
     } catch (err) {
@@ -89,7 +138,7 @@ function initSocket(io) {
     }
 
     // Informer les contacts que l'utilisateur est en ligne
-    io.emit('user:online', { userId });
+    diffuserEtab('user:online', { userId });
 
     // ── Événement : envoyer un message dans un canal ──────
     socket.on('message:canal', async (data, callback) => {
@@ -97,6 +146,8 @@ function initSocket(io) {
       if (!contenu?.trim()) return callback?.({ error: 'Contenu vide' });
 
       try {
+        if (!(await canalDeMonEtab(canalId, etab))) return callback?.({ error: 'Accès refusé à ce canal' });
+
         // Vérifier que l'utilisateur a le droit d'écrire
         const normRole = String(socket.userRole || '').toLowerCase().trim();
         const isStaff = ['admin', 'professeur', 'prof', 'enseignant', 'teacher'].includes(normRole);
@@ -147,6 +198,7 @@ function initSocket(io) {
       if (!contenu?.trim()) return callback?.({ error: 'Contenu vide' });
 
       try {
+        if (!(await userDeMonEtab(destinataireId, etab))) return callback?.({ error: 'Destinataire introuvable' });
         const { rows } = await pool.query(
           `INSERT INTO messages_prives (expediteur_id, destinataire_id, contenu, created_at)
            VALUES ($1, $2, $3, NOW())
@@ -217,6 +269,7 @@ function initSocket(io) {
       }
 
       try {
+        if (!(await filiereDeMonEtab(filiereId, etab))) return callback?.({ error: 'Filière introuvable' });
         const { rows } = await pool.query(
           `INSERT INTO messages_groupe (filiere_id, auteur_id, contenu, created_at)
            VALUES ($1, $2, $3, NOW())
@@ -247,6 +300,9 @@ function initSocket(io) {
       const { messageId, emoji, messageType } = data;
 
       try {
+        if (data.canalId && !(await canalDeMonEtab(data.canalId, etab))) {
+          return callback?.({ error: 'Accès refusé à ce canal' });
+        }
         await pool.query(
           `INSERT INTO reactions (message_id, user_id, emoji, message_type)
            VALUES ($1, $2, $3, $4)
@@ -265,9 +321,14 @@ function initSocket(io) {
     });
 
     // ── Événement : indicateur de frappe ─────────────────
-    socket.on('user:typing', (data) => {
+    socket.on('user:typing', async (data) => {
       const { canalId, filiereId, destinataireId } = data;
       const payload = { userId, typing: true };
+      try {
+        if (canalId && !(await canalDeMonEtab(canalId, etab))) return;
+        if (!canalId && filiereId && !(await filiereDeMonEtab(filiereId, etab))) return;
+        if (!canalId && !filiereId && destinataireId && !(await userDeMonEtab(destinataireId, etab))) return;
+      } catch (_) { return; }
 
       if (canalId) {
         socket.to(`canal:${canalId}`).emit('user:typing', payload);
@@ -285,17 +346,18 @@ function initSocket(io) {
       try {
         // Vérifier que c'est l'auteur ou un admin
         const { rows } = await pool.query(
-          `SELECT auteur_id FROM messages WHERE id = $1`,
+          `SELECT auteur_id, canal_id FROM messages WHERE id = $1`,
           [messageId]
         );
         if (!rows.length) return callback?.({ error: 'Message introuvable' });
+        if (!(await canalDeMonEtab(rows[0].canal_id, etab))) return callback?.({ error: 'Message introuvable' });
         if (rows[0].auteur_id !== userId && socket.userRole !== 'admin') {
           return callback?.({ error: 'Non autorisé' });
         }
 
         await pool.query(`DELETE FROM messages WHERE id = $1`, [messageId]);
 
-        io.to(`canal:${canalId}`).emit('message:supprimer', { messageId });
+        io.to(`canal:${etab ? rows[0].canal_id : canalId}`).emit('message:supprimer', { messageId });
         callback?.({ success: true });
       } catch (err) {
         console.error('[Socket] message:supprimer erreur:', err.message);
@@ -306,7 +368,7 @@ function initSocket(io) {
     // ── Déconnexion ───────────────────────────────────────
     socket.on('disconnect', () => {
       onlineUsers.delete(userId);
-      io.emit('user:offline', { userId });
+      diffuserEtab('user:offline', { userId });
       console.log(`[Socket] Déconnecté : userId=${userId}`);
     });
   });

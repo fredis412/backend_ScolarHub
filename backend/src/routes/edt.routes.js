@@ -16,6 +16,14 @@ router.get(
   edtController.getStudentEdt
 );
 
+// GET /api/edt/mon-programme - Programme actif + historique de l'étudiant connecté
+// (doit rester AVANT '/:id')
+router.get(
+  '/mon-programme',
+  authMiddleware,
+  edtController.getMonProgramme
+);
+
 // GET /api/edt/admin/all - Récupérer tous les EDT (admin seulement)
 router.get(
   '/admin/all',

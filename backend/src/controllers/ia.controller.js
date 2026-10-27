@@ -197,8 +197,8 @@ const genererRevision = async (req, res) => {
     const supportResult = await pool.query(`
       SELECT sc.*, m.nom AS module_nom FROM supports_cours sc
       JOIN modules m ON m.id = sc.module_id
-      WHERE sc.id = $1
-    `, [support_id]);
+      WHERE sc.id = $1${req.etablissementId ? ' AND sc.filiere_id IN (SELECT id FROM filieres WHERE etablissement_id = $2)' : ''}
+    `, req.etablissementId ? [support_id, req.etablissementId] : [support_id]);
     const support = supportResult.rows[0];
     if (!support) {
       return res.status(404).json({ success: false, message: 'Support de cours non trouvé.' });

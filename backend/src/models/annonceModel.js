@@ -179,6 +179,8 @@ const AnnonceModel = {
       if (annonceData.niveau !== undefined) { params.push(annonceData.niveau || null); sets.push(`niveau = $${params.length}`); }
       if (annonceData.cibleRole !== undefined) { params.push(annonceData.cibleRole); sets.push(`"cibleRole" = $${params.length}`); }
       if (annonceData.statut !== undefined) { params.push(annonceData.statut); sets.push(`statut = $${params.length}`); }
+      if (annonceData.categorie !== undefined) { params.push(annonceData.categorie || null); sets.push(`categorie = $${params.length}`); }
+      if (annonceData.fichiers !== undefined) { params.push(JSON.stringify(annonceData.fichiers || [])); sets.push(`fichiers = $${params.length}`); }
       sets.push(`"updatedAt" = NOW()`);
 
       const { rows } = await pool.query(

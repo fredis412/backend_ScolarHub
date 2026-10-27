@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const ctrl = require('../controllers/professeurs.controller');
 const { authMiddleware, requireRole } = require('../middleware/auth.middleware');
+const { upload, uploadToCloudinary } = require('../middleware/upload.middleware');
 
 // ── Routes publiques ──────────────────────────────────────────────────────────
 // Lookup par nom + tel (pour la connexion)
@@ -31,11 +32,22 @@ router.get('/disponibilites/all', authMiddleware, requireRole('admin'), ctrl.get
 router.get('/disponibilites',     authMiddleware, ctrl.getDisponibilites);
 router.put('/disponibilites',     authMiddleware, ctrl.saveDisponibilites);
 
-// Assignation modules (avant /:id)
+// Assignation modules — ancien mécanisme (module_professeur, sans niveau)
 router.patch('/assign-module', authMiddleware, requireRole('admin'), ctrl.patchModuleAssignment);
+
+// Sous-fils "Professeurs & Délégués" du professeur connecté (étape 4 messagerie)
+router.get('/mes-canaux-coordination', authMiddleware, ctrl.getMesCanauxCoordination);
 
 // ── Routes paramétrées (en DERNIER pour ne pas capturer les routes statiques) ─
 router.get('/:id',         authMiddleware, ctrl.getProfesseurById);
 router.get('/:id/modules', authMiddleware, ctrl.getModulesByProfesseur);
+
+// Affectation module précise (professeur_modules : module + niveau + semestre)
+router.post('/:id/modules',                     authMiddleware, requireRole('admin'), ctrl.assignerModule);
+router.delete('/:id/modules/:affectationId',    authMiddleware, requireRole('admin'), ctrl.retirerModule);
+
+// Photo d'identité d'un professeur (multipart, champ `file`) — admin
+router.post('/:id/photo', authMiddleware, requireRole('admin'),
+  upload.single('file'), uploadToCloudinary('scolarhub/photos-profil'), ctrl.uploaderPhotoProfesseur);
 
 module.exports = router;

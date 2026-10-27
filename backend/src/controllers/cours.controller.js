@@ -16,6 +16,19 @@ function getSupabaseClient() {
 
 const BUCKET = 'cours';
 
+// ── Isolation par établissement ─────────────────────────────────────────────
+// req.etablissementId vient du jeton ; s'il est absent (anciens jetons), pas de filtre.
+async function filiereDeMonEtab(req, filiereId) {
+  if (!req.etablissementId) return true;
+  if (filiereId === undefined || filiereId === null || filiereId === '') return false;
+  const r = await db.query('SELECT 1 FROM filieres WHERE id = $1 AND etablissement_id = $2', [filiereId, req.etablissementId]);
+  return r.rows.length > 0;
+}
+async function moduleDeLaFiliere(moduleId, filiereId) {
+  const r = await db.query('SELECT 1 FROM modules WHERE id = $1 AND filiere_id = $2', [moduleId, filiereId]);
+  return r.rows.length > 0;
+}
+
 // Ensure bucket exists (called once lazily)
 let bucketReady = false;
 async function ensureBucket() {
@@ -37,6 +50,13 @@ exports.uploadCours = async (req, res) => {
 
     if (!titre || !filiere_id || !module_id || !file) {
       return res.status(400).json({ success: false, message: 'Paramètres manquants ou fichier absent' });
+    }
+
+    if (!(await filiereDeMonEtab(req, filiere_id))) {
+      return res.status(403).json({ success: false, message: 'Filière inconnue pour votre établissement.' });
+    }
+    if (req.etablissementId && !(await moduleDeLaFiliere(module_id, filiere_id))) {
+      return res.status(403).json({ success: false, message: 'Module invalide pour cette filière.' });
     }
 
     const fichier_nom = file.originalname;
@@ -75,7 +95,9 @@ exports.uploadCours = async (req, res) => {
       const params = [filiere_id];
       if (niveau && niveau !== 'Tous') params.push(niveau);
 
-      const etudiantsRes = await db.query(`SELECT user_id FROM etudiants WHERE filiere_id = $1${filtreNiveau} AND (statut = 'actif' OR statut IS NULL)`, params);
+      let filtreEtab = '';
+      if (req.etablissementId) { params.push(req.etablissementId); filtreEtab = ` AND etablissement_id = $${params.length}`; }
+      const etudiantsRes = await db.query(`SELECT user_id FROM etudiants WHERE filiere_id = $1${filtreNiveau} AND (statut = 'actif' OR statut IS NULL)${filtreEtab}`, params);
       const moduleRes = await db.query('SELECT nom FROM modules WHERE id = $1', [module_id]);
       const module_nom = moduleRes.rows.length > 0 ? moduleRes.rows[0].nom : 'Module';
 
@@ -101,9 +123,10 @@ exports.uploadCours = async (req, res) => {
 exports.downloadCours = async (req, res) => {
   try {
     const coursId = req.params.id;
-    const result = await db.query('SELECT fichier_url, fichier_mime, fichier_nom FROM supports_cours WHERE id = $1', [coursId]);
+    const result = await db.query('SELECT fichier_url, fichier_mime, fichier_nom, filiere_id FROM supports_cours WHERE id = $1', [coursId]);
     
-    if (result.rows.length === 0 || !result.rows[0].fichier_url) {
+    if (result.rows.length === 0 || !result.rows[0].fichier_url
+        || !(await filiereDeMonEtab(req, result.rows[0].filiere_id))) {
       return res.status(404).json({ success: false, message: 'Fichier introuvable' });
     }
 

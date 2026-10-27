@@ -19,6 +19,7 @@ const niveauRisque = (score) => {
 // Croise moyenne générale (notes validées) et assiduité (appels) sur 60 jours.
 const getEtudiantsARisque = async (req, res) => {
   try {
+    const etabId = req.etablissementId || null;
     const result = await pool.query(`
       SELECT
         e.id, e.user_id, e.matricule, e.nom, e.prenoms,
@@ -45,9 +46,9 @@ const getEtudiantsARisque = async (req, res) => {
         WHERE a.date_appel >= CURRENT_DATE - INTERVAL '${PERIODE_JOURS} days'
         GROUP BY ap.etudiant_id
       ) pres ON pres.etudiant_id = e.id
-      WHERE e.statut = 'actif' OR e.statut IS NULL
+      WHERE (e.statut = 'actif' OR e.statut IS NULL)${etabId ? ' AND e.etablissement_id = $1' : ''}
       ORDER BY e.nom
-    `);
+    `, etabId ? [etabId] : []);
 
     const etudiants = result.rows.map((e) => {
       const moyenne = e.moyenne !== null ? parseFloat(e.moyenne) : null;
@@ -99,9 +100,10 @@ const alerterEtudiant = async (req, res) => {
     const { etudiantId } = req.params;
     const { message } = req.body;
 
+    const etabId = req.etablissementId || null;
     const result = await pool.query(
-      `SELECT id, user_id, nom, prenoms, tel_parent, nom_parent FROM etudiants WHERE id = $1`,
-      [etudiantId],
+      `SELECT id, user_id, nom, prenoms, tel_parent, nom_parent FROM etudiants WHERE id = $1${etabId ? ' AND etablissement_id = $2' : ''}`,
+      etabId ? [etudiantId, etabId] : [etudiantId],
     );
     const etudiant = result.rows[0];
     if (!etudiant) {

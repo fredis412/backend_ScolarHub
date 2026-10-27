@@ -2,6 +2,7 @@ const pool = require('../config/db');
 
 const getNotesStatistiques = async (req, res) => {
     try {
+        const etabId = req.etablissementId || null;
         const query = `
             WITH student_averages AS (
                 SELECT 
@@ -9,6 +10,7 @@ const getNotesStatistiques = async (req, res) => {
                     SUM(n.valeur * m.coefficient) / NULLIF(SUM(m.coefficient), 0) AS moyenne
                 FROM notes n
                 JOIN modules m ON n.module_id = m.id
+                ${etabId ? 'JOIN etudiants et ON et.id = n.etudiant_id AND et.etablissement_id = $1' : ''}
                 GROUP BY n.etudiant_id
             )
             SELECT 
@@ -23,7 +25,7 @@ const getNotesStatistiques = async (req, res) => {
             FROM student_averages;
         `;
 
-        const result = await pool.query(query);
+        const result = await pool.query(query, etabId ? [etabId] : []);
         
         if (result.rows.length === 0) {
             return res.status(200).json({
@@ -68,6 +70,9 @@ const getNotesStatistiques = async (req, res) => {
 // tableau de bord admin.
 const getInscriptionsParMois = async (req, res) => {
     try {
+        const etabId = req.etablissementId || null;
+        const filtre = etabId ? ' AND etablissement_id = $1' : '';
+        const pr = etabId ? [etabId] : [];
         const monthlyResult = await pool.query(`
             WITH mois AS (
                 SELECT generate_series(
@@ -79,21 +84,21 @@ const getInscriptionsParMois = async (req, res) => {
             inscriptions AS (
                 SELECT date_trunc('month', created_at) AS mois, COUNT(*)::int AS nouveaux
                 FROM users
-                WHERE role ILIKE '%etudiant%' AND created_at IS NOT NULL
+                WHERE role ILIKE '%etudiant%' AND created_at IS NOT NULL${filtre}
                 GROUP BY 1
             )
             SELECT to_char(m.mois, 'YYYY-MM') AS mois, COALESCE(i.nouveaux, 0) AS nouveaux
             FROM mois m
             LEFT JOIN inscriptions i ON i.mois = m.mois
             ORDER BY m.mois
-        `);
+        `, pr);
 
         const baseResult = await pool.query(`
             SELECT COUNT(*)::int AS base
             FROM users
             WHERE role ILIKE '%etudiant%'
-              AND created_at < date_trunc('month', now()) - interval '11 months'
-        `);
+              AND created_at < date_trunc('month', now()) - interval '11 months'${filtre}
+        `, pr);
         let cumule = baseResult.rows[0]?.base || 0;
 
         const data = monthlyResult.rows.map((row) => {

@@ -7,18 +7,30 @@ const FILIERES_DEFAUT = [
   { nom: 'Finance Comptabilité', description: 'Finance et comptabilité' },
 ];
 
-const ensureFilieres = async (client) => {
+// ⚠️ Multi-établissement : cette liste est celle de l'IST. Ne l'appelez PAS pour
+// une nouvelle école (elle crée ses propres filières). Avec etabId, la vérification
+// et l'insertion se font dans cet établissement.
+const ensureFilieres = async (client, etabId = null) => {
   for (const f of FILIERES_DEFAUT) {
-    const exists = await client.query('SELECT id FROM filieres WHERE nom = $1', [f.nom]);
+    const exists = etabId
+      ? await client.query('SELECT id FROM filieres WHERE nom = $1 AND etablissement_id = $2', [f.nom, etabId])
+      : await client.query('SELECT id FROM filieres WHERE nom = $1', [f.nom]);
     if (exists.rows.length === 0) {
-      await client.query('INSERT INTO filieres (nom, description) VALUES ($1, $2)', [f.nom, f.description]);
+      if (etabId) {
+        await client.query('INSERT INTO filieres (nom, description, etablissement_id) VALUES ($1, $2, $3)', [f.nom, f.description, etabId]);
+      } else {
+        await client.query('INSERT INTO filieres (nom, description) VALUES ($1, $2)', [f.nom, f.description]);
+      }
     }
   }
 };
 
-const getFiliereNomById = async (db, filiereId) => {
+// etabId optionnel : si fourni, la filière doit appartenir à cet établissement.
+const getFiliereNomById = async (db, filiereId, etabId = null) => {
   if (!filiereId) return null;
-  const r = await db.query('SELECT nom FROM filieres WHERE id = $1', [filiereId]);
+  const r = etabId
+    ? await db.query('SELECT nom FROM filieres WHERE id = $1 AND etablissement_id = $2', [filiereId, etabId])
+    : await db.query('SELECT nom FROM filieres WHERE id = $1', [filiereId]);
   return r.rows[0]?.nom || null;
 };
 
@@ -39,28 +51,41 @@ const ACRONYMS = {
   'finance': 6,
 };
 
-const resolveFiliere = async (db, filiereValue) => {
+// Multi-établissement : passez req.etablissementId en 3e argument. Alors seules
+// les filières de cet établissement sont reconnues (id, nom ou sigle) ; sans lui
+// (anciens appels / anciens jetons), comportement historique inchangé.
+// Les sigles ci-dessus (rit → 1, elt → 2…) sont ceux de l'IST : ils ne servent
+// qu'à condition que la filière visée appartienne bien à l'établissement.
+const resolveFiliere = async (db, filiereValue, etabId = null) => {
   if (!filiereValue) return { id: null, nom: null };
   const str = String(filiereValue).trim();
   const asId = parseInt(str, 10);
   if (!Number.isNaN(asId)) {
-    const nom = await getFiliereNomById(db, asId);
+    const nom = await getFiliereNomById(db, asId, etabId);
+    if (etabId && !nom) return { id: null, nom: str };
     return { id: asId, nom };
   }
 
   const clean = str.toLowerCase().replace(/[^a-z0-9]/g, '');
   if (ACRONYMS[clean]) {
     const id = ACRONYMS[clean];
-    const nom = await getFiliereNomById(db, id);
-    return { id, nom };
+    const nom = await getFiliereNomById(db, id, etabId);
+    if (!etabId || nom) return { id, nom };
   }
 
   // Exact match
-  const rExact = await db.query('SELECT id, nom FROM filieres WHERE LOWER(nom) = LOWER($1)', [str]);
+  const pe = [str];
+  const rExact = await db.query(
+    `SELECT id, nom FROM filieres WHERE LOWER(nom) = LOWER($1)${etabId ? ' AND etablissement_id = $2' : ''}`,
+    etabId ? [str, etabId] : pe
+  );
   if (rExact.rows[0]) return { id: rExact.rows[0].id, nom: rExact.rows[0].nom };
 
   // ILIKE match
-  const rLike = await db.query('SELECT id, nom FROM filieres WHERE nom ILIKE $1 OR $1 ILIKE nom', [`%${str}%`]);
+  const rLike = await db.query(
+    `SELECT id, nom FROM filieres WHERE (nom ILIKE $1 OR $1 ILIKE nom)${etabId ? ' AND etablissement_id = $2' : ''}`,
+    etabId ? [`%${str}%`, etabId] : [`%${str}%`]
+  );
   if (rLike.rows[0]) return { id: rLike.rows[0].id, nom: rLike.rows[0].nom };
 
   return { id: null, nom: str };

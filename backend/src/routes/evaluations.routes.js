@@ -1,12 +1,16 @@
 const express = require('express');
 const router = express.Router();
-const { soumettreEvaluation, getResultats } = require('../controllers/evaluation.controller');
+const evaluationController = require('../controllers/evaluation.controller');
 const { authMiddleware, requireRole } = require('../middleware/auth.middleware');
 
-// POST /api/evaluations - Étudiant seulement
-router.post('/', authMiddleware, requireRole('etudiant'), soumettreEvaluation);
+// ── Étudiant ────────────────────────────────────────────────────────────
+router.get('/a-faire', authMiddleware, requireRole('etudiant'), evaluationController.getEvaluationsAFaire);
+router.post('/', authMiddleware, requireRole('etudiant'), evaluationController.soumettreEvaluation);
 
-// GET /api/evaluations/resultats - Admin seulement
-router.get('/resultats', authMiddleware, requireRole('admin', 'direction'), getResultats);
+// ── Admin (déclarées avant toute route paramétrique générique) ──────────
+router.post('/periodes', authMiddleware, requireRole('admin', 'direction'), evaluationController.creerPeriode);
+router.get('/periodes', authMiddleware, requireRole('admin', 'direction'), evaluationController.getPeriodes);
+router.patch('/periodes/:id/cloturer', authMiddleware, requireRole('admin', 'direction'), evaluationController.cloturerPeriode);
+router.get('/periodes/:id/resultats', authMiddleware, requireRole('admin', 'direction'), evaluationController.getResultatsPeriode);
 
 module.exports = router;

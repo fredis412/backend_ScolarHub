@@ -6,6 +6,20 @@ const pool = require('../config/db');
  * s'y inscrivent via une fiche d'inscription (evenement_inscriptions).
  */
 
+// ── Multi-établissement ─────────────────────────────────────────────────────
+// req.etablissementId vient du jeton ; s'il est absent (anciens jetons), pas de filtre.
+// La table evenements porte etablissement_id.
+const etabCol = (params, etabId, col) => {
+  if (!etabId) return '';
+  params.push(etabId);
+  return ` AND ${col} = $${params.length}`;
+};
+const evenementDeMonEtab = async (id, etabId) => {
+  if (!etabId) return true;
+  const r = await pool.query('SELECT 1 FROM evenements WHERE id = $1 AND etablissement_id = $2', [id, etabId]);
+  return r.rows.length > 0;
+};
+
 const STATUTS = ['en_attente', 'approuve', 'annule'];
 
 // GET /api/evenements - Liste des événements avec le nombre d'inscrits
@@ -13,11 +27,12 @@ exports.getAllEvenements = async (req, res) => {
   try {
     const { statut, limit = 50, offset = 0 } = req.query;
     const params = [];
-    let where = '';
+    let where = 'WHERE 1=1';
     if (statut && STATUTS.includes(statut)) {
       params.push(statut);
-      where = `WHERE e.statut = $${params.length}`;
+      where += ` AND e.statut = $${params.length}`;
     }
+    where += etabCol(params, req.etablissementId, 'e.etablissement_id');
     params.push(parseInt(limit), parseInt(offset));
 
     const result = await pool.query(
@@ -45,15 +60,16 @@ exports.getAllEvenements = async (req, res) => {
 // GET /api/evenements/:id
 exports.getEvenementById = async (req, res) => {
   try {
+    const pg = [req.params.id];
     const result = await pool.query(
       `
       SELECT e.*, COUNT(i.id)::int AS inscrits
       FROM evenements e
       LEFT JOIN evenement_inscriptions i ON i.evenement_id = e.id
-      WHERE e.id = $1
+      WHERE e.id = $1${etabCol(pg, req.etablissementId, 'e.etablissement_id')}
       GROUP BY e.id
       `,
-      [req.params.id]
+      pg
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Événement non trouvé.' });
@@ -77,22 +93,24 @@ exports.createEvenement = async (req, res) => {
     // ceux des étudiants restent en attente de validation.
     const statut = req.user.role === 'admin' ? 'approuve' : 'en_attente';
 
+    const valeurs = [
+      titre,
+      description || null,
+      lieu || null,
+      dateDebut,
+      parseFloat(prix) || 0,
+      parseInt(capacite) || 0,
+      statut,
+      req.user.id,
+    ];
+    if (req.etablissementId) valeurs.push(req.etablissementId);
     const result = await pool.query(
       `
-      INSERT INTO evenements (titre, description, lieu, date_debut, prix, capacite, statut, auteur)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      INSERT INTO evenements (titre, description, lieu, date_debut, prix, capacite, statut, auteur${req.etablissementId ? ', etablissement_id' : ''})
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8${req.etablissementId ? ', $9' : ''})
       RETURNING *
       `,
-      [
-        titre,
-        description || null,
-        lieu || null,
-        dateDebut,
-        parseFloat(prix) || 0,
-        parseInt(capacite) || 0,
-        statut,
-        req.user.id,
-      ]
+      valeurs
     );
 
     res.status(201).json({ success: true, message: 'Événement créé avec succès.', data: result.rows[0] });
@@ -109,9 +127,10 @@ exports.updateStatut = async (req, res) => {
     if (!STATUTS.includes(statut)) {
       return res.status(400).json({ success: false, message: `Statut invalide. Valeurs autorisées : ${STATUTS.join(', ')}.` });
     }
+    const pu = [statut, req.params.id];
     const result = await pool.query(
-      `UPDATE evenements SET statut = $1, "updatedAt" = NOW() WHERE id = $2 RETURNING *`,
-      [statut, req.params.id]
+      `UPDATE evenements SET statut = $1, "updatedAt" = NOW() WHERE id = $2${etabCol(pu, req.etablissementId, 'etablissement_id')} RETURNING *`,
+      pu
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Événement non trouvé.' });
@@ -126,7 +145,8 @@ exports.updateStatut = async (req, res) => {
 // DELETE /api/evenements/:id - Auteur ou admin
 exports.deleteEvenement = async (req, res) => {
   try {
-    const existing = await pool.query('SELECT auteur FROM evenements WHERE id = $1', [req.params.id]);
+    const pd = [req.params.id];
+    const existing = await pool.query(`SELECT auteur FROM evenements WHERE id = $1${etabCol(pd, req.etablissementId, 'etablissement_id')}`, pd);
     if (existing.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Événement non trouvé.' });
     }
@@ -147,9 +167,10 @@ exports.uploadAffiche = async (req, res) => {
     if (!req.uploadedFileUrl) {
       return res.status(400).json({ success: false, message: 'Aucun fichier uploadé.' });
     }
+    const pa = [req.uploadedFileUrl, req.params.id];
     const result = await pool.query(
-      `UPDATE evenements SET affiche_url = $1, "updatedAt" = NOW() WHERE id = $2 RETURNING *`,
-      [req.uploadedFileUrl, req.params.id]
+      `UPDATE evenements SET affiche_url = $1, "updatedAt" = NOW() WHERE id = $2${etabCol(pa, req.etablissementId, 'etablissement_id')} RETURNING *`,
+      pa
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Événement non trouvé.' });
@@ -171,15 +192,16 @@ exports.inscrire = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Le nom est obligatoire sur la fiche d\'inscription.' });
     }
 
+    const pe = [id];
     const evtResult = await pool.query(
       `
       SELECT e.*, COUNT(i.id)::int AS inscrits
       FROM evenements e
       LEFT JOIN evenement_inscriptions i ON i.evenement_id = e.id
-      WHERE e.id = $1
+      WHERE e.id = $1${etabCol(pe, req.etablissementId, 'e.etablissement_id')}
       GROUP BY e.id
       `,
-      [id]
+      pe
     );
     if (evtResult.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Événement non trouvé.' });
@@ -216,15 +238,17 @@ exports.inscrire = async (req, res) => {
 exports.getAllInscriptions = async (req, res) => {
   try {
     const { limit = 100, offset = 0 } = req.query;
+    const pi = [parseInt(limit), parseInt(offset)];
     const result = await pool.query(
       `
       SELECT i.*, e.titre AS evenement_titre, e.date_debut, e.prix
       FROM evenement_inscriptions i
       JOIN evenements e ON e.id = i.evenement_id
+      WHERE 1=1${etabCol(pi, req.etablissementId, 'e.etablissement_id')}
       ORDER BY i."createdAt" DESC
       LIMIT $1 OFFSET $2
       `,
-      [parseInt(limit), parseInt(offset)]
+      pi
     );
     res.json({ success: true, count: result.rows.length, data: result.rows });
   } catch (error) {
@@ -237,7 +261,8 @@ exports.getAllInscriptions = async (req, res) => {
 exports.getInscriptions = async (req, res) => {
   try {
     const { id } = req.params;
-    const evt = await pool.query('SELECT auteur FROM evenements WHERE id = $1', [id]);
+    const pv = [id];
+    const evt = await pool.query(`SELECT auteur FROM evenements WHERE id = $1${etabCol(pv, req.etablissementId, 'etablissement_id')}`, pv);
     if (evt.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Événement non trouvé.' });
     }

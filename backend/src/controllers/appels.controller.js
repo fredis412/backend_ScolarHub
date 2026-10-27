@@ -3,6 +3,16 @@ const pool = require('../config/db');
 const { envoyerNotificationAuto } = require('./notifications.controller');
 const { envoyerSMS } = require('../services/sms.service');
 
+// ── Multi-établissement ─────────────────────────────────────────────────────
+// req.etablissementId vient du jeton ; s'il est absent (anciens jetons), pas de filtre.
+// Un appel est rattaché à l'établissement par sa filière (filieres.etablissement_id).
+const filiereDeMonEtab = async (filiereId, etabId) => {
+    if (!etabId) return true;
+    if (filiereId === undefined || filiereId === null || filiereId === '') return false;
+    const r = await pool.query('SELECT 1 FROM filieres WHERE id = $1 AND etablissement_id = $2', [filiereId, etabId]);
+    return r.rows.length > 0;
+};
+
 // POST /api/appels - Créer un appel (présences) pour une classe/module
 const createAppel = async (req, res) => {
     try {
@@ -11,6 +21,10 @@ const createAppel = async (req, res) => {
 
         if (!filiere_id || !module_id) {
             return res.status(400).json({ success: false, message: 'filiere_id et module_id sont requis.' });
+        }
+
+        if (!(await filiereDeMonEtab(filiere_id, req.etablissementId))) {
+            return res.status(404).json({ success: false, message: 'Filière introuvable.' });
         }
 
         // Fetch module_nom to use in notifications
@@ -27,9 +41,15 @@ const createAppel = async (req, res) => {
         if (presences && presences.length > 0) {
             for (const p of presences) {
                 if (!p.matricule) continue;
+                const pe = [p.matricule];
+                let filtreEtu = '';
+                if (req.etablissementId) {
+                    pe.push(req.etablissementId);
+                    filtreEtu = ` AND etablissement_id = $${pe.length}`;
+                }
                 const etudiantResult = await pool.query(
-                    `SELECT id, user_id, nom, prenoms, tel_parent FROM etudiants WHERE matricule = $1`,
-                    [p.matricule]
+                    `SELECT id, user_id, nom, prenoms, tel_parent FROM etudiants WHERE matricule = $1${filtreEtu}`,
+                    pe
                 );
                 const etudiant = etudiantResult.rows[0];
                 if (!etudiant) continue;
@@ -69,6 +89,12 @@ const createAppel = async (req, res) => {
 const getAppels = async (req, res) => {
     try {
         const professeur_id = req.user.id;
+        const pa = [professeur_id];
+        let filtreEtab = '';
+        if (req.etablissementId) {
+            pa.push(req.etablissementId);
+            filtreEtab = ` AND a.filiere_id IN (SELECT id FROM filieres WHERE etablissement_id = $${pa.length})`;
+        }
         const result = await pool.query(`
             SELECT a.*, m.nom AS module_nom,
                 COUNT(ap.id) FILTER (WHERE ap.statut = 'present') AS nb_presents,
@@ -77,10 +103,10 @@ const getAppels = async (req, res) => {
             FROM appels a
             JOIN modules m ON a.module_id = m.id
             LEFT JOIN appel_presences ap ON ap.appel_id = a.id
-            WHERE a.professeur_id = $1
+            WHERE a.professeur_id = $1${filtreEtab}
             GROUP BY a.id, m.nom
             ORDER BY a.date_appel DESC, a.created_at DESC
-        `, [professeur_id]);
+        `, pa);
 
         res.json({ success: true, data: result.rows });
     } catch (error) {
@@ -102,7 +128,9 @@ const getAppelDetail = async (req, res) => {
             WHERE a.id = $1
         `, [id]);
         const appel = appelResult.rows[0];
-        if (!appel) return res.status(404).json({ success: false, message: 'Appel non trouvé.' });
+        if (!appel || !(await filiereDeMonEtab(appel.filiere_id, req.etablissementId))) {
+            return res.status(404).json({ success: false, message: 'Appel non trouvé.' });
+        }
         if (appel.professeur_id !== professeur_id && req.user.role !== 'admin') {
             return res.status(403).json({ success: false, message: 'Accès refusé.' });
         }
@@ -126,8 +154,8 @@ const updateAppel = async (req, res) => {
         const { presences } = req.body;
         const professeur_id = req.user.id;
 
-        const appelResult = await client.query('SELECT professeur_id FROM appels WHERE id = $1', [id]);
-        if (appelResult.rows.length === 0) return res.status(404).json({ success: false, message: 'Appel non trouvé.' });
+        const appelResult = await client.query('SELECT professeur_id, filiere_id FROM appels WHERE id = $1', [id]);
+        if (appelResult.rows.length === 0 || !(await filiereDeMonEtab(appelResult.rows[0].filiere_id, req.etablissementId))) return res.status(404).json({ success: false, message: 'Appel non trouvé.' });
         if (appelResult.rows[0].professeur_id !== professeur_id && req.user.role !== 'admin') {
             return res.status(403).json({ success: false, message: 'Accès refusé.' });
         }

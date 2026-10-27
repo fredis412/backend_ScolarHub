@@ -7,9 +7,52 @@ const { envoyerNotificationAuto } = require('./notifications.controller');
  * Contrôleur pour les Emplois Du Temps (EDT)
  */
 
+// ── Multi-établissement ─────────────────────────────────────────────────────
+// Un EDT appartient à un établissement par sa filière (filieres.etablissement_id).
+// req.etablissementId vient du jeton ; s'il est absent (anciens jetons), aucun
+// filtre n'est appliqué (comportement historique).
+async function filieresDeMonEtab(etabId) {
+  if (!etabId) return null; // pas de filtre
+  const r = await pool.query('SELECT id FROM filieres WHERE etablissement_id = $1', [etabId]);
+  return new Set(r.rows.map((x) => String(x.id)));
+}
+async function edtAutorise(req, edt) {
+  const ids = await filieresDeMonEtab(req.etablissementId);
+  return !ids || ids.has(String(edt.filiere));
+}
+// Résout une filière (id ou nom) DANS l'établissement du demandeur.
+async function resoudreFiliereEtab(req, filiere) {
+  if (!req.etablissementId) return resolveFiliere(pool, filiere);
+  const r = await pool.query(
+    'SELECT id, nom FROM filieres WHERE etablissement_id = $1 AND (CAST(id AS TEXT) = $2 OR LOWER(nom) = LOWER($2)) LIMIT 1',
+    [req.etablissementId, String(filiere)]
+  );
+  return r.rows[0] || null;
+}
+const FILIERE_INTROUVABLE = { success: false, message: 'Filière inconnue pour votre établissement.' };
+
+// Archive automatiquement les EDT dont la semaine est terminée (dateFin dépassée).
+// Appelé à chaque lecture : pas besoin de tâche planifiée. Les EDT archivés
+// n'apparaissent plus côté étudiants et passent dans l'onglet « Archivés » côté admin.
+async function archiverExpires() {
+  try {
+    const actifs = await EdtModel.findAll({ limit: 1000, offset: 0, includeArchives: false });
+    const aujourdhui = new Date().toISOString().slice(0, 10);
+    for (const e of actifs || []) {
+      if (e.archive || !e.dateFin) continue;
+      if (String(e.dateFin).slice(0, 10) < aujourdhui) {
+        await EdtModel.archive(e.id);
+      }
+    }
+  } catch (err) {
+    console.error('[archiverExpires] Erreur :', err.message);
+  }
+}
+
 // GET /api/edt - Récupérer l'EDT de l'étudiant connecté
 exports.getStudentEdt = async (req, res) => {
   try {
+    await archiverExpires();
     const userFiliere = req.user?.filiere_id;
     const userNiveau = req.user?.niveau; // À vérifier selon votre schéma
 
@@ -43,9 +86,71 @@ exports.getStudentEdt = async (req, res) => {
   }
 };
 
+// GET /api/edt/mon-programme — Programme actif + historique de l'étudiant connecté.
+// La filière et le niveau viennent de la fiche étudiant (etudiants.filiere_id),
+// DANS l'établissement du jeton : un étudiant ne voit jamais l'EDT d'un autre
+// établissement, même si une filière y porte le même nom.
+exports.getMonProgramme = async (req, res) => {
+  try {
+    const params = [req.user.id];
+    let etabSql = '';
+    if (req.etablissementId) {
+      params.push(req.etablissementId);
+      etabSql = ` AND f.etablissement_id = $${params.length}`;
+    }
+    const etu = await pool.query(
+      `SELECT e.filiere_id, e.niveau, f.nom AS filiere_nom, f.domaine
+         FROM etudiants e JOIN filieres f ON f.id = e.filiere_id
+        WHERE e.user_id = $1${etabSql}
+        LIMIT 1`,
+      params
+    );
+    const fiche = etu.rows[0];
+    if (!fiche) {
+      return res.json({ success: true, data: { filiere: {}, actif: null, historique: [] } });
+    }
+
+    const r = await pool.query(
+      `SELECT * FROM edt WHERE CAST(filiere AS TEXT) = $1 AND niveau = $2`,
+      [String(fiche.filiere_id), fiche.niveau]
+    );
+    const aujourdhui = new Date().toISOString().slice(0, 10);
+    const jour = (v) => (v ? String(v).slice(0, 10) : null);
+    const lignes = r.rows || [];
+
+    const nonArchives = lignes.filter((e) => !e.archive);
+    // Semaine en cours d'abord ; sinon le plus récent non archivé (anciens EDT sans dates).
+    let actif = nonArchives
+      .filter((e) => jour(e.dateDebut) && jour(e.dateFin) && jour(e.dateDebut) <= aujourdhui && aujourdhui <= jour(e.dateFin))
+      .sort((a, b) => String(jour(b.dateDebut)).localeCompare(String(jour(a.dateDebut))))[0];
+    if (!actif) {
+      actif = nonArchives
+        .filter((e) => !jour(e.dateFin) || jour(e.dateFin) >= aujourdhui)
+        .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))[0] || null;
+    }
+    const historique = lignes
+      .filter((e) => e.archive || (jour(e.dateFin) && jour(e.dateFin) < aujourdhui))
+      .sort((a, b) => String(jour(b.dateFin) || '').localeCompare(String(jour(a.dateFin) || '')));
+
+    res.json({
+      success: true,
+      data: {
+        filiere: { id: fiche.filiere_id, nom: fiche.filiere_nom, domaine: fiche.domaine || '' },
+        niveau: fiche.niveau,
+        actif: actif || null,
+        historique,
+      },
+    });
+  } catch (error) {
+    console.error('[getMonProgramme] Erreur :', error);
+    res.status(500).json({ success: false, message: 'Erreur lors de la récupération du programme.' });
+  }
+};
+
 // GET /api/edt/admin - Récupérer tous les EDT (admin seulement)
 exports.getAllEdt = async (req, res) => {
   try {
+    await archiverExpires();
     const { filiere, niveau, anneeAcademique, includeArchives = false, limit = 50, offset = 0 } = req.query;
 
     const filters = {
@@ -58,7 +163,9 @@ exports.getAllEdt = async (req, res) => {
     if (niveau) filters.niveau = niveau;
     if (anneeAcademique) filters.anneeAcademique = anneeAcademique;
 
-    const edts = await EdtModel.findAll(filters);
+    let edts = await EdtModel.findAll(filters);
+    const idsEtab = await filieresDeMonEtab(req.etablissementId);
+    if (idsEtab) edts = (edts || []).filter((e) => idsEtab.has(String(e.filiere)));
 
     res.status(200).json({
       success: true,
@@ -82,7 +189,7 @@ exports.getEdtById = async (req, res) => {
 
     const edt = await EdtModel.findById(id);
 
-    if (!edt) {
+    if (!edt || !(await edtAutorise(req, edt))) {
       return res.status(404).json({
         success: false,
         message: 'EDT non trouvé.',
@@ -122,7 +229,8 @@ exports.createEdt = async (req, res) => {
       });
     }
 
-    const filiereInfo = await resolveFiliere(pool, filiere);
+    const filiereInfo = await resoudreFiliereEtab(req, filiere);
+    if (!filiereInfo) return res.status(403).json(FILIERE_INTROUVABLE);
 
     const edtData = {
       filiere: filiereInfo.id || filiere,
@@ -155,7 +263,7 @@ exports.createEdt = async (req, res) => {
 // POST /api/edt/grille - Créer un EDT au format grille (jours/heures/salle), sans fichier PDF
 exports.createEdtGrille = async (req, res) => {
   try {
-    const { filiere, niveau, anneeAcademique, creneaux } = req.body;
+    const { filiere, niveau, anneeAcademique, creneaux, dateDebut, dateFin } = req.body;
 
     if (!filiere || !niveau) {
       return res.status(400).json({
@@ -171,7 +279,8 @@ exports.createEdtGrille = async (req, res) => {
       });
     }
 
-    const filiereInfo = await resolveFiliere(pool, filiere);
+    const filiereInfo = await resoudreFiliereEtab(req, filiere);
+    if (!filiereInfo) return res.status(403).json(FILIERE_INTROUVABLE);
 
     const edtData = {
       filiere: filiereInfo.id || filiere,
@@ -180,6 +289,8 @@ exports.createEdtGrille = async (req, res) => {
       anneeAcademique: anneeAcademique || new Date().getFullYear().toString(),
       pdfUrl: null,
       creneaux,
+      dateDebut: dateDebut || null,
+      dateFin: dateFin || null,
       archive: false,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -206,10 +317,10 @@ exports.createEdtGrille = async (req, res) => {
 exports.updateEdtGrille = async (req, res) => {
   try {
     const { id } = req.params;
-    const { niveau, anneeAcademique, creneaux, archive } = req.body;
+    const { niveau, anneeAcademique, creneaux, archive, dateDebut, dateFin } = req.body;
 
     const edt = await EdtModel.findById(id);
-    if (!edt) {
+    if (!edt || !(await edtAutorise(req, edt))) {
       return res.status(404).json({
         success: false,
         message: 'EDT non trouvé.',
@@ -221,6 +332,8 @@ exports.updateEdtGrille = async (req, res) => {
       ...(anneeAcademique && { anneeAcademique }),
       ...(Array.isArray(creneaux) && { creneaux }),
       ...(typeof archive === 'boolean' && { archive }),
+      ...(dateDebut !== undefined && { dateDebut }),
+      ...(dateFin !== undefined && { dateFin }),
       updatedAt: new Date().toISOString(),
     };
 
@@ -249,7 +362,7 @@ exports.updateEdt = async (req, res) => {
 
     // Vérifier que l'EDT existe
     const edt = await EdtModel.findById(id);
-    if (!edt) {
+    if (!edt || !(await edtAutorise(req, edt))) {
       return res.status(404).json({
         success: false,
         message: 'EDT non trouvé.',
@@ -263,7 +376,8 @@ exports.updateEdt = async (req, res) => {
       updatedAt: new Date().toISOString(),
     };
     if (filiere) {
-      const filiereInfo = await resolveFiliere(pool, filiere);
+      const filiereInfo = await resoudreFiliereEtab(req, filiere);
+      if (!filiereInfo) return res.status(403).json(FILIERE_INTROUVABLE);
       updateData.filiere = filiereInfo.id || filiere;
       updateData.filiere_nom = filiereInfo.nom;
     }
@@ -292,7 +406,7 @@ exports.archiveEdt = async (req, res) => {
 
     // Vérifier que l'EDT existe
     const edt = await EdtModel.findById(id);
-    if (!edt) {
+    if (!edt || !(await edtAutorise(req, edt))) {
       return res.status(404).json({
         success: false,
         message: 'EDT non trouvé.',
@@ -331,7 +445,7 @@ exports.deleteEdt = async (req, res) => {
 
     // Vérifier que l'EDT existe
     const edt = await EdtModel.findById(id);
-    if (!edt) {
+    if (!edt || !(await edtAutorise(req, edt))) {
       return res.status(404).json({
         success: false,
         message: 'EDT non trouvé.',
@@ -360,23 +474,34 @@ exports.envoyerEdt = async (req, res) => {
   try {
     const { id } = req.params;
     const edt = await EdtModel.findById(id);
-    if (!edt) {
+    if (!edt || !(await edtAutorise(req, edt))) {
       return res.status(404).json({ success: false, message: 'Emploi du temps introuvable.' });
     }
 
     const filiereId = edt.filiere;      // id de filière stocké dans l'EDT
     const niveau = edt.niveau || null;  // ex. "Licence 2"
 
-    // Étudiants actifs de cette filière (et de ce niveau si renseigné).
+    // ⚠️ Bug récurrent sur ce projet : `filiere_id` et `niveau` n'existent
+    // QUE sur `etudiants`, jamais sur `users` — ne JAMAIS écrire
+    // `u.filiere_id` ou `u.niveau` dans une requête (déjà rencontré et
+    // corrigé dans etudiants.controller.js::listEtudiants, notes.controller.js
+    // et ailleurs). D'où le JOIN (pas LEFT) : un étudiant sans ligne
+    // `etudiants` ne peut de toute façon pas être rattaché à une filière.
+    const pEnv = [filiereId, niveau];
+    let etabEnv = '';
+    if (req.etablissementId) {
+      pEnv.push(req.etablissementId);
+      etabEnv = ` AND u.etablissement_id = $${pEnv.length}`;
+    }
     const r = await pool.query(
       `SELECT u.id, u.prenoms, u.nom
          FROM users u
-         LEFT JOIN etudiants e ON u.id = e.user_id
-        WHERE (e.filiere_id = $1 OR u.filiere_id = $1)
-          AND ($2::text IS NULL OR e.niveau = $2 OR u.niveau = $2)
+         JOIN etudiants e ON u.id = e.user_id
+        WHERE e.filiere_id = $1
+          AND ($2::text IS NULL OR e.niveau = $2)
           AND (u.role ILIKE '%etudiant%' OR u.role ILIKE '%delegue%' OR u.role ILIKE '%bde%')
-          AND COALESCE(u.statut, 'actif') NOT IN ('suspendu', 'renvoye')`,
-      [filiereId, niveau]
+          AND COALESCE(u.statut, 'actif') NOT IN ('suspendu', 'renvoye')${etabEnv}`,
+      pEnv
     );
     const etudiants = r.rows;
 
@@ -387,7 +512,8 @@ exports.envoyerEdt = async (req, res) => {
 
     let notifies = 0;
     for (const etu of etudiants) {
-      const rr = await envoyerNotificationAuto(etu.id, titre, corps);
+      // type/data → au clic côté Flutter, ouvre directement l'onglet Planning.
+      const rr = await envoyerNotificationAuto(etu.id, titre, corps, 'edt', { tab: 'planning' });
       if (rr.success) notifies += 1;
     }
 

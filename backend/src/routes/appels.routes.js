@@ -10,6 +10,7 @@ router.post('/qr', authMiddleware, requireRole('professeur', 'admin'), qrControl
 router.post('/qr/checkin', authMiddleware, qrController.checkin);
 router.get('/qr/:sessionId', authMiddleware, qrController.getSessionQr);
 router.post('/qr/:sessionId/cloturer', authMiddleware, requireRole('professeur', 'admin'), qrController.cloturerSessionQr);
+router.post('/qr/:sessionId/marquer', authMiddleware, requireRole('professeur', 'admin'), qrController.marquerPresenceManuelle);
 
 // ── Appel classique ──
 router.post('/', authMiddleware, appelsController.createAppel);

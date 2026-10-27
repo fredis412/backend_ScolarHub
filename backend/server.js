@@ -52,7 +52,6 @@ app.use('/api/annonces',      require('./src/routes/annonces.routes'));
 app.use('/api/messages',      require('./src/routes/messageRoutes'));  // ← Jalil
 app.use('/api/canaux',        require('./src/routes/canaux.routes'));
 app.use('/api/tickets',       require('./src/routes/tickets.routes'));
-app.use('/api/bde',           require('./src/routes/bde.routes'));
 app.use('/api/evenements',    require('./src/routes/evenements.routes'));
 app.use('/api/edt',           require('./src/routes/edt.routes'));
 app.use('/api/upload',        require('./src/routes/upload.routes'));
@@ -65,6 +64,9 @@ app.use('/api/appels',        require('./src/routes/appels.routes'));
 app.use('/api/risque',        require('./src/routes/risque.routes'));
 app.use('/api/paiements',     require('./src/routes/paiements.routes'));
 app.use('/api/dashboard',     require('./src/routes/dashboard.routes'));
+app.use('/api/cantine', require('./src/routes/cantine.routes'));
+app.use('/api/gifs', require('./src/routes/gifs.routes'));
+app.use('/api/plateforme', require('./src/routes/plateforme.routes'));
  
 app.get('/', (req, res) => res.json({ message: 'ScolarHub API — IST Ouaga 2000', status: 'OK' }));
  

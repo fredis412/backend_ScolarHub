@@ -1,5 +1,13 @@
 ﻿const jwt = require('jsonwebtoken');
 
+// Tout jeton valide DOIT contenir l'établissement du compte. Un jeton sans
+// établissement (émis avant le multi-établissement) est refusé : sans lui le
+// serveur ne pourrait pas filtrer les données et verrait toutes les écoles.
+const SESSION_ETAB_REQUISE = {
+  message: 'Session expirée. Veuillez vous reconnecter avec le code de votre établissement.',
+  code: 'ETAB_REQUIS',
+};
+
 const authMiddleware = (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -8,7 +16,11 @@ const authMiddleware = (req, res, next) => {
   const token = authHeader.split(' ')[1];
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    if (!decoded.etablissement_id) {
+      return res.status(401).json(SESSION_ETAB_REQUISE);
+    }
     req.user = decoded;
+    req.etablissementId = decoded.etablissement_id;
     next();
   } catch (err) {
     return res.status(401).json({ message: 'Token expiré ou invalide.' });
@@ -31,7 +43,11 @@ const optionalAuth = (req, res, next) => {
   const token = authHeader.split(' ')[1];
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded;
+    // Jeton sans établissement : traité comme non connecté (jamais de données non filtrées).
+    if (decoded.etablissement_id) {
+      req.user = decoded;
+      req.etablissementId = decoded.etablissement_id;
+    }
   } catch (err) {
     // Token invalide, on continue sans user
   }

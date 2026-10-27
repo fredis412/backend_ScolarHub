@@ -3,6 +3,19 @@ const router = express.Router();
 const pool = require('../config/db');
 const { authMiddleware, requireRole } = require('../middleware/auth.middleware');
 
+// ── Isolation par établissement ─────────────────────────────────────────────
+// Un ticket appartient à l'établissement de son étudiant (users.etablissement_id).
+// req.etablissementId vient du jeton ; s'il est absent (anciens jetons), pas de filtre.
+async function ticketDeMonEtab(req, id) {
+  if (!req.etablissementId) return true;
+  const r = await pool.query(
+    `SELECT 1 FROM tickets t JOIN users u ON u.id = t.etudiant_id
+     WHERE t.id = $1 AND u.etablissement_id = $2`,
+    [id, req.etablissementId]
+  );
+  return r.rows.length > 0;
+}
+
 // GET /api/tickets - Liste des tickets (paiements)
 router.get('/', authMiddleware, async (req, res) => {
   try {
@@ -14,9 +27,10 @@ router.get('/', authMiddleware, async (req, res) => {
         SELECT t.*, u.nom, u.prenoms, u.matricule
         FROM tickets t
         JOIN users u ON u.id = t.etudiant_id
+        ${req.etablissementId ? 'WHERE u.etablissement_id = $1' : ''}
         ORDER BY t.created_at DESC
       `;
-      params = [];
+      params = req.etablissementId ? [req.etablissementId] : [];
     } else {
       query = `SELECT * FROM tickets WHERE etudiant_id = $1 ORDER BY created_at DESC`;
       params = [req.user.id];
@@ -58,7 +72,7 @@ router.get('/:id', authMiddleware, async (req, res) => {
        WHERE t.id = $1`,
       [req.params.id]
     );
-    if (!result.rows[0]) {
+    if (!result.rows[0] || !(await ticketDeMonEtab(req, req.params.id))) {
       return res.status(404).json({ success: false, message: 'Ticket non trouve.' });
     }
     const ticket = result.rows[0];
@@ -76,6 +90,9 @@ router.get('/:id', authMiddleware, async (req, res) => {
 router.patch('/:id', authMiddleware, requireRole('admin', 'direction'), async (req, res) => {
   try {
     const { statut, qr_code } = req.body;
+    if (!(await ticketDeMonEtab(req, req.params.id))) {
+      return res.status(404).json({ success: false, message: 'Ticket non trouve.' });
+    }
     const result = await pool.query(
       `UPDATE tickets SET statut = COALESCE($1, statut), qr_code = COALESCE($2, qr_code)
        WHERE id = $3 RETURNING *`,

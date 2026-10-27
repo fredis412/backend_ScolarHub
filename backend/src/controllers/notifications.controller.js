@@ -21,6 +21,28 @@ const getNotifications = async (req, res) => {
   }
 };
 
+// GET /api/notifications/non-lues/count - Nombre de notifications non lues.
+// Léger, dédié à la cloche (badge rouge) — évite de charger toute la liste
+// juste pour afficher un chiffre.
+const getNombreNonLues = async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { count, error } = await supabase
+      .from('notifications')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .eq('lue', false);
+
+    if (error) throw error;
+
+    res.json({ success: true, count: count || 0 });
+  } catch (error) {
+    console.error('[getNombreNonLues]', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
 // PATCH /api/notifications/:id/lue - Marquer une notification comme lue
 const marquerCommeLue = async (req, res) => {
   try {
@@ -62,15 +84,23 @@ const marquerToutesLues = async (req, res) => {
 };
 
 // Utilitaire - Enregistrer une notification
+// [type] identifie la catégorie d'événement (ex. 'edt', 'note', 'bulletin',
+// 'cours', 'mot_de_passe', 'premiere_connexion', 'nouvel_etudiant',
+// 'annonce') — utilisé côté Flutter pour choisir l'icône ET pour savoir
+// où rediriger au clic.
+// [data] porte le contexte nécessaire à cette redirection (ex.
+// { tab: 'planning' }, { etudiantId }, { canalId }...). Optionnel.
 // Returns { success: true } or { success: false, error: string }
-const envoyerNotificationAuto = async (userId, titre, corps) => {
+const envoyerNotificationAuto = async (userId, titre, corps, type = null, data = null) => {
   try {
-    const { data, error } = await supabase
+    const { data: row, error } = await supabase
       .from('notifications')
       .insert({
         user_id: userId,
         titre,
         corps,
+        type,
+        data,
         lue: false,
         created_at: new Date(),
       })
@@ -83,9 +113,9 @@ const envoyerNotificationAuto = async (userId, titre, corps) => {
     }
 
     // Push temps réel vers la cloche de l'utilisateur (si connecté).
-    pushToUser(userId, 'notification', data);
+    pushToUser(userId, 'notification', row);
 
-    return { success: true, data };
+    return { success: true, data: row };
   } catch (error) {
     console.error('[envoyerNotificationAuto]', error);
     return { success: false, error: error.message };
@@ -94,6 +124,7 @@ const envoyerNotificationAuto = async (userId, titre, corps) => {
 
 module.exports = {
   getNotifications,
+  getNombreNonLues,
   marquerCommeLue,
   marquerToutesLues,
   envoyerNotificationAuto,

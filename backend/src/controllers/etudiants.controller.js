@@ -458,6 +458,7 @@ const inscrireEtudiant = async (req, res) => {
         email: email?.trim() || null,
         telephone: telephone?.trim() || null,
         ecole: filiere?.trim(),
+        etablissementId: etabId, // expéditeur « École via ScolarHub » + réponses vers l'école
       });
     } catch (notifErr) {
       console.error('[inscrireEtudiant] notification', notifErr.message);
@@ -567,6 +568,17 @@ const finaliserPremiereConnexion = async (req, res) => {
 
     if (!userRow) {
       return res.status(404).json({ error: 'Étudiant non trouvé.' });
+    }
+
+    // ⚠️ Route publique : l'activation n'est permise que si le compte n'a PAS encore de mot de
+    // passe (nouvel étudiant, ou mot de passe réinitialisé par l'administration). Sans cette
+    // garde, n'importe qui connaissant un matricule pouvait changer le mot de passe d'un
+    // étudiant et se connecter à sa place.
+    const mdpExistant = userRow.mot_de_passe && String(userRow.mot_de_passe).trim() !== '' && userRow.mot_de_passe !== 'null';
+    if (mdpExistant) {
+      return res.status(403).json({
+        error: 'Ce compte est déjà activé. Connectez-vous, ou utilisez « Mot de passe oublié ».',
+      });
     }
 
     const hashed = await bcrypt.hash(password, 10);
@@ -1204,7 +1216,31 @@ const modifierEtudiant = async (req, res) => {
   }
 };
 
+// ── POST /api/etudiants/:id/reinitialiser-mdp — l'administration efface le mot de passe ──
+// :id = id de la table etudiants. L'étudiant reprend le parcours de première connexion
+// (matricule, puis il choisit un nouveau mot de passe). Pour les comptes sans email.
+const reinitialiserMotDePasseEtudiant = async (req, res) => {
+  try {
+    const etu = await etudiantDeMonEtab(req.params.id, req.etablissementId);
+    if (!etu) return res.status(404).json({ success: false, message: 'Étudiant introuvable.' });
+    await pool.query(
+      `UPDATE users SET mot_de_passe = NULL, reset_code = NULL, reset_code_hash = NULL,
+              reset_expires = NULL, reset_essais = 0 WHERE id = $1`,
+      [etu.user_id]
+    );
+    await pool.query('UPDATE etudiants SET premierefois = true WHERE id = $1', [etu.id]);
+    return res.status(200).json({
+      success: true,
+      message: 'Mot de passe réinitialisé. L\'étudiant choisira un nouveau mot de passe à sa prochaine connexion.',
+    });
+  } catch (err) {
+    console.error('[reinitialiserMotDePasseEtudiant]', err);
+    return res.status(500).json({ success: false, message: 'Erreur lors de la réinitialisation.' });
+  }
+};
+
 module.exports = {
+  reinitialiserMotDePasseEtudiant,
   modifierEtudiant,
   uploaderPhotoEtudiant,
   ajouterDocumentEtudiant,

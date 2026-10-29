@@ -21,6 +21,7 @@ router.post('/refuser-inscriptions', authMiddleware, requireRole('admin'), etudi
 router.post('/:id/photo', authMiddleware, requireRole('admin'), upload.single('file'), uploadToCloudinary('scolarhub/photos-profil'), etudiantsController.uploaderPhotoEtudiant);
 router.post('/:id/document', authMiddleware, requireRole('admin'), upload.single('file'), uploadToCloudinary('scolarhub/documents-etudiants'), etudiantsController.ajouterDocumentEtudiant);
 router.get('/:id/documents', authMiddleware, requireRole('admin'), etudiantsController.listerDocumentsEtudiant);
+router.post('/:id/reinitialiser-mdp', authMiddleware, requireRole('admin'), etudiantsController.reinitialiserMotDePasseEtudiant);
 router.put('/:id/identite', authMiddleware, requireRole('admin'), etudiantsController.completerIdentite);
 
 router.get('/delegues', authMiddleware, etudiantsController.getDelegues);

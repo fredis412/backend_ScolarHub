@@ -46,6 +46,9 @@ router.get('/:id/modules', authMiddleware, ctrl.getModulesByProfesseur);
 router.post('/:id/modules',                     authMiddleware, requireRole('admin'), ctrl.assignerModule);
 router.delete('/:id/modules/:affectationId',    authMiddleware, requireRole('admin'), ctrl.retirerModule);
 
+// Réinitialisation du mot de passe par l'administration (compte sans email)
+router.post('/:id/reinitialiser-mdp', authMiddleware, requireRole('admin'), ctrl.reinitialiserMotDePasse);
+
 // Photo d'identité d'un professeur (multipart, champ `file`) — admin
 router.post('/:id/photo', authMiddleware, requireRole('admin'),
   upload.single('file'), uploadToCloudinary('scolarhub/photos-profil'), ctrl.uploaderPhotoProfesseur);

@@ -2,6 +2,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const pool = require('../config/db');
 const supabase = require('../config/supabase');
+const crypto = require('crypto');
 const emailService = require('../services/email.service');
 const { envoyerNotificationAuto } = require('./notifications.controller');
 const { validerMatricule } = require('../utils/matricule');
@@ -862,6 +863,25 @@ function tropEssaisMdp(cle, max, fenetreMs) {
   return e.n > max;
 }
 
+// ── Mot de passe oublié ───────────────────────────────────────────────────────
+// Code à 6 chiffres tiré avec crypto (imprévisible), stocké HACHÉ (HMAC) dans
+// users.reset_code_hash, valable 15 min, invalidé après 5 essais ratés.
+const MAX_ESSAIS_CODE = 5;
+const hacherCode = (userId, code) =>
+  crypto.createHmac('sha256', process.env.JWT_SECRET || 'scolarhub').update(`${userId}:${String(code).trim()}`).digest('hex');
+const memeHash = (a, b) => {
+  const x = Buffer.from(String(a || ''), 'hex'); const y = Buffer.from(String(b || ''), 'hex');
+  return x.length > 0 && x.length === y.length && crypto.timingSafeEqual(x, y);
+};
+// « ibrahim@gmail.com » -> « i***@gmail.com »
+const masquerEmail = (e) => {
+  const [loc, dom] = String(e || '').split('@');
+  if (!loc || !dom) return '';
+  return `${loc[0]}***@${dom}`;
+};
+const MSG_CODE_ENVOYE = 'Si un compte correspond, un code de réinitialisation vient d\'être envoyé par email. '
+  + 'Sans email reçu, contactez l\'administration de votre établissement.';
+
 const forgotPassword = async (req, res) => {
   try {
     const { identifiant } = req.body;
@@ -882,46 +902,32 @@ const forgotPassword = async (req, res) => {
       paramsFp
     );
     const user = r.rows[0];
+    const emailReel = user && user.email && !/@sans-email\.scolarhub$/i.test(user.email) ? user.email : null;
 
-    if (!user) {
-      return res.status(404).json({ message: 'Utilisateur introuvable.' });
-    }
+    // Même réponse que le compte existe ou non (pas de devinette des comptes).
+    const reponse = { message: MSG_CODE_ENVOYE, email: emailReel ? masquerEmail(emailReel) : '' };
+    if (!emailReel) return res.status(200).json(reponse);
 
-    if (!user.email) {
-      return res.status(400).json({ message: 'Aucune adresse email associée à ce compte.' });
-    }
-
-    // Générer un code à 6 chiffres
-    const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const resetCode = String(crypto.randomInt(100000, 1000000));
     const expiresAt = new Date(Date.now() + 15 * 60000); // 15 minutes
-
-    // Sauvegarder dans la DB
     await pool.query(
-      'UPDATE users SET reset_code = $1, reset_expires = $2 WHERE id = $3',
-      [resetCode, expiresAt, user.id]
+      'UPDATE users SET reset_code = NULL, reset_code_hash = $1, reset_expires = $2, reset_essais = 0 WHERE id = $3',
+      [hacherCode(user.id, resetCode), expiresAt, user.id]
     );
 
-    // Envoyer l'email
     const emailResult = await emailService.envoyer(
-      user.email,
+      emailReel,
       'ScolarHub - Réinitialisation de mot de passe',
       {
-        text: `Bonjour ${user.nom},\n\nVotre code de réinitialisation est : ${resetCode}\n\nCe code expirera dans 15 minutes.\n\nL'équipe ScolarHub`,
+        etablissementId: etab.id,
+        text: `Bonjour ${user.nom},\n\nVotre code de réinitialisation est : ${resetCode}\n\nCe code expire dans 15 minutes. Si vous n'êtes pas à l'origine de cette demande, ignorez ce message.\n\nL'équipe ScolarHub`,
       }
     );
+    if (!emailResult.success) console.error('[forgotPassword] envoi email échoué :', emailResult.error);
 
-    if (!emailResult.success) {
-      console.error('Failed to send email:', emailResult.error);
-      // We still return success so we don't block testing in dev, but ideally handle it better
-    }
-
-    return res.status(200).json({
-      message: 'Un code de réinitialisation a été envoyé à votre adresse email.',
-      email: user.email,
-      // Le code n'est renvoyé au client QUE si les e-mails sont en mode « console »
-      // (développement). En production il n'est jamais exposé.
-      code: process.env.EMAIL_PROVIDER === 'console' ? resetCode : undefined,
-    });
+    // Le code n'est renvoyé au client QUE si les e-mails sont en mode « console »
+    // (développement). En production il n'est jamais exposé.
+    return res.status(200).json({ ...reponse, code: process.env.EMAIL_PROVIDER === 'console' ? resetCode : undefined });
   } catch (err) {
     console.error('ForgotPassword error:', err);
     return res.status(500).json({ message: 'Erreur serveur.' });
@@ -943,24 +949,30 @@ const resetPassword = async (req, res) => {
       return res.status(429).json({ message: 'Trop de tentatives. Réessayez dans 15 minutes.' });
     }
 
-    // Chercher l'utilisateur
     const paramsRp = [identifiant.trim()];
     const r = await pool.query(
-      `SELECT id, reset_code, reset_expires FROM users WHERE (UPPER(matricule) = UPPER($1) OR LOWER(email) = LOWER($1))${etabClause(paramsRp, etab.id, 'users')}`,
+      `SELECT id, reset_code_hash, reset_expires, reset_essais FROM users WHERE (UPPER(matricule) = UPPER($1) OR LOWER(email) = LOWER($1))${etabClause(paramsRp, etab.id, 'users')}`,
       paramsRp
     );
     const user = r.rows[0];
+    const MSG_CODE_KO = 'Code incorrect ou expiré. Refaites une demande si besoin.';
 
-    if (!user) {
-      return res.status(404).json({ message: 'Utilisateur introuvable.' });
+    // Compte inconnu, pas de code en cours ou code expiré : même réponse.
+    if (!user || !user.reset_code_hash || !user.reset_expires || new Date() > new Date(user.reset_expires)) {
+      return res.status(400).json({ message: MSG_CODE_KO });
     }
-
-    if (!user.reset_code || String(user.reset_code) !== String(code).trim()) {
-      return res.status(400).json({ message: 'Code de réinitialisation incorrect.' });
+    if ((user.reset_essais || 0) >= MAX_ESSAIS_CODE) {
+      await pool.query('UPDATE users SET reset_code_hash = NULL, reset_expires = NULL, reset_essais = 0 WHERE id = $1', [user.id]);
+      return res.status(400).json({ message: 'Trop d\'essais : ce code est annulé. Refaites une demande.' });
     }
-
-    if (new Date() > new Date(user.reset_expires)) {
-      return res.status(400).json({ message: 'Le code de réinitialisation a expiré.' });
+    if (!memeHash(user.reset_code_hash, hacherCode(user.id, code))) {
+      const essais = (user.reset_essais || 0) + 1;
+      if (essais >= MAX_ESSAIS_CODE) {
+        await pool.query('UPDATE users SET reset_code_hash = NULL, reset_expires = NULL, reset_essais = 0 WHERE id = $1', [user.id]);
+        return res.status(400).json({ message: 'Trop d\'essais : ce code est annulé. Refaites une demande.' });
+      }
+      await pool.query('UPDATE users SET reset_essais = $1 WHERE id = $2', [essais, user.id]);
+      return res.status(400).json({ message: MSG_CODE_KO });
     }
 
     if (String(newPassword).length < 4) {
@@ -969,7 +981,7 @@ const resetPassword = async (req, res) => {
     const hashed = await bcrypt.hash(newPassword, 10);
 
     await pool.query(
-      'UPDATE users SET mot_de_passe = $1, reset_code = NULL, reset_expires = NULL WHERE id = $2',
+      'UPDATE users SET mot_de_passe = $1, reset_code = NULL, reset_code_hash = NULL, reset_expires = NULL, reset_essais = 0 WHERE id = $2',
       [hashed, user.id]
     );
 

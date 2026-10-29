@@ -12,6 +12,11 @@ const PROVIDER = process.env.EMAIL_PROVIDER || 'console';
 const FROM_EMAIL = process.env.EMAIL_FROM || 'no-reply@scolarhub.bf';
 const FROM_NAME = process.env.EMAIL_FROM_NAME || 'ScolarHub';
 
+// Un seul expéditeur technique pour toute l'application (EMAIL_FROM). Le NOM affiché est
+// celui de l'école (« IST Ouaga 2000 via ScolarHub ») et les réponses vont à l'adresse de
+// l'école (etablissements.email_contact) : voir contenu.etablissementId plus bas.
+const nettoyerNom = (n) => String(n || '').replace(/["<>\r\n]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
+
 // Fournisseur "console" : journalise l'email (dev / démo).
 const consoleProvider = {
   async envoyer(to, subject, { text }) {
@@ -22,7 +27,7 @@ const consoleProvider = {
 
 // SMTP via nodemailer (chargé à la demande : dépendance requise seulement ici).
 const smtpProvider = {
-  async envoyer(to, subject, { text, html }) {
+  async envoyer(to, subject, { text, html, fromName, replyTo }) {
     try {
       const nodemailer = require('nodemailer');
       const transport = nodemailer.createTransport({
@@ -32,13 +37,17 @@ const smtpProvider = {
         auth: process.env.SMTP_USER
           ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
           : undefined,
+        connectionTimeout: 10000, // ne pas bloquer la requête si le port SMTP est filtré
+        greetingTimeout: 10000,
+        socketTimeout: 15000,
       });
       await transport.sendMail({
-        from: `"${FROM_NAME}" <${FROM_EMAIL}>`,
+        from: `"${fromName || FROM_NAME}" <${FROM_EMAIL}>`,
         to,
         subject,
         text,
         html,
+        ...(replyTo ? { replyTo } : {}),
       });
       return { success: true, provider: 'smtp' };
     } catch (err) {
@@ -50,7 +59,7 @@ const smtpProvider = {
 
 // Brevo (ex-Sendinblue) — API HTTP, aucune dépendance npm.
 const brevoProvider = {
-  async envoyer(to, subject, { text, html }) {
+  async envoyer(to, subject, { text, html, fromName, replyTo }) {
     const key = process.env.BREVO_API_KEY;
     if (!key) return { success: false, error: 'BREVO_API_KEY non configuré.' };
     try {
@@ -58,7 +67,8 @@ const brevoProvider = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'api-key': key },
         body: JSON.stringify({
-          sender: { name: FROM_NAME, email: FROM_EMAIL },
+          sender: { name: fromName || FROM_NAME, email: FROM_EMAIL },
+          ...(replyTo ? { replyTo: { email: replyTo } } : {}),
           to: [{ email: to }],
           subject,
           htmlContent: html || `<pre>${text}</pre>`,
@@ -80,7 +90,7 @@ const brevoProvider = {
 
 // SendGrid — API HTTP, aucune dépendance npm.
 const sendgridProvider = {
-  async envoyer(to, subject, { text, html }) {
+  async envoyer(to, subject, { text, html, fromName, replyTo }) {
     const key = process.env.SENDGRID_API_KEY;
     if (!key) return { success: false, error: 'SENDGRID_API_KEY non configuré.' };
     try {
@@ -92,7 +102,8 @@ const sendgridProvider = {
         },
         body: JSON.stringify({
           personalizations: [{ to: [{ email: to }] }],
-          from: { email: FROM_EMAIL, name: FROM_NAME },
+          from: { email: FROM_EMAIL, name: fromName || FROM_NAME },
+          ...(replyTo ? { reply_to: { email: replyTo } } : {}),
           subject,
           content: [
             { type: 'text/plain', value: text },
@@ -124,15 +135,32 @@ const providers = {
  * Envoie un email. Ne lève jamais d'exception.
  * @param {string} to - adresse du destinataire
  * @param {string} subject - objet
- * @param {{text:string, html?:string}} contenu
+ * @param {{text:string, html?:string, etablissementId?:number, fromName?:string, replyTo?:string}} contenu
+ *   etablissementId : l'expéditeur affiché devient « <École> via ScolarHub » et les réponses
+ *   vont à l'email de l'école (etablissements.email_contact), s'il est renseigné.
  * @returns {Promise<{success:boolean, provider?:string, error?:string}>}
  */
-const envoyerEmail = async (to, subject, contenu) => {
-  if (!to || !to.includes('@')) {
+const envoyerEmail = async (to, subject, contenu = {}) => {
+  if (!to || !to.includes('@') || /@sans-email\.scolarhub$/i.test(to.trim())) {
     return { success: false, error: 'Adresse email invalide ou absente.' };
   }
+  const { etablissementId, ...reste } = contenu;
+  if (etablissementId && !reste.fromName) {
+    try {
+      const pool = require('../config/db'); // chargé à la demande : pas de cycle au démarrage
+      const r = await pool.query('SELECT nom, email_contact FROM etablissements WHERE id = $1', [etablissementId]);
+      const e = r.rows[0];
+      if (e) {
+        const nom = nettoyerNom(e.nom);
+        if (nom) reste.fromName = `${nom} via ScolarHub`;
+        if (!reste.replyTo && e.email_contact && e.email_contact.includes('@')) reste.replyTo = e.email_contact.trim();
+      }
+    } catch (err) {
+      console.error('[EMAIL] expéditeur par établissement indisponible :', err.message); // ex. migration non faite
+    }
+  }
   const provider = providers[PROVIDER] || consoleProvider;
-  return provider.envoyer(to, subject, contenu);
+  return provider.envoyer(to.trim(), subject, reste);
 };
 
 module.exports = { envoyerEmail, envoyer: envoyerEmail };

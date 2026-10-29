@@ -383,6 +383,7 @@
     ouvrir('<h2>Nouvel établissement</h2><div class="mu">Création de l\'école, de ses canaux standard et de son premier Super Admin.</div>' +
       '<form id="fNouvel"><div class="grid2">' + champ('nom', 'Nom complet *', 'required') + champ('sigle', 'Sigle *', 'required') +
       champ('ville', 'Ville') + champ('campus', 'Campus') +
+      champ('email_contact', 'Email de l\'établissement', 'type="email" placeholder="contact@ecole.bf"') +
       '<div><label>Type</label><select name="type">' + optionsType('superieur') + '</select></div>' +
       champ('code', 'Code d\'accès (vide = automatique)', 'placeholder="ex. UNIV2026"') + '</div>' +
       '<label>Modèle de matricule * <span class="mu">— jetons {AA}, {AAAA}, {NNNN} ; le reste est le texte fixe propre à l\'école</span></label>' +
@@ -437,6 +438,7 @@
     ouvrir('<h2>Modifier l\'établissement</h2><div class="mu">' + esc(e.nom) + '</div><form id="fEdit" data-id="' + e.id + '"><div class="grid2">' +
       champ('nom', 'Nom complet *', 'required', e.nom) + champ('sigle', 'Sigle *', 'required', e.sigle) +
       champ('ville', 'Ville', '', e.ville) + champ('campus', 'Campus', '', e.campus) +
+      champ('email_contact', 'Email de l\'établissement', 'type="email"', e.email_contact) +
       '<div><label>Type</label><select name="type">' + optionsType(e.type) + '</select></div>' +
       champ('code', 'Code d\'accès *', 'required', e.code) + '</div>' +
       '<label>Modèle de matricule *</label><input name="modele_matricule" required value="' + esc(e.modele_matricule || '') + '">' +
@@ -552,6 +554,7 @@
       if (errLogo) { fin(); $('resNouvel').innerHTML = '<div class="err">' + esc(errLogo) + '</div>'; return; }
       appel('POST', '/etablissements', {
         nom: v('nom'), sigle: v('sigle'), ville: v('ville'), campus: v('campus'), type: v('type'), code: v('code'),
+        email_contact: v('email_contact'),
         modele_matricule: v('modele_matricule'),
         admin: { nom: v('a_nom'), prenoms: v('a_prenoms'), email: v('a_email'), tel: v('a_tel'), motDePasse: f.elements.a_mdp.value }
       }).then(function (j) {
@@ -577,6 +580,7 @@
       var id = f.getAttribute('data-id');
       modifier(id, {
         nom: v('nom'), sigle: v('sigle').toUpperCase(), ville: v('ville'), campus: v('campus'), type: v('type'), code: v('code'),
+        email_contact: v('email_contact'),
         modele_matricule: v('modele_matricule'),
         inscription_ouverte: f.elements.inscription_ouverte.checked, inscription_validation: f.elements.inscription_validation.checked
       }, 'Établissement mis à jour.').then(fin);

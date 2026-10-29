@@ -298,6 +298,29 @@ exports.uploaderPhotoProfesseur = async (req, res) => {
   }
 };
 
+// ── POST /api/professeurs/:id/reinitialiser-mdp — l'administration efface le mot de passe ──
+// Le professeur reprend le parcours de première connexion (nom, prénom, téléphone) et
+// choisit un nouveau mot de passe. Pour les comptes sans email.
+exports.reinitialiserMotDePasse = async (req, res) => {
+  try {
+    const p = [req.params.id];
+    const r = await db.query(
+      `UPDATE users SET mot_de_passe = NULL, reset_code = NULL, reset_code_hash = NULL,
+              reset_expires = NULL, reset_essais = 0
+       WHERE id = $1 AND role = 'professeur'${etabCol(p, req.etablissementId, 'etablissement_id')} RETURNING id`,
+      p
+    );
+    if (!r.rows[0]) return res.status(404).json({ success: false, message: 'Professeur introuvable.' });
+    res.json({
+      success: true,
+      message: 'Mot de passe réinitialisé. Le professeur choisira un nouveau mot de passe à sa prochaine connexion.',
+    });
+  } catch (err) {
+    console.error('[reinitialiserMotDePasse prof]', err);
+    res.status(500).json({ success: false, message: 'Erreur lors de la réinitialisation.' });
+  }
+};
+
 // ── DELETE /api/professeurs/:id ───────────────────────────────────────────────
 exports.deleteProfesseur = async (req, res) => {
   const { id } = req.params;

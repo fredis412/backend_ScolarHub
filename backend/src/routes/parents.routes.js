@@ -25,7 +25,9 @@ router.post('/consultation', authMiddleware, parentsController.marquerConsulte);
 router.get('/enfant/:etudiantId/notes', authMiddleware, parentsController.getNotesEnfant);
 router.get('/enfant/:etudiantId/bulletins', authMiddleware, parentsController.getBulletinsEnfant);
 router.get('/enfant/:etudiantId/presences', authMiddleware, parentsController.getPresencesEnfant);
-
+router.get('/enfant/:etudiantId/programme', authMiddleware, parentsController.getProgrammeEnfant);
+router.get('/enfant/:etudiantId/contact-administration', authMiddleware, parentsController.getContactAdministration);
+router.get('/mon-profil', authMiddleware, parentsController.getMonProfil);
 // ── Admin : édition des champs d'affichage tuteur sur `etudiants` ───────────
 router.get('/enfant/:etudiantId', authMiddleware, requireRole('admin', 'direction'), parentsController.getInfoTuteur);
 router.put('/enfant/:etudiantId', authMiddleware, requireRole('admin', 'direction'), parentsController.modifierInfoTuteur);

@@ -1,6 +1,7 @@
 const db = require('../config/db');
 const bcrypt = require('bcryptjs');
 const { getOrCreateCanalProfDelegue } = require('../utils/canauxProfDelegue');
+const { messageConflitUnique } = require('../utils/erreursSql');
 
 // ── Multi-établissement ─────────────────────────────────────────────────────
 // req.etablissementId vient du jeton ; s'il est absent (anciens jetons), pas de filtre.
@@ -231,8 +232,9 @@ exports.createProfesseur = async (req, res) => {
     });
   } catch (err) {
     console.error('createProfesseur:', err.message);
-    if (err.code === '23505') return res.status(409).json({ error: 'Email ou matricule déjà utilisé.' });
-    res.status(500).json({ error: err.message });
+    const doublon = messageConflitUnique(err);
+    if (doublon) return res.status(409).json({ error: doublon, message: doublon });
+    res.status(500).json({ error: 'Une erreur est survenue. Réessayez ou contactez le support.' });
   } finally {
     client.release();
   }
@@ -276,8 +278,9 @@ exports.updateProfesseur = async (req, res) => {
     res.json(result.rows[0]);
   } catch (err) {
     console.error('updateProfesseur:', err.message);
-    if (err.code === '23505') return res.status(409).json({ error: 'Email ou matricule déjà utilisé.' });
-    res.status(500).json({ error: err.message });
+    const doublon = messageConflitUnique(err);
+    if (doublon) return res.status(409).json({ error: doublon, message: doublon });
+    res.status(500).json({ error: 'Une erreur est survenue. Réessayez ou contactez le support.' });
   } finally {
     client.release();
   }

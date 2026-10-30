@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const supabase = require('../config/supabase');
 const bcrypt = require('bcryptjs');
+const { messageConflitUnique } = require('../utils/erreursSql');
 
 // ── Multi-établissement ─────────────────────────────────────────────────────
 // req.etablissementId vient du jeton ; s'il est absent (anciens jetons), pas de filtre.
@@ -252,7 +253,12 @@ const createMembre = async (req, res) => {
           ...(etabId ? { etablissement_id: etabId } : {}),
         }]).select().single();
 
-        if (errSup) return res.status(500).json({ success: false, message: errSup.message });
+        if (errSup) {
+          console.error('[createMembre] Supabase insert error:', errSup.message);
+          const doublon = messageConflitUnique(errSup);
+          if (doublon) return res.status(409).json({ success: false, message: doublon });
+          return res.status(500).json({ success: false, message: 'Erreur serveur lors de la création.' });
+        }
         createdUser = userSup;
 
         // Insertion dans membres
@@ -304,6 +310,8 @@ const createMembre = async (req, res) => {
     });
   } catch (err) {
     console.error('createMembre error:', err);
+    const doublon = messageConflitUnique(err);
+    if (doublon) return res.status(409).json({ success: false, message: doublon });
     return res.status(500).json({ success: false, message: 'Erreur serveur lors de la création.' });
   }
 };
@@ -433,6 +441,8 @@ const updateMembre = async (req, res) => {
     return res.status(200).json({ success: true, message: 'Membre mis à jour.' });
   } catch (err) {
     console.error('updateMembre error:', err);
+    const doublon = messageConflitUnique(err);
+    if (doublon) return res.status(409).json({ success: false, message: doublon });
     return res.status(500).json({ success: false, message: 'Erreur serveur lors de la modification.' });
   }
 };

@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const emailService = require('../services/email.service');
 const { envoyerNotificationAuto } = require('./notifications.controller');
 const { validerMatricule } = require('../utils/matricule');
+const { messageConflitUnique } = require('../utils/erreursSql');
 
 // ── Multi-établissement ─────────────────────────────────────────────────────
 // L'établissement est désigné par son CODE (saisi à l'ouverture de l'app) ou,
@@ -624,7 +625,13 @@ const me = async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT u.id, u.nom, u.prenoms, u.matricule, u.email, u.tel, u.role, u.etudiant_role, u.statut,
-              u.adresse, u.attestation_url, u.langue, u.notifications_actives,
+              COALESCE(e.adresse, u.adresse) AS adresse,
+              COALESCE(e.date_naissance, u.date_naissance) AS date_naissance,
+              u.photo_url, u.cover_url,
+              u.biographie, u.centres_interet, u.facebook, u.whatsapp, u.linkedin,
+              COALESCE(u.masquer_email, false) AS masquer_email,
+              COALESCE(u.masquer_tel, false) AS masquer_tel,
+              u.attestation_url, u.langue, u.notifications_actives,
               u.etablissement_id, e.filiere_id
        FROM users u LEFT JOIN etudiants e ON u.id = e.user_id WHERE u.id = $1`,
       [req.user.id]
@@ -647,15 +654,35 @@ const me = async (req, res) => {
 
 // ── PATCH /api/auth/profil ──────────────────────────────────────────────
 // Mise à jour partielle du profil connecté : adresse, préférences (langue,
-// notifications). Chaque champ est optionnel — seuls ceux envoyés sont
-// modifiés. Téléphone/email restent en lecture seule ici volontairement
-// (déjà gérés par leurs propres flux existants ailleurs dans l'app).
+// notifications, email, biographie, centres d'intérêt, liens, confidentialité).
+// Chaque champ est optionnel — seuls ceux envoyés sont modifiés. Téléphone,
+// date de naissance, matricule restent en lecture seule (données d'inscription).
 const modifierProfil = async (req, res) => {
   try {
-    const { adresse, langue, notifications_actives } = req.body;
+    const { adresse, langue, notifications_actives, email } = req.body;
     const champs = [];
     const valeurs = [];
     let i = 1;
+    // Email : seule information d'identité que l'utilisateur peut changer lui-même.
+    let nouvelEmail = null;
+    if (email !== undefined) {
+      nouvelEmail = String(email || '').trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(nouvelEmail)) {
+        return res.status(400).json({ success: false, message: 'Adresse email invalide.' });
+      }
+      champs.push(`email = $${i++}`); valeurs.push(nouvelEmail);
+    }
+    // Champs libres du profil (texte court, tronqué côté serveur).
+    const texteLibre = { biographie: 300, centres_interet: 200, facebook: 200, whatsapp: 200, linkedin: 200 };
+    for (const [col, max] of Object.entries(texteLibre)) {
+      if (req.body[col] !== undefined) {
+        const v = String(req.body[col] || '').trim().slice(0, max);
+        champs.push(`${col} = $${i++}`); valeurs.push(v === '' ? null : v);
+      }
+    }
+    for (const col of ['masquer_email', 'masquer_tel']) {
+      if (req.body[col] !== undefined) { champs.push(`${col} = $${i++}`); valeurs.push(req.body[col] === true || req.body[col] === 'true'); }
+    }
     if (adresse !== undefined) { champs.push(`adresse = $${i++}`); valeurs.push(adresse); }
     if (langue !== undefined) { champs.push(`langue = $${i++}`); valeurs.push(langue); }
     if (notifications_actives !== undefined) { champs.push(`notifications_actives = $${i++}`); valeurs.push(notifications_actives); }
@@ -664,9 +691,15 @@ const modifierProfil = async (req, res) => {
     }
     valeurs.push(req.user.id);
     await pool.query(`UPDATE users SET ${champs.join(', ')} WHERE id = $${i}`, valeurs);
+    if (nouvelEmail) {
+      // La fiche étudiant garde sa propre copie de l'email : on la synchronise.
+      try { await pool.query('UPDATE etudiants SET email = $1 WHERE user_id = $2', [nouvelEmail, req.user.id]); } catch (_) {}
+    }
     res.status(200).json({ success: true, message: 'Profil mis à jour.' });
   } catch (err) {
     console.error('[modifierProfil]', err);
+    const conflit = messageConflitUnique(err);
+    if (conflit) return res.status(409).json({ success: false, message: conflit });
     res.status(500).json({ success: false, message: 'Erreur lors de la mise à jour du profil.' });
   }
 };

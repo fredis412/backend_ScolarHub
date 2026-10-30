@@ -6,6 +6,7 @@ const { synchroniserDeleguesCanaux } = require('../utils/canauxProfDelegue');
 const { notifierInscription } = require('../services/inscription.notify');
 const { envoyerNotificationAuto } = require('./notifications.controller');
 const { genererProchainMatricule, validerMatricule, modeleValide } = require('../utils/matricule');
+const { messageConflitUnique } = require('../utils/erreursSql');
 
 const domaineFromFiliere = (filiere) => {
   const f = (filiere || '').toLowerCase();
@@ -524,10 +525,9 @@ const inscrireEtudiant = async (req, res) => {
   } catch (err) {
     // Pas de ROLLBACK car pas de BEGIN avec Supabase RPC
     console.error('[inscrireEtudiant]', err);
-    if (err.code === '23505') {
-      return res.status(409).json({ message: 'Matricule ou email déjà utilisé.' });
-    }
-    return res.status(500).json({ message: err.message || 'Erreur lors de l\'inscription.' });
+    const doublon = messageConflitUnique(err);
+    if (doublon) return res.status(409).json({ success: false, message: doublon });
+    return res.status(500).json({ success: false, message: 'Erreur lors de l\'inscription. Réessayez ou contactez le support.' });
   } finally {
     if (client) client.release();
   }
@@ -1211,7 +1211,8 @@ const modifierEtudiant = async (req, res) => {
     return res.status(200).json({ success: true });
   } catch (err) {
     console.error('[modifierEtudiant]', err);
-    if (err.code === '23505') return res.status(409).json({ success: false, message: 'Cet email est déjà utilisé.' });
+    const doublon = messageConflitUnique(err);
+    if (doublon) return res.status(409).json({ success: false, message: doublon });
     return res.status(500).json({ success: false, message: 'Erreur lors de la modification.' });
   }
 };

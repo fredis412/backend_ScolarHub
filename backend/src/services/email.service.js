@@ -17,6 +17,40 @@ const FROM_NAME = process.env.EMAIL_FROM_NAME || 'ScolarHub';
 // l'école (etablissements.email_contact) : voir contenu.etablissementId plus bas.
 const nettoyerNom = (n) => String(n || '').replace(/["<>\r\n]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
 
+// ── Habillage des mails : logo ScolarHub + logo de l'établissement ──────────────────────
+// Le logo ScolarHub doit être joignable publiquement : EMAIL_LOGO_URL (ex. lien Cloudinary),
+// sinon l'icône du site (APP_URL/icons/Icon-192.png).
+const echapper = (t) => String(t || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const logoScolarHub = () => {
+  if (process.env.EMAIL_LOGO_URL) return process.env.EMAIL_LOGO_URL;
+  const app = (process.env.APP_URL || '').replace(/\/+$/, '');
+  return app ? `${app}/icons/Icon-192.png` : '';
+};
+
+const enteteMarque = (ecole) => {
+  const sh = logoScolarHub();
+  const imgSh = sh
+    ? `<img src="${echapper(sh)}" alt="ScolarHub" width="48" height="48" style="display:block;border-radius:10px;border:0">`
+    : '';
+  const logoEcole = ecole && /^https?:\/\//i.test(ecole.logo_url || '') ? ecole.logo_url : '';
+  const imgEcole = logoEcole
+    ? `<img src="${echapper(logoEcole)}" alt="${echapper(ecole.nom)}" height="48" style="display:block;max-height:48px;max-width:140px;border:0">`
+    : '';
+  if (!imgSh && !imgEcole) return '';
+  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" data-sh-brand="1" style="max-width:600px;margin:0 auto 12px;border-bottom:2px solid #F8C400"><tr>`
+    + `<td align="left" style="padding:10px 0">${imgSh}</td>`
+    + `<td align="right" style="padding:10px 0">${imgEcole}</td></tr></table>`;
+};
+
+const habillerHtml = (html, text, ecole) => {
+  const corps = html || `<div style="font-family:Arial,sans-serif;font-size:15px;line-height:1.6;color:#0F172A;max-width:600px;margin:0 auto;white-space:pre-wrap">${echapper(text)}</div>`;
+  if (corps.includes('data-sh-brand')) return corps;
+  const entete = enteteMarque(ecole);
+  if (!entete) return corps;
+  if (/<body[^>]*>/i.test(corps)) return corps.replace(/(<body[^>]*>)/i, `$1${entete}`);
+  return `<div style="font-family:Arial,sans-serif">${entete}${corps}</div>`;
+};
+
 // Fournisseur "console" : journalise l'email (dev / démo).
 const consoleProvider = {
   async envoyer(to, subject, { text }) {
@@ -145,12 +179,14 @@ const envoyerEmail = async (to, subject, contenu = {}) => {
     return { success: false, error: 'Adresse email invalide ou absente.' };
   }
   const { etablissementId, ...reste } = contenu;
+  let ecole = null;
   if (etablissementId && !reste.fromName) {
     try {
       const pool = require('../config/db'); // chargé à la demande : pas de cycle au démarrage
-      const r = await pool.query('SELECT nom, email_contact FROM etablissements WHERE id = $1', [etablissementId]);
+      const r = await pool.query('SELECT nom, email_contact, logo_url FROM etablissements WHERE id = $1', [etablissementId]);
       const e = r.rows[0];
       if (e) {
+        ecole = e;
         const nom = nettoyerNom(e.nom);
         if (nom) reste.fromName = `${nom} via ScolarHub`;
         if (!reste.replyTo && e.email_contact && e.email_contact.includes('@')) reste.replyTo = e.email_contact.trim();
@@ -158,6 +194,11 @@ const envoyerEmail = async (to, subject, contenu = {}) => {
     } catch (err) {
       console.error('[EMAIL] expéditeur par établissement indisponible :', err.message); // ex. migration non faite
     }
+  }
+  try {
+    if (PROVIDER !== 'console') reste.html = habillerHtml(reste.html, reste.text, ecole);
+  } catch (err) {
+    console.error('[EMAIL] habillage indisponible :', err.message);
   }
   const provider = providers[PROVIDER] || consoleProvider;
   return provider.envoyer(to.trim(), subject, reste);

@@ -2,9 +2,11 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const pool = require('../config/db');
 const supabase = require('../config/supabase');
+const crypto = require('crypto');
 const emailService = require('../services/email.service');
 const { envoyerNotificationAuto } = require('./notifications.controller');
 const { validerMatricule } = require('../utils/matricule');
+const { messageConflitUnique } = require('../utils/erreursSql');
 
 // ── Multi-établissement ─────────────────────────────────────────────────────
 // L'établissement est désigné par son CODE (saisi à l'ouverture de l'app) ou,
@@ -623,7 +625,13 @@ const me = async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT u.id, u.nom, u.prenoms, u.matricule, u.email, u.tel, u.role, u.etudiant_role, u.statut,
-              u.adresse, u.attestation_url, u.langue, u.notifications_actives,
+              COALESCE(e.adresse, u.adresse) AS adresse,
+              COALESCE(e.date_naissance, u.date_naissance) AS date_naissance,
+              u.photo_url, u.cover_url,
+              u.biographie, u.centres_interet, u.facebook, u.whatsapp, u.linkedin,
+              COALESCE(u.masquer_email, false) AS masquer_email,
+              COALESCE(u.masquer_tel, false) AS masquer_tel,
+              u.attestation_url, u.langue, u.notifications_actives,
               u.etablissement_id, e.filiere_id
        FROM users u LEFT JOIN etudiants e ON u.id = e.user_id WHERE u.id = $1`,
       [req.user.id]
@@ -646,15 +654,35 @@ const me = async (req, res) => {
 
 // ── PATCH /api/auth/profil ──────────────────────────────────────────────
 // Mise à jour partielle du profil connecté : adresse, préférences (langue,
-// notifications). Chaque champ est optionnel — seuls ceux envoyés sont
-// modifiés. Téléphone/email restent en lecture seule ici volontairement
-// (déjà gérés par leurs propres flux existants ailleurs dans l'app).
+// notifications, email, biographie, centres d'intérêt, liens, confidentialité).
+// Chaque champ est optionnel — seuls ceux envoyés sont modifiés. Téléphone,
+// date de naissance, matricule restent en lecture seule (données d'inscription).
 const modifierProfil = async (req, res) => {
   try {
-    const { adresse, langue, notifications_actives } = req.body;
+    const { adresse, langue, notifications_actives, email } = req.body;
     const champs = [];
     const valeurs = [];
     let i = 1;
+    // Email : seule information d'identité que l'utilisateur peut changer lui-même.
+    let nouvelEmail = null;
+    if (email !== undefined) {
+      nouvelEmail = String(email || '').trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(nouvelEmail)) {
+        return res.status(400).json({ success: false, message: 'Adresse email invalide.' });
+      }
+      champs.push(`email = $${i++}`); valeurs.push(nouvelEmail);
+    }
+    // Champs libres du profil (texte court, tronqué côté serveur).
+    const texteLibre = { biographie: 300, centres_interet: 200, facebook: 200, whatsapp: 200, linkedin: 200 };
+    for (const [col, max] of Object.entries(texteLibre)) {
+      if (req.body[col] !== undefined) {
+        const v = String(req.body[col] || '').trim().slice(0, max);
+        champs.push(`${col} = $${i++}`); valeurs.push(v === '' ? null : v);
+      }
+    }
+    for (const col of ['masquer_email', 'masquer_tel']) {
+      if (req.body[col] !== undefined) { champs.push(`${col} = $${i++}`); valeurs.push(req.body[col] === true || req.body[col] === 'true'); }
+    }
     if (adresse !== undefined) { champs.push(`adresse = $${i++}`); valeurs.push(adresse); }
     if (langue !== undefined) { champs.push(`langue = $${i++}`); valeurs.push(langue); }
     if (notifications_actives !== undefined) { champs.push(`notifications_actives = $${i++}`); valeurs.push(notifications_actives); }
@@ -663,9 +691,15 @@ const modifierProfil = async (req, res) => {
     }
     valeurs.push(req.user.id);
     await pool.query(`UPDATE users SET ${champs.join(', ')} WHERE id = $${i}`, valeurs);
+    if (nouvelEmail) {
+      // La fiche étudiant garde sa propre copie de l'email : on la synchronise.
+      try { await pool.query('UPDATE etudiants SET email = $1 WHERE user_id = $2', [nouvelEmail, req.user.id]); } catch (_) {}
+    }
     res.status(200).json({ success: true, message: 'Profil mis à jour.' });
   } catch (err) {
     console.error('[modifierProfil]', err);
+    const conflit = messageConflitUnique(err);
+    if (conflit) return res.status(409).json({ success: false, message: conflit });
     res.status(500).json({ success: false, message: 'Erreur lors de la mise à jour du profil.' });
   }
 };
@@ -734,27 +768,40 @@ const register = async (req, res) => {
     }
     const {
       nom, prenoms, email, telephone, motDePasse, matricule: matriculeBody, filiere, niveau,
-      nomPersonne, telPersonne,
+      dateNaissance, lieuNaissance, nationalite, sexe, regime, adresse,
+      urgenceNom, urgenceTel, urgenceLien,
+      nomParent, prenomParent, telParent, emailParent,
+      nomPersonne, telPersonne, // anciens noms de champs (= personne à prévenir)
     } = req.body;
 
-    if (!nom?.trim() || !prenoms?.trim()) {
-      return res.status(400).json({ message: 'Nom et prénom requis.' });
-    }
-    if (!matriculeBody?.trim()) {
-      return res.status(400).json({ message: 'Matricule requis.' });
-    }
-    if (!email?.trim()) {
-      return res.status(400).json({ message: 'Email requis.' });
-    }
-    if (!motDePasse || motDePasse.length < 4) {
-      return res.status(400).json({ message: 'Mot de passe requis (4 caractères minimum).' });
-    }
-    if (!filiere?.trim()) {
-      return res.status(400).json({ message: 'Filière requise.' });
-    }
-    if (!niveau?.trim()) {
-      return res.status(400).json({ message: 'Niveau requis.' });
-    }
+    const t = (v) => String(v ?? '').trim();
+    const tel8 = (v) => t(v).replace(/\D/g, '').length >= 8;
+    const urgNom = t(urgenceNom || nomPersonne);
+    const urgTel = t(urgenceTel || telPersonne);
+    const urgLien = t(urgenceLien);
+    const sexeNorm = ['M', 'F'].includes(t(sexe).toUpperCase()) ? t(sexe).toUpperCase() : null;
+    const naissance = t(dateNaissance);
+
+    const erreur =
+      (!t(nom) || !t(prenoms)) ? 'Nom et prénom requis.'
+      : !t(matriculeBody) ? 'Matricule requis.'
+      : !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t(email)) ? 'Une adresse email valide est requise.'
+      : !tel8(telephone) ? 'Numéro de téléphone requis (8 chiffres minimum).'
+      : (!motDePasse || motDePasse.length < 4) ? 'Mot de passe requis (4 caractères minimum).'
+      : !t(filiere) ? 'Filière requise.'
+      : !t(niveau) ? 'Niveau requis.'
+      : !/^\d{4}-\d{2}-\d{2}$/.test(naissance) || isNaN(Date.parse(naissance)) || new Date(naissance) > new Date()
+        || new Date(naissance).getFullYear() < 1940 ? 'Date de naissance invalide.'
+      : !t(lieuNaissance) ? 'Lieu de naissance requis.'
+      : !t(nationalite) ? 'Nationalité requise.'
+      : !sexeNorm ? 'Sexe requis.'
+      : !t(adresse) ? 'Adresse requise.'
+      : !urgNom ? 'Nom de la personne à prévenir requis.'
+      : !tel8(urgTel) ? 'Téléphone de la personne à prévenir requis (8 chiffres minimum).'
+      : !urgLien ? 'Lien avec la personne à prévenir requis (ex. Père, Oncle).'
+      : (t(telParent) && (!tel8(telParent) || !t(nomParent))) ? 'Tuteur / parent : nom et téléphone valides requis (ou laissez cette partie vide).'
+      : null;
+    if (erreur) return res.status(400).json({ message: erreur });
 
     const etabReg = await resolveEtablissement(req);
     if (etabReg.invalide) return res.status(404).json({ message: 'Établissement introuvable.' });
@@ -786,7 +833,7 @@ const register = async (req, res) => {
         message: 'Ce matricule est déjà enregistré. Utilisez « Se connecter » (première connexion) ou contactez l\'administration.',
       });
     }
-    const existingEmail = await client.query('SELECT 1 FROM users WHERE email = $1', [email.trim()]);
+    const existingEmail = await client.query('SELECT 1 FROM users WHERE LOWER(email) = LOWER($1)', [t(email)]);
     if (existingEmail.rows.length > 0) {
       return res.status(409).json({ message: 'Cet email est déjà utilisé.' });
     }
@@ -794,28 +841,74 @@ const register = async (req, res) => {
     const hashed = await bcrypt.hash(motDePasse, 10);
 
     const filiereRes = await client.query(
-      'SELECT id FROM filieres WHERE nom = $1 AND etablissement_id = $2',
-      [filiere.trim(), etabIdReg]
+      'SELECT id FROM filieres WHERE LOWER(TRIM(nom)) = LOWER($1) AND etablissement_id = $2',
+      [t(filiere), etabIdReg]
     );
     const filiereId = filiereRes.rows[0]?.id || null;
+    if (!filiereId) {
+      return res.status(400).json({ message: `Filière « ${t(filiere)} » introuvable dans cet établissement.` });
+    }
 
     const enAttente = etab.inscription_validation !== false;
     const statut = enAttente ? 'en_attente' : 'actif';
 
+    const f = t(filiere).toLowerCase();
+    const domaine = (f.includes('marketing') || f.includes('gestion') || f.includes('finance') || f.includes('comptab'))
+      ? 'Sciences de Gestion' : 'Sciences & Technologies';
+    const emailNorm = t(email).toLowerCase();
+    const nomMaj = t(nom).toUpperCase();
+    // Tuteur / parent (facultatif) : champs « parent ». La personne à prévenir est
+    // stockée à part (urgence_*) et ne donne AUCUN accès parent.
+    // Pas de colonne « prénom » côté parent : on stocke « NOM Prénom » dans nom_parent
+    // (séparé à la validation pour créer le compte parent).
+    const tutNom = [t(nomParent).toUpperCase(), t(prenomParent)].filter(Boolean).join(' ') || null;
+    const tutPrenom = null;
+    const tutTel = t(telParent) || null;
+    const tutEmail = t(emailParent) || null;
+
     const userRes = await client.query(
-      `INSERT INTO users (matricule, nom, prenoms, email, tel, role, statut, mot_de_passe, etablissement_id, filiere_nom, niveau, nom_parent, tel_parent)
-       VALUES ($1, $2, $3, $4, $5, 'etudiant', $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
-      [matricule, nom.trim().toUpperCase(), prenoms.trim(), email.trim(), telephone?.trim() || null, statut, hashed,
-        etabIdReg, filiere.trim(), niveau.trim(), nomPersonne?.trim() || null, telPersonne?.trim() || null]
+      `INSERT INTO users (matricule, nom, prenoms, email, tel, role, statut, mot_de_passe, etablissement_id,
+                          filiere_nom, domaine, niveau, date_naissance, nationalite, adresse,
+                          nom_parent, tel_parent, email_parent)
+       VALUES ($1, $2, $3, $4, $5, 'etudiant', $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING *`,
+      [matricule, nomMaj, t(prenoms), emailNorm, t(telephone), statut, hashed, etabIdReg,
+        t(filiere), domaine, t(niveau), naissance, t(nationalite), t(adresse),
+        tutNom, tutTel, tutEmail]
     );
     const user = userRes.rows[0];
 
-    await client.query(
-      `INSERT INTO etudiants (user_id, filiere_id, premierefois, matricule, nom, prenoms, email, tel, filiere_nom, niveau, statut, etablissement_id, nom_parent, tel_parent)
-       VALUES ($1, $2, false, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-      [user.id, filiereId, matricule, nom.trim().toUpperCase(), prenoms.trim(), email.trim(), telephone?.trim() || null,
-        filiere.trim(), niveau.trim(), statut, etabIdReg, nomPersonne?.trim() || null, telPersonne?.trim() || null]
-    );
+    try {
+      await client.query(
+        `INSERT INTO etudiants (user_id, filiere_id, premierefois, matricule, nom, prenoms, email, tel,
+                                filiere_nom, domaine, niveau, date_naissance, nationalite, adresse,
+                                nom_parent, tel_parent, email_parent, statut, etablissement_id,
+                                sexe, lieu_naissance, urgence_nom, urgence_tel, urgence_lien, regime)
+         VALUES ($1, $2, false, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                 $19, $20, $21, $22, $23, $24)`,
+        [user.id, filiereId, matricule, nomMaj, t(prenoms), emailNorm, t(telephone),
+          t(filiere), domaine, t(niveau), naissance, t(nationalite), t(adresse),
+          tutNom, tutTel, tutEmail, statut, etabIdReg,
+          sexeNorm, t(lieuNaissance), urgNom, urgTel, urgLien, t(regime) === 'soir' ? 'soir' : 'jour']
+      );
+    } catch (e) {
+      // Pas de compte à moitié créé si la fiche étudiant échoue.
+      await client.query('DELETE FROM users WHERE id = $1', [user.id]).catch(() => {});
+      throw e;
+    }
+
+    // Validation automatique désactivée : le tuteur est lié tout de suite
+    // (sinon la liaison se fait à la validation par l'administration).
+    if (!enAttente && tutTel) {
+      try {
+        const { creerOuLierParent } = require('./etudiants.controller');
+        const er2 = await client.query('SELECT id FROM etudiants WHERE user_id = $1', [user.id]);
+        if (er2.rows[0]) {
+          await creerOuLierParent(client, { nomParent: tutNom, telParent: tutTel, emailParent: tutEmail }, er2.rows[0].id);
+        }
+      } catch (e) {
+        console.warn('[register] liaison tuteur:', e.message);
+      }
+    }
 
     if (enAttente) {
       return res.status(201).json({
@@ -833,8 +926,8 @@ const register = async (req, res) => {
         matricule: user.matricule,
         role: user.role,
         statut: user.statut,
-        filiere: filiere.trim(),
-        niveau: niveau.trim(),
+        filiere: t(filiere),
+        niveau: t(niveau),
       },
     });
   } catch (err) {
@@ -862,6 +955,25 @@ function tropEssaisMdp(cle, max, fenetreMs) {
   return e.n > max;
 }
 
+// ── Mot de passe oublié ───────────────────────────────────────────────────────
+// Code à 6 chiffres tiré avec crypto (imprévisible), stocké HACHÉ (HMAC) dans
+// users.reset_code_hash, valable 15 min, invalidé après 5 essais ratés.
+const MAX_ESSAIS_CODE = 5;
+const hacherCode = (userId, code) =>
+  crypto.createHmac('sha256', process.env.JWT_SECRET || 'scolarhub').update(`${userId}:${String(code).trim()}`).digest('hex');
+const memeHash = (a, b) => {
+  const x = Buffer.from(String(a || ''), 'hex'); const y = Buffer.from(String(b || ''), 'hex');
+  return x.length > 0 && x.length === y.length && crypto.timingSafeEqual(x, y);
+};
+// « ibrahim@gmail.com » -> « i***@gmail.com »
+const masquerEmail = (e) => {
+  const [loc, dom] = String(e || '').split('@');
+  if (!loc || !dom) return '';
+  return `${loc[0]}***@${dom}`;
+};
+const MSG_CODE_ENVOYE = 'Si un compte correspond, un code de réinitialisation vient d\'être envoyé par email. '
+  + 'Sans email reçu, contactez l\'administration de votre établissement.';
+
 const forgotPassword = async (req, res) => {
   try {
     const { identifiant } = req.body;
@@ -882,46 +994,43 @@ const forgotPassword = async (req, res) => {
       paramsFp
     );
     const user = r.rows[0];
+    const emailReel = user && user.email && !/@sans-email\.scolarhub$/i.test(user.email) ? user.email : null;
 
-    if (!user) {
-      return res.status(404).json({ message: 'Utilisateur introuvable.' });
-    }
+    // Même réponse que le compte existe ou non (pas de devinette des comptes).
+    const reponse = { message: MSG_CODE_ENVOYE, email: emailReel ? masquerEmail(emailReel) : '' };
+    if (!emailReel) return res.status(200).json(reponse);
 
-    if (!user.email) {
-      return res.status(400).json({ message: 'Aucune adresse email associée à ce compte.' });
-    }
-
-    // Générer un code à 6 chiffres
-    const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const resetCode = String(crypto.randomInt(100000, 1000000));
     const expiresAt = new Date(Date.now() + 15 * 60000); // 15 minutes
-
-    // Sauvegarder dans la DB
     await pool.query(
-      'UPDATE users SET reset_code = $1, reset_expires = $2 WHERE id = $3',
-      [resetCode, expiresAt, user.id]
+      'UPDATE users SET reset_code = NULL, reset_code_hash = $1, reset_expires = $2, reset_essais = 0 WHERE id = $3',
+      [hacherCode(user.id, resetCode), expiresAt, user.id]
     );
 
-    // Envoyer l'email
     const emailResult = await emailService.envoyer(
-      user.email,
+      emailReel,
       'ScolarHub - Réinitialisation de mot de passe',
       {
-        text: `Bonjour ${user.nom},\n\nVotre code de réinitialisation est : ${resetCode}\n\nCe code expirera dans 15 minutes.\n\nL'équipe ScolarHub`,
+        etablissementId: etab.id,
+        modele: {
+          titre: 'Réinitialisation du mot de passe',
+          sousTitre: 'Code de sécurité à usage temporaire',
+          salutation: `Bonjour ${user.nom},`,
+          preheader: 'Votre code de réinitialisation ScolarHub',
+          blocs: [
+            { type: 'p', texte: 'Vous avez demandé à réinitialiser votre mot de passe ScolarHub. Saisissez le code ci-dessous dans l\'application.' },
+            { type: 'code', label: 'Code de réinitialisation', valeur: resetCode },
+            { type: 'note', ton: 'alerte', texte: 'Ce code expire dans 15 minutes. Ne le communiquez à personne. Si vous n\'êtes pas à l\'origine de cette demande, ignorez ce message : votre mot de passe reste inchangé.' },
+          ],
+        },
+        text: `Bonjour ${user.nom},\n\nVotre code de réinitialisation est : ${resetCode}\n\nCe code expire dans 15 minutes. Si vous n'êtes pas à l'origine de cette demande, ignorez ce message.\n\nL'équipe ScolarHub`,
       }
     );
+    if (!emailResult.success) console.error('[forgotPassword] envoi email échoué :', emailResult.error);
 
-    if (!emailResult.success) {
-      console.error('Failed to send email:', emailResult.error);
-      // We still return success so we don't block testing in dev, but ideally handle it better
-    }
-
-    return res.status(200).json({
-      message: 'Un code de réinitialisation a été envoyé à votre adresse email.',
-      email: user.email,
-      // Le code n'est renvoyé au client QUE si les e-mails sont en mode « console »
-      // (développement). En production il n'est jamais exposé.
-      code: process.env.EMAIL_PROVIDER === 'console' ? resetCode : undefined,
-    });
+    // Le code n'est renvoyé au client QUE si les e-mails sont en mode « console »
+    // (développement). En production il n'est jamais exposé.
+    return res.status(200).json({ ...reponse, code: process.env.EMAIL_PROVIDER === 'console' ? resetCode : undefined });
   } catch (err) {
     console.error('ForgotPassword error:', err);
     return res.status(500).json({ message: 'Erreur serveur.' });
@@ -943,24 +1052,30 @@ const resetPassword = async (req, res) => {
       return res.status(429).json({ message: 'Trop de tentatives. Réessayez dans 15 minutes.' });
     }
 
-    // Chercher l'utilisateur
     const paramsRp = [identifiant.trim()];
     const r = await pool.query(
-      `SELECT id, reset_code, reset_expires FROM users WHERE (UPPER(matricule) = UPPER($1) OR LOWER(email) = LOWER($1))${etabClause(paramsRp, etab.id, 'users')}`,
+      `SELECT id, reset_code_hash, reset_expires, reset_essais FROM users WHERE (UPPER(matricule) = UPPER($1) OR LOWER(email) = LOWER($1))${etabClause(paramsRp, etab.id, 'users')}`,
       paramsRp
     );
     const user = r.rows[0];
+    const MSG_CODE_KO = 'Code incorrect ou expiré. Refaites une demande si besoin.';
 
-    if (!user) {
-      return res.status(404).json({ message: 'Utilisateur introuvable.' });
+    // Compte inconnu, pas de code en cours ou code expiré : même réponse.
+    if (!user || !user.reset_code_hash || !user.reset_expires || new Date() > new Date(user.reset_expires)) {
+      return res.status(400).json({ message: MSG_CODE_KO });
     }
-
-    if (!user.reset_code || String(user.reset_code) !== String(code).trim()) {
-      return res.status(400).json({ message: 'Code de réinitialisation incorrect.' });
+    if ((user.reset_essais || 0) >= MAX_ESSAIS_CODE) {
+      await pool.query('UPDATE users SET reset_code_hash = NULL, reset_expires = NULL, reset_essais = 0 WHERE id = $1', [user.id]);
+      return res.status(400).json({ message: 'Trop d\'essais : ce code est annulé. Refaites une demande.' });
     }
-
-    if (new Date() > new Date(user.reset_expires)) {
-      return res.status(400).json({ message: 'Le code de réinitialisation a expiré.' });
+    if (!memeHash(user.reset_code_hash, hacherCode(user.id, code))) {
+      const essais = (user.reset_essais || 0) + 1;
+      if (essais >= MAX_ESSAIS_CODE) {
+        await pool.query('UPDATE users SET reset_code_hash = NULL, reset_expires = NULL, reset_essais = 0 WHERE id = $1', [user.id]);
+        return res.status(400).json({ message: 'Trop d\'essais : ce code est annulé. Refaites une demande.' });
+      }
+      await pool.query('UPDATE users SET reset_essais = $1 WHERE id = $2', [essais, user.id]);
+      return res.status(400).json({ message: MSG_CODE_KO });
     }
 
     if (String(newPassword).length < 4) {
@@ -969,7 +1084,7 @@ const resetPassword = async (req, res) => {
     const hashed = await bcrypt.hash(newPassword, 10);
 
     await pool.query(
-      'UPDATE users SET mot_de_passe = $1, reset_code = NULL, reset_expires = NULL WHERE id = $2',
+      'UPDATE users SET mot_de_passe = $1, reset_code = NULL, reset_code_hash = NULL, reset_expires = NULL, reset_essais = 0 WHERE id = $2',
       [hashed, user.id]
     );
 

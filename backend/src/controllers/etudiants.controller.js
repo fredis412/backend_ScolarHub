@@ -6,6 +6,7 @@ const { synchroniserDeleguesCanaux } = require('../utils/canauxProfDelegue');
 const { notifierInscription } = require('../services/inscription.notify');
 const { envoyerNotificationAuto } = require('./notifications.controller');
 const { genererProchainMatricule, validerMatricule, modeleValide } = require('../utils/matricule');
+const { messageConflitUnique } = require('../utils/erreursSql');
 
 const domaineFromFiliere = (filiere) => {
   const f = (filiere || '').toLowerCase();
@@ -80,17 +81,27 @@ const creerOuLierParent = async (client, { nomParent, prenomParent, telParent, e
       lienExistant = true;
     } else {
       // 2. Créer le parent sans compte (user_id = null)
+      // L'établissement du parent = celui de l'étudiant (nécessaire pour qu'il retrouve
+      // son espace à la connexion).
       const nouveau = await client.query(
-        `INSERT INTO parents (nom, prenoms, tel, email, statut)
-         VALUES ($1, $2, $3, $4, 'actif') RETURNING id`,
+        `INSERT INTO parents (nom, prenoms, tel, email, statut, etablissement_id)
+         VALUES ($1, $2, $3, $4, 'actif', (SELECT etablissement_id FROM etudiants WHERE id = $5)) RETURNING id`,
         [
           (nomParent?.trim() || '').toUpperCase(),
           prenomParent?.trim() || null,
           tel,
           emailParent?.trim() || null,
+          etuId,
         ]
       );
       parentId = nouveau.rows[0].id;
+    }
+    if (lienExistant) {
+      await client.query(
+        `UPDATE parents SET etablissement_id = (SELECT etablissement_id FROM etudiants WHERE id = $2)
+         WHERE id = $1 AND etablissement_id IS NULL`,
+        [parentId, etuId]
+      ).catch(() => {});
     }
 
     // 3. Lier au nouvel étudiant (ON CONFLICT protège si un tuteur principal
@@ -293,6 +304,16 @@ const inscrireEtudiant = async (req, res) => {
     if (!filiere?.trim()) {
       return res.status(400).json({ message: 'Filière requise.' });
     }
+    // Fiche complète obligatoire : contact de l'étudiant + personne à prévenir.
+    const nb = (v) => String(v ?? '').replace(/\D/g, '').length;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email ?? '').trim())) {
+      return res.status(400).json({ message: 'Une adresse e-mail valide est requise.' });
+    }
+    if (nb(telephone) < 8) return res.status(400).json({ message: 'Téléphone de l\'étudiant requis (8 chiffres minimum).' });
+    if (!String(adresse ?? '').trim()) return res.status(400).json({ message: 'Adresse requise.' });
+    if (!String(urgenceNom ?? '').trim() || !String(urgenceLien ?? '').trim() || nb(urgenceTel) < 8) {
+      return res.status(400).json({ message: 'Personne à prévenir requise (nom, téléphone de 8 chiffres minimum et lien).' });
+    }
 
     client = await pool.connect();
     // Note: BEGIN/COMMIT ne fonctionnent pas avec Supabase RPC execute_sql
@@ -458,6 +479,7 @@ const inscrireEtudiant = async (req, res) => {
         email: email?.trim() || null,
         telephone: telephone?.trim() || null,
         ecole: filiere?.trim(),
+        etablissementId: etabId, // expéditeur « École via ScolarHub » + réponses vers l'école
       });
     } catch (notifErr) {
       console.error('[inscrireEtudiant] notification', notifErr.message);
@@ -523,10 +545,9 @@ const inscrireEtudiant = async (req, res) => {
   } catch (err) {
     // Pas de ROLLBACK car pas de BEGIN avec Supabase RPC
     console.error('[inscrireEtudiant]', err);
-    if (err.code === '23505') {
-      return res.status(409).json({ message: 'Matricule ou email déjà utilisé.' });
-    }
-    return res.status(500).json({ message: err.message || 'Erreur lors de l\'inscription.' });
+    const doublon = messageConflitUnique(err);
+    if (doublon) return res.status(409).json({ success: false, message: doublon });
+    return res.status(500).json({ success: false, message: 'Erreur lors de l\'inscription. Réessayez ou contactez le support.' });
   } finally {
     if (client) client.release();
   }
@@ -567,6 +588,17 @@ const finaliserPremiereConnexion = async (req, res) => {
 
     if (!userRow) {
       return res.status(404).json({ error: 'Étudiant non trouvé.' });
+    }
+
+    // ⚠️ Route publique : l'activation n'est permise que si le compte n'a PAS encore de mot de
+    // passe (nouvel étudiant, ou mot de passe réinitialisé par l'administration). Sans cette
+    // garde, n'importe qui connaissant un matricule pouvait changer le mot de passe d'un
+    // étudiant et se connecter à sa place.
+    const mdpExistant = userRow.mot_de_passe && String(userRow.mot_de_passe).trim() !== '' && userRow.mot_de_passe !== 'null';
+    if (mdpExistant) {
+      return res.status(403).json({
+        error: 'Ce compte est déjà activé. Connectez-vous, ou utilisez « Mot de passe oublié ».',
+      });
     }
 
     const hashed = await bcrypt.hash(password, 10);
@@ -999,7 +1031,10 @@ async function chargerEnAttente(req) {
     where += ` AND u.id IN (${ids.map((id) => { params.push(id); return `$${params.length}`; }).join(', ')})`;
   }
   const r = await pool.query(
-    `SELECT u.id, u.matricule, e.filiere_id, COALESCE(e.filiere_nom, u.filiere_nom) AS filiere
+    `SELECT u.id, u.matricule, e.id AS etudiant_id, e.filiere_id, COALESCE(e.filiere_nom, u.filiere_nom) AS filiere,
+            COALESCE(e.nom_parent, u.nom_parent) AS nom_parent,
+            COALESCE(e.tel_parent, u.tel_parent) AS tel_parent,
+            COALESCE(e.email_parent, u.email_parent) AS email_parent
      FROM users u LEFT JOIN etudiants e ON e.user_id = u.id WHERE ${where}`,
     params
   );
@@ -1015,6 +1050,17 @@ const validerInscriptions = async (req, res) => {
       await pool.query("UPDATE etudiants SET statut = 'actif' WHERE user_id = $1", [c.id]);
       if (c.filiere_id) {
         await integrerDansGroupeFiliere(pool, c.id, c.filiere_id, c.filiere || '', c.matricule);
+      }
+      // Tuteur / parent renseigné à l'auto-inscription : compte parent créé ou lié maintenant
+      // que l'inscription est validée (non bloquant).
+      if (c.tel_parent && c.etudiant_id) {
+        // nom_parent = « NOM Prénom(s) » → premier mot = nom, le reste = prénoms
+        const mots = String(c.nom_parent || '').trim().split(/\s+/);
+        await creerOuLierParent(
+          pool,
+          { nomParent: mots[0] || '', prenomParent: mots.slice(1).join(' ') || null, telParent: c.tel_parent, emailParent: c.email_parent },
+          c.etudiant_id
+        );
       }
       envoyerNotificationAuto(
         c.id, 'Inscription validée',
@@ -1139,12 +1185,64 @@ const listerDocumentsEtudiant = async (req, res) => {
 // ── PUT /api/etudiants/:id — modifier la fiche d'un étudiant ──────────────────
 // :id = id de la table etudiants. Seuls les champs présents dans le body sont modifiés.
 // Le matricule n'est jamais modifiable ici.
+// ── Invitation (matricule + lien d'activation) ──────────────────────────────────────────
+// Renvoie à l'étudiant son mail de bienvenue (matricule + « Activer mon compte »), et son SMS
+// si demandé. Uniquement pour un compte NON ACTIVÉ (pas encore de mot de passe) et pas en attente.
+const envoyerInvitation = async (etuId, { avecSms = false } = {}) => {
+  const r = await pool.query(
+    `SELECT u.matricule, u.nom, u.prenoms, u.email, u.tel, u.statut, u.etablissement_id,
+            COALESCE(e.filiere_nom, u.filiere_nom) AS filiere,
+            (u.mot_de_passe IS NULL OR u.mot_de_passe = '' OR u.mot_de_passe = 'null') AS non_active
+     FROM etudiants e JOIN users u ON u.id = e.user_id WHERE e.id = $1`,
+    [etuId]
+  );
+  const u = r.rows[0];
+  if (!u) return { ok: false, raison: 'introuvable' };
+  if (!u.non_active) return { ok: false, raison: 'deja_active' };
+  if (u.statut === 'en_attente' || u.statut === 'suspendu' || u.statut === 'renvoye') return { ok: false, raison: 'statut' };
+  const emailReel = u.email && !/@sans-email\.scolarhub$/i.test(u.email) ? u.email : null;
+  if (!emailReel && !(avecSms && u.tel)) return { ok: false, raison: 'aucun_contact' };
+  const notifications = await notifierInscription({
+    prenoms: u.prenoms,
+    nom: String(u.nom || '').toUpperCase(),
+    matricule: u.matricule,
+    email: emailReel,
+    telephone: avecSms ? u.tel : null,
+    ecole: u.filiere,
+    etablissementId: u.etablissement_id,
+  });
+  return { ok: true, notifications, email: emailReel };
+};
+
+// POST /api/etudiants/:id/renvoyer-invitation (admin) — :id = id de la table etudiants.
+const renvoyerInvitation = async (req, res) => {
+  try {
+    const etu = await etudiantDeMonEtab(req.params.id, req.etablissementId);
+    if (!etu) return res.status(404).json({ success: false, message: 'Étudiant introuvable.' });
+    const r = await envoyerInvitation(etu.id, { avecSms: true });
+    if (!r.ok) {
+      const messages = {
+        deja_active: 'Ce compte est déjà activé : l\'étudiant a déjà choisi son mot de passe.',
+        statut: 'Ce compte n\'est pas en état de recevoir une invitation (en attente, suspendu ou renvoyé).',
+        aucun_contact: 'Aucune adresse e-mail valide ni numéro de téléphone pour cet étudiant. Modifiez sa fiche d\'abord.',
+        introuvable: 'Étudiant introuvable.',
+      };
+      return res.status(r.raison === 'introuvable' ? 404 : 409).json({ success: false, message: messages[r.raison] || 'Envoi impossible.' });
+    }
+    return res.status(200).json({ success: true, notifications: r.notifications, message: 'Invitation renvoyée.' });
+  } catch (err) {
+    console.error('[renvoyerInvitation]', err);
+    return res.status(500).json({ success: false, message: 'Erreur lors de l\'envoi.' });
+  }
+};
+
 const modifierEtudiant = async (req, res) => {
   try {
     const { id } = req.params;
     const b = req.body || {};
     const etu = await etudiantDeMonEtab(id, req.etablissementId);
     if (!etu) return res.status(404).json({ success: false, message: 'Étudiant introuvable.' });
+    const avant = (await pool.query('SELECT email FROM users WHERE id = $1', [etu.user_id])).rows[0] || {};
 
     const t = (v) => (v === undefined || v === null || String(v).trim() === '' ? null : String(v).trim());
     const has = (k) => Object.prototype.hasOwnProperty.call(b, k);
@@ -1196,15 +1294,54 @@ const modifierEtudiant = async (req, res) => {
       valsU.push(etu.user_id);
       await pool.query(`UPDATE users SET ${setsU.join(', ')} WHERE id = $${valsU.length}`, valsU);
     }
-    return res.status(200).json({ success: true });
+    // L'adresse e-mail vient d'être corrigée et l'étudiant n'a pas encore activé son compte :
+    // on lui envoie directement son matricule + le lien d'activation (e-mail seulement).
+    let invitation = null;
+    const nouvelEmail = has('email') ? t(b.email) : null;
+    if (nouvelEmail && String(avant.email || '').trim().toLowerCase() !== nouvelEmail.toLowerCase()) {
+      try {
+        const r = await envoyerInvitation(etu.id, { avecSms: false });
+        if (r.ok) invitation = { email: !!(r.notifications && r.notifications.email && r.notifications.email.envoye), adresse: nouvelEmail };
+      } catch (e) {
+        console.error('[modifierEtudiant] invitation', e.message);
+      }
+    }
+    return res.status(200).json({ success: true, ...(invitation ? { invitation } : {}) });
   } catch (err) {
     console.error('[modifierEtudiant]', err);
-    if (err.code === '23505') return res.status(409).json({ success: false, message: 'Cet email est déjà utilisé.' });
+    const doublon = messageConflitUnique(err);
+    if (doublon) return res.status(409).json({ success: false, message: doublon });
     return res.status(500).json({ success: false, message: 'Erreur lors de la modification.' });
   }
 };
 
+// ── POST /api/etudiants/:id/reinitialiser-mdp — l'administration efface le mot de passe ──
+// :id = id de la table etudiants. L'étudiant reprend le parcours de première connexion
+// (matricule, puis il choisit un nouveau mot de passe). Pour les comptes sans email.
+const reinitialiserMotDePasseEtudiant = async (req, res) => {
+  try {
+    const etu = await etudiantDeMonEtab(req.params.id, req.etablissementId);
+    if (!etu) return res.status(404).json({ success: false, message: 'Étudiant introuvable.' });
+    await pool.query(
+      `UPDATE users SET mot_de_passe = NULL, reset_code = NULL, reset_code_hash = NULL,
+              reset_expires = NULL, reset_essais = 0 WHERE id = $1`,
+      [etu.user_id]
+    );
+    await pool.query('UPDATE etudiants SET premierefois = true WHERE id = $1', [etu.id]);
+    return res.status(200).json({
+      success: true,
+      message: 'Mot de passe réinitialisé. L\'étudiant choisira un nouveau mot de passe à sa prochaine connexion.',
+    });
+  } catch (err) {
+    console.error('[reinitialiserMotDePasseEtudiant]', err);
+    return res.status(500).json({ success: false, message: 'Erreur lors de la réinitialisation.' });
+  }
+};
+
 module.exports = {
+  renvoyerInvitation,
+  creerOuLierParent,
+  reinitialiserMotDePasseEtudiant,
   modifierEtudiant,
   uploaderPhotoEtudiant,
   ajouterDocumentEtudiant,

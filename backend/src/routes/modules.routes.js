@@ -2,13 +2,14 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
 const { authMiddleware, requireRole } = require('../middleware/auth.middleware');
+const { parseSemestre, niveauDuSemestre } = require('../utils/semestres');
 
 // GET /api/modules - Liste de tous les modules
 router.get('/', async (req, res) => {
   try {
     const { filiere_id } = req.query;
     let query = `
-      SELECT m.id, m.nom, m.coefficient, m.volume_horaire, m.filiere_id, m.filiere_nom,
+      SELECT m.id, m.nom, m.coefficient, m.volume_horaire, m.semestre, m.filiere_id, m.filiere_nom,
              f.nom AS filiere,
              (SELECT CONCAT(u2.prenoms, ' ', u2.nom)
               FROM module_professeur mp
@@ -55,14 +56,19 @@ router.get('/:id', async (req, res) => {
 // POST /api/modules - Creer un module (admin ou professeur)
 router.post('/', authMiddleware, requireRole('admin', 'professeur'), async (req, res) => {
   try {
-    const { nom, coefficient, volume_horaire, filiere_id, filiere_nom, professeur_user_id } = req.body;
+    const { nom, coefficient, volume_horaire, filiere_id, filiere_nom, professeur_user_id, semestre } = req.body;
     if (!nom?.trim()) {
       return res.status(400).json({ success: false, message: 'Nom du module requis.' });
     }
+    // Le semestre est défini par l'administration à la création du module (obligatoire).
+    const sem = parseSemestre(semestre);
+    if (sem === null && req.user.role === 'admin') {
+      return res.status(400).json({ success: false, message: 'Choisissez le semestre du module.' });
+    }
     const result = await pool.query(
-      `INSERT INTO modules (nom, coefficient, volume_horaire, filiere_id, filiere_nom)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [nom.trim(), coefficient || 1, volume_horaire || null, filiere_id || null, filiere_nom || null]
+      `INSERT INTO modules (nom, coefficient, volume_horaire, filiere_id, filiere_nom, semestre)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [nom.trim(), coefficient || 1, volume_horaire || null, filiere_id || null, filiere_nom || null, sem]
     );
 
     // Assure l'existence de la fiche professeurs(user_id) et lie le module.
@@ -104,18 +110,50 @@ router.post('/', authMiddleware, requireRole('admin', 'professeur'), async (req,
 // PUT /api/modules/:id - Modifier un module (admin)
 router.put('/:id', authMiddleware, requireRole('admin'), async (req, res) => {
   try {
-    const { nom, coefficient, volume_horaire, filiere_id, filiere_nom } = req.body;
+    const { nom, coefficient, volume_horaire, filiere_id, filiere_nom, semestre } = req.body;
+    let sem = null;
+    if (semestre !== undefined && semestre !== null && semestre !== '') {
+      sem = parseSemestre(semestre);
+      if (sem === null) {
+        return res.status(400).json({ success: false, message: 'Semestre invalide (S1 à S10).' });
+      }
+    }
     const result = await pool.query(
       `UPDATE modules SET nom = COALESCE($1, nom), coefficient = COALESCE($2, coefficient),
        volume_horaire = COALESCE($3, volume_horaire), filiere_id = COALESCE($4, filiere_id),
-       filiere_nom = COALESCE($5, filiere_nom)
-       WHERE id = $6 RETURNING *`,
-      [nom, coefficient, volume_horaire, filiere_id, filiere_nom, req.params.id]
+       filiere_nom = COALESCE($5, filiere_nom), semestre = COALESCE($6, semestre)
+       WHERE id = $7 RETURNING *`,
+      [nom, coefficient, volume_horaire, filiere_id, filiere_nom, sem, req.params.id]
     );
     if (!result.rows[0]) {
       return res.status(404).json({ success: false, message: 'Module non trouve.' });
     }
-    res.json({ success: true, data: result.rows[0] });
+
+    // Semestre modifié : les professeurs déjà affectés à ce module suivent automatiquement
+    // (semestre + niveau correspondant), pour qu'aucune incohérence ne subsiste.
+    let affectationsMisesAJour = 0;
+    if (sem !== null) {
+      try {
+        const niv = niveauDuSemestre(sem);
+        if (niv) {
+          await pool.query(
+            `DELETE FROM professeur_modules pm
+              WHERE pm.module_id = $1 AND pm.niveau <> $2
+                AND EXISTS (SELECT 1 FROM professeur_modules x
+                             WHERE x.professeur_id = pm.professeur_id AND x.module_id = pm.module_id AND x.niveau = $2)`,
+            [req.params.id, niv]
+          );
+          const maj = await pool.query(
+            `UPDATE professeur_modules SET niveau = $2, semestre = $3 WHERE module_id = $1`,
+            [req.params.id, niv, sem]
+          );
+          affectationsMisesAJour = maj.rowCount || 0;
+        }
+      } catch (majErr) {
+        console.error('[modules] PUT /:id — mise à jour des affectations :', majErr.message);
+      }
+    }
+    res.json({ success: true, data: result.rows[0], affectations_mises_a_jour: affectationsMisesAJour });
   } catch (err) {
     console.error('[modules] PUT /:id', err);
     res.status(500).json({ success: false, message: 'Erreur modification module.' });

@@ -30,6 +30,26 @@ const userDeMonEtab = async (userId, etab) => {
   return r.rows.length > 0;
 };
 
+// ── Groupes « filière + niveau » ────────────────────────────────────────────
+// Salle = filiere:<id>:<niveau>. Un étudiant ne rejoint / n'écrit que dans le
+// groupe de SA filière ET de SON niveau, lus en base (jamais fournis par le client).
+const ROLES_STAFF = ['admin', 'professeur', 'prof', 'enseignant', 'teacher'];
+const estStaffRole = (role) => ROLES_STAFF.includes(String(role || '').toLowerCase().trim());
+const roomGroupe = (filiereId, niveau) => `filiere:${filiereId}:${niveau}`;
+async function niveauEtudiant(userId, filiereId) {
+  const r = await pool.query(
+    `SELECT niveau FROM etudiants WHERE user_id = $1 AND filiere_id = $2 AND COALESCE(niveau, '') <> '' LIMIT 1`,
+    [userId, filiereId]
+  );
+  return r.rows[0]?.niveau || null;
+}
+async function niveauxDeFiliere(filiereId) {
+  const r = await pool.query(
+    `SELECT DISTINCT niveau FROM etudiants WHERE filiere_id = $1 AND COALESCE(niveau, '') <> ''`, [filiereId]
+  );
+  return r.rows.map((x) => x.niveau);
+}
+
 // Stocke les utilisateurs en ligne : { userId: socketId }
 const onlineUsers = new Map();
 
@@ -74,19 +94,25 @@ function initSocket(io) {
     socket.join(`user:${userId}`);
     if (etab) socket.join(`etab:${etab}`);
 
-    // Les étudiants rejoignent leur filière. Les comptes de gestion doivent
-    // écouter toutes les filières pour recevoir les messages des groupes.
-    if (socket.userRole === 'admin' || socket.userRole === 'professeur') {
-      try {
-        const { rows: filieres } = etab
-          ? await pool.query('SELECT id FROM filieres WHERE etablissement_id = $1', [etab])
-          : await pool.query('SELECT id FROM filieres');
-        filieres.forEach(({ id }) => socket.join(`filiere:${id}`));
-      } catch (err) {
-        console.error('[Socket] Erreur chargement filières:', err.message);
+    // Groupes filière + niveau : un étudiant rejoint UNIQUEMENT celui de sa filière
+    // ET de son niveau. Les comptes de gestion écoutent tous les groupes.
+    try {
+      if (estStaffRole(socket.userRole)) {
+        const { rows } = await pool.query(
+          `SELECT DISTINCT e.filiere_id, e.niveau
+           FROM etudiants e JOIN filieres f ON f.id = e.filiere_id
+           WHERE COALESCE(e.niveau, '') <> ''${etab ? ' AND f.etablissement_id = $1' : ''}`,
+          etab ? [etab] : []
+        );
+        rows.forEach((r) => socket.join(roomGroupe(r.filiere_id, r.niveau)));
+      } else {
+        const { rows } = await pool.query(
+          `SELECT filiere_id, niveau FROM etudiants WHERE user_id = $1 AND COALESCE(niveau, '') <> ''`, [userId]
+        );
+        rows.forEach((r) => socket.join(roomGroupe(r.filiere_id, r.niveau)));
       }
-    } else if (socket.filiere) {
-      socket.join(`filiere:${socket.filiere}`);
+    } catch (err) {
+      console.error('[Socket] Erreur chargement groupes filière:', err.message);
     }
 
     // ── Rejoindre une room dynamiquement ──────────────────────
@@ -95,6 +121,21 @@ function initSocket(io) {
         if (etab) {
           // Une salle de canal / filière / utilisateur d'un autre établissement est refusée.
           const m = /^(canal|filiere|user|etab):(.+)$/.exec(String(data.roomId));
+          if (m && m[1] === 'filiere') {
+            // Salle de groupe : on ignore le niveau demandé. Étudiant → SON niveau uniquement ;
+            // staff → tous les niveaux de la filière.
+            try {
+              const fid = m[2].split(':')[0];
+              if (!(await filiereDeMonEtab(fid, etab))) return;
+              if (estStaffRole(socket.userRole)) {
+                (await niveauxDeFiliere(fid)).forEach((nv) => socket.join(roomGroupe(fid, nv)));
+              } else {
+                const nv = await niveauEtudiant(userId, fid);
+                if (nv) socket.join(roomGroupe(fid, nv));
+              }
+            } catch (_) { /* accès refusé : silencieux */ }
+            return;
+          }
           if (m) {
             let ok = true;
             try {
@@ -255,26 +296,26 @@ function initSocket(io) {
       }
     });
 
-    // ── Événement : message dans groupe filière ───────────
+    // ── Événement : message dans groupe filière + niveau ─────
     socket.on('message:groupe', async (data, callback) => {
       const { filiereId, contenu } = data;
       if (!contenu?.trim()) return callback?.({ error: 'Contenu vide' });
 
-      // Staff (admin/prof) peut écrire dans n'importe quelle filière
-      // Les étudiants ne peuvent écrire que dans leur propre filière
-      const normRole = String(socket.userRole || '').toLowerCase().trim();
-      const isStaff = ['admin', 'professeur', 'prof', 'enseignant', 'teacher'].includes(normRole);
-      if (!isStaff && String(socket.filiere) !== String(filiereId)) {
-        return callback?.({ error: 'Vous n\'appartenez pas à cette filière' });
-      }
-
       try {
         if (!(await filiereDeMonEtab(filiereId, etab))) return callback?.({ error: 'Filière introuvable' });
+
+        // Étudiant : son niveau (lu en base) ; staff : le niveau choisi dans la requête.
+        const staff = estStaffRole(socket.userRole);
+        const niveau = staff ? (data.niveau || null) : await niveauEtudiant(userId, filiereId);
+        if (!niveau) {
+          return callback?.({ error: staff ? 'Choisissez le niveau du groupe.' : 'Vous n\'appartenez pas à ce groupe (filière et niveau).' });
+        }
+
         const { rows } = await pool.query(
-          `INSERT INTO messages_groupe (filiere_id, auteur_id, contenu, created_at)
-           VALUES ($1, $2, $3, NOW())
+          `INSERT INTO messages_groupe (filiere_id, niveau, auteur_id, contenu, created_at)
+           VALUES ($1, $2, $3, $4, NOW())
            RETURNING id, filiere_id, auteur_id, contenu, created_at`,
-          [filiereId, userId, contenu.trim()]
+          [filiereId, niveau, userId, contenu.trim()]
         );
         const { rows: auteurs } = await pool.query(
           `SELECT mg.id, mg.filiere_id, mg.auteur_id, mg.contenu, mg.created_at,
@@ -286,8 +327,8 @@ function initSocket(io) {
         );
         const message = auteurs[0];
 
-        // Diffuser à toute la filière
-        io.to(`filiere:${filiereId}`).emit('message:groupe', message);
+        // Diffuser UNIQUEMENT au groupe filière + niveau
+        io.to(roomGroupe(filiereId, niveau)).emit('message:groupe', message);
         callback?.({ success: true, message });
       } catch (err) {
         console.error('[Socket] message:groupe erreur:', err.message);
@@ -303,15 +344,24 @@ function initSocket(io) {
         if (data.canalId && !(await canalDeMonEtab(data.canalId, etab))) {
           return callback?.({ error: 'Accès refusé à ce canal' });
         }
+        // Message de groupe : seul un membre de SON groupe (filière + niveau) peut réagir.
+        let room = data.canalId ? `canal:${data.canalId}` : null;
+        if (!data.canalId) {
+          if ((messageType || 'canal') !== 'groupe') return callback?.({ error: 'Salle introuvable' });
+          const g = await pool.query('SELECT filiere_id, niveau FROM messages_groupe WHERE id = $1', [messageId]);
+          if (!g.rows.length || !(await filiereDeMonEtab(g.rows[0].filiere_id, etab))) return callback?.({ error: 'Message introuvable' });
+          const nv = estStaffRole(socket.userRole) ? g.rows[0].niveau : await niveauEtudiant(userId, g.rows[0].filiere_id);
+          if (!nv || String(nv) !== String(g.rows[0].niveau)) return callback?.({ error: 'Accès refusé' });
+          room = roomGroupe(g.rows[0].filiere_id, g.rows[0].niveau);
+        }
         await pool.query(
           `INSERT INTO reactions (message_id, user_id, emoji, message_type)
            VALUES ($1, $2, $3, $4)
-           ON CONFLICT (message_id, user_id, emoji) DO NOTHING`,
+           ON CONFLICT (message_id, user_id, emoji, message_type) DO NOTHING`,
           [messageId, userId, emoji, messageType || 'canal']
         );
 
         // Diffuser la réaction à la room concernée
-        const room = data.canalId ? `canal:${data.canalId}` : `filiere:${socket.filiere}`;
         io.to(room).emit('reaction:ajout', { messageId, userId, emoji });
         callback?.({ success: true });
       } catch (err) {
@@ -333,7 +383,10 @@ function initSocket(io) {
       if (canalId) {
         socket.to(`canal:${canalId}`).emit('user:typing', payload);
       } else if (filiereId) {
-        socket.to(`filiere:${filiereId}`).emit('user:typing', payload);
+        try {
+          const nv = estStaffRole(socket.userRole) ? (data.niveau || null) : await niveauEtudiant(userId, filiereId);
+          if (nv) socket.to(roomGroupe(filiereId, nv)).emit('user:typing', payload);
+        } catch (_) { /* ignoré */ }
       } else if (destinataireId) {
         io.to(`user:${destinataireId}`).emit('user:typing', payload);
       }

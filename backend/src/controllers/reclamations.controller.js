@@ -13,6 +13,8 @@ const { envoyerNotificationAuto } = require('./notifications.controller');
 
 const CATEGORIES = ['Notes & Moyennes', 'Accès & Connexion', 'Documents', 'Inscription', 'Paiement', 'Autre'];
 const TYPES_LEGACY = ['note', 'moyenne', 'absence'];
+// Seules ces catégories peuvent être transmises à un professeur (le reste relève de l'administration).
+const CATEGORIES_TRANSMISSIBLES = ['Notes & Moyennes', 'Documents', 'Autre'];
 
 const estAdmin = (req) => req.user.role === 'admin';
 const estProf  = (req) => req.user.role === 'professeur';
@@ -320,6 +322,12 @@ const transfererReclamation = async (req, res) => {
     if (!rec) return res.status(404).json({ success: false, message: 'Réclamation introuvable.' });
     if (rec.statut === 'resolu' || rec.statut === 'rejete') {
       return res.status(400).json({ success: false, message: 'Cette réclamation est déjà clôturée.' });
+    }
+    if (rec.categorie && !CATEGORIES_TRANSMISSIBLES.includes(rec.categorie)) {
+      return res.status(400).json({
+        success: false,
+        message: `Une réclamation « ${rec.categorie} » est traitée par l'administration : elle ne peut pas être transmise à un professeur.`,
+      });
     }
     const pp = [prof_id];
     let cond = '';

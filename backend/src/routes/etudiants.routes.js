@@ -32,6 +32,7 @@ router.post('/:id/nommer-bde', authMiddleware, etudiantsController.nommerBde);
 router.patch('/:id/revoquer-bde', authMiddleware, etudiantsController.revoquerBde);
 
 // Modifier la fiche d'un étudiant (⚠️ après les autres PUT, comme /parametres-inscription)
+router.post('/:id/renvoyer-invitation', authMiddleware, requireRole('admin'), etudiantsController.renvoyerInvitation);
 router.put('/:id', authMiddleware, requireRole('admin'), etudiantsController.modifierEtudiant);
 
 module.exports = router;

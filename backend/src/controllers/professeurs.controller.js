@@ -1,6 +1,9 @@
 const db = require('../config/db');
 const bcrypt = require('bcryptjs');
 const { getOrCreateCanalProfDelegue } = require('../utils/canauxProfDelegue');
+const { messageConflitUnique } = require('../utils/erreursSql');
+const { inviterProfesseur, compteActive } = require('../services/compte.notify');
+const { parseSemestre, niveauCompatible, niveauDuSemestre } = require('../utils/semestres');
 
 // ── Multi-établissement ─────────────────────────────────────────────────────
 // req.etablissementId vient du jeton ; s'il est absent (anciens jetons), pas de filtre.
@@ -44,7 +47,7 @@ exports.getAllProfesseurs = async (req, res) => {
                         json_build_object('affectation_id', pm.id, 'module_id', m.id, 'module_nom', m.nom,
                                           'filiere_id', pm.filiere_id, 'filiere_nom', f2.nom,
                                           'abreviation', f2.abreviation, 'niveau', pm.niveau,
-                                          'semestre', pm.semestre)
+                                          'semestre', COALESCE(m.semestre, pm.semestre))
                         ORDER BY f2.nom, pm.niveau, pm.semestre, m.nom), '[]')
                  FROM professeur_modules pm
                  JOIN modules m ON m.id = pm.module_id
@@ -225,14 +228,19 @@ exports.createProfesseur = async (req, res) => {
     // 4. Champs d'identité / complémentaires (p35)
     await enregistrerChampsProf(client, user.id, req.body);
 
+    // Mail de bienvenue (filières + niveaux assignés) — après enregistrement des affectations.
+    const invitation = user.email ? await inviterProfesseur(user.id) : { envoye: false, raison: 'aucun_email' };
+
     res.status(201).json({
       message: 'Professeur créé avec succès. Il pourra se connecter avec son nom, prénom et numéro de téléphone.',
       professeur: user,
+      invitation,
     });
   } catch (err) {
     console.error('createProfesseur:', err.message);
-    if (err.code === '23505') return res.status(409).json({ error: 'Email ou matricule déjà utilisé.' });
-    res.status(500).json({ error: err.message });
+    const doublon = messageConflitUnique(err);
+    if (doublon) return res.status(409).json({ error: doublon, message: doublon });
+    res.status(500).json({ error: 'Une erreur est survenue. Réessayez ou contactez le support.' });
   } finally {
     client.release();
   }
@@ -249,6 +257,8 @@ exports.updateProfesseur = async (req, res) => {
     if (!(await profDeMonEtab(id, req.etablissementId))) {
       return res.status(404).json({ error: 'Professeur non trouvé.' });
     }
+
+    const emailAvant = (await client.query('SELECT LOWER(email) AS e FROM users WHERE id = $1', [id])).rows[0]?.e || null;
 
     await client.query(
       `UPDATE users SET nom=COALESCE($1,nom), prenoms=COALESCE($2,prenoms),
@@ -273,11 +283,19 @@ exports.updateProfesseur = async (req, res) => {
       return res.status(404).json({ error: 'Professeur non trouvé.' });
     }
 
-    res.json(result.rows[0]);
+    // Email corrigé / ajouté avant la première connexion : on envoie le mail de bienvenue.
+    const nouveau = result.rows[0];
+    let invitation;
+    if (email && nouveau.email && String(nouveau.email).toLowerCase() !== emailAvant && !(await compteActive(id))) {
+      invitation = await inviterProfesseur(id);
+    }
+
+    res.json(invitation ? { ...nouveau, invitation } : nouveau);
   } catch (err) {
     console.error('updateProfesseur:', err.message);
-    if (err.code === '23505') return res.status(409).json({ error: 'Email ou matricule déjà utilisé.' });
-    res.status(500).json({ error: err.message });
+    const doublon = messageConflitUnique(err);
+    if (doublon) return res.status(409).json({ error: doublon, message: doublon });
+    res.status(500).json({ error: 'Une erreur est survenue. Réessayez ou contactez le support.' });
   } finally {
     client.release();
   }
@@ -295,6 +313,47 @@ exports.uploaderPhotoProfesseur = async (req, res) => {
   } catch (err) {
     console.error('[uploaderPhotoProfesseur]', err);
     res.status(500).json({ success: false, message: "Erreur lors de l'enregistrement de la photo." });
+  }
+};
+
+// ── POST /api/professeurs/:id/renvoyer-invitation — renvoie le mail de bienvenue ──
+exports.renvoyerInvitation = async (req, res) => {
+  try {
+    if (!(await profDeMonEtab(req.params.id, req.etablissementId))) {
+      return res.status(404).json({ success: false, message: 'Professeur introuvable.' });
+    }
+    const r = await inviterProfesseur(req.params.id);
+    if (!r.envoye) {
+      const code = r.raison === 'aucun_email' ? 409 : (r.raison === 'introuvable' ? 404 : 502);
+      return res.status(code).json({ success: false, message: r.error || "L'envoi du mail a échoué." });
+    }
+    res.json({ success: true, message: 'Mail envoyé.' });
+  } catch (err) {
+    console.error('[renvoyerInvitation prof]', err);
+    res.status(500).json({ success: false, message: "Erreur lors de l'envoi du mail." });
+  }
+};
+
+// ── POST /api/professeurs/:id/reinitialiser-mdp — l'administration efface le mot de passe ──
+// Le professeur reprend le parcours de première connexion (nom, prénom, téléphone) et
+// choisit un nouveau mot de passe. Pour les comptes sans email.
+exports.reinitialiserMotDePasse = async (req, res) => {
+  try {
+    const p = [req.params.id];
+    const r = await db.query(
+      `UPDATE users SET mot_de_passe = NULL, reset_code = NULL, reset_code_hash = NULL,
+              reset_expires = NULL, reset_essais = 0
+       WHERE id = $1 AND role = 'professeur'${etabCol(p, req.etablissementId, 'etablissement_id')} RETURNING id`,
+      p
+    );
+    if (!r.rows[0]) return res.status(404).json({ success: false, message: 'Professeur introuvable.' });
+    res.json({
+      success: true,
+      message: 'Mot de passe réinitialisé. Le professeur choisira un nouveau mot de passe à sa prochaine connexion.',
+    });
+  } catch (err) {
+    console.error('[reinitialiserMotDePasse prof]', err);
+    res.status(500).json({ success: false, message: 'Erreur lors de la réinitialisation.' });
   }
 };
 
@@ -401,7 +460,8 @@ exports.getModules = async (req, res) => {
   try {
     const result = await db.query(
       `SELECT pm.id AS affectation_id, m.id, m.nom, m.coefficient, m.volume_horaire,
-              m.filiere_id, m.filiere_nom, pm.niveau, pm.semestre
+              m.filiere_id, m.filiere_nom, pm.niveau,
+              COALESCE(m.semestre, pm.semestre) AS semestre, (m.semestre IS NOT NULL) AS semestre_defini
        FROM professeur_modules pm
        JOIN modules m ON m.id = pm.module_id
        WHERE pm.professeur_id = $1
@@ -421,7 +481,8 @@ exports.getModulesByProfesseur = async (req, res) => {
     }
     const result = await db.query(
       `SELECT pm.id AS affectation_id, m.id, m.nom, m.coefficient, m.volume_horaire,
-              m.filiere_id, m.filiere_nom, pm.niveau, pm.semestre
+              m.filiere_id, m.filiere_nom, pm.niveau,
+              COALESCE(m.semestre, pm.semestre) AS semestre, (m.semestre IS NOT NULL) AS semestre_defini
        FROM professeur_modules pm
        JOIN modules m ON m.id = pm.module_id
        WHERE pm.professeur_id = $1
@@ -570,14 +631,16 @@ exports.patchModuleAssignment = async (req, res) => {
 };
 
 // ── POST /api/professeurs/:id/modules ─────────────────────────────────────────
-// Affecte un module précis à un prof, pour un niveau et un semestre donnés.
-// body: { module_id, filiere_id, niveau, semestre }
+// Affecte un module précis à un prof, pour un niveau donné. Le SEMESTRE est celui du module
+// (défini par l'administration) : le `semestre` éventuellement envoyé n'est utilisé que pour
+// les anciens modules qui n'ont pas encore de semestre.
+// body: { module_id, filiere_id, niveau, semestre? }
 exports.assignerModule = async (req, res) => {
   const { id: professeurId } = req.params;
   const { module_id, filiere_id, niveau, semestre } = req.body;
 
-  if (!module_id || !filiere_id || !niveau || !semestre) {
-    return res.status(400).json({ success: false, message: 'module_id, filiere_id, niveau et semestre sont requis.' });
+  if (!module_id || !filiere_id || !niveau) {
+    return res.status(400).json({ success: false, message: 'module_id, filiere_id et niveau sont requis.' });
   }
 
   try {
@@ -585,12 +648,31 @@ exports.assignerModule = async (req, res) => {
         !(await filiereDeMonEtab(filiere_id, req.etablissementId))) {
       return res.status(404).json({ success: false, message: 'Professeur ou filière introuvable.' });
     }
+    const mod = await db.query('SELECT nom, semestre FROM modules WHERE id = $1', [module_id]);
+    if (!mod.rows[0]) {
+      return res.status(404).json({ success: false, message: 'Module introuvable.' });
+    }
+    // Semestre du module (source de vérité) ; à défaut (ancien module), celui envoyé.
+    let sem = parseSemestre(mod.rows[0].semestre);
+    if (sem === null) sem = parseSemestre(semestre);
+    if (sem === null) {
+      return res.status(400).json({
+        success: false,
+        message: `Le module « ${mod.rows[0].nom} » n'a pas encore de semestre : définissez-le d'abord dans Filières.`,
+      });
+    }
+    if (!niveauCompatible(niveau, sem)) {
+      return res.status(400).json({
+        success: false,
+        message: `Le module « ${mod.rows[0].nom} » est au semestre S${sem} (${niveauDuSemestre(sem)}) : il ne peut pas être affecté en ${niveau}.`,
+      });
+    }
     const result = await db.query(
       `INSERT INTO professeur_modules (professeur_id, module_id, filiere_id, niveau, semestre)
        VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (professeur_id, module_id, niveau) DO UPDATE SET semestre = EXCLUDED.semestre
        RETURNING id, professeur_id, module_id, filiere_id, niveau, semestre, created_at`,
-      [professeurId, module_id, filiere_id, niveau, semestre]
+      [professeurId, module_id, filiere_id, niveau, sem]
     );
 
     // Crée (ou récupère) le sous-fil "Professeurs & Délégués" pour ce trio

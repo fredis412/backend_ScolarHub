@@ -12,6 +12,7 @@ router.get('/lookup', ctrl.lookupProfesseur);
 router.get('/',    authMiddleware, requireRole('admin'), ctrl.getAllProfesseurs);
 router.post('/',   authMiddleware, requireRole('admin'), ctrl.createProfesseur);
 router.put('/:id', authMiddleware, requireRole('admin'), ctrl.updateProfesseur);
+router.post('/:id/renvoyer-invitation', authMiddleware, requireRole('admin'), ctrl.renvoyerInvitation);
 router.delete('/:id', authMiddleware, requireRole('admin'), ctrl.deleteProfesseur);
 
 // ── Routes professeur connecté ────────────────────────────────────────────────
@@ -45,6 +46,9 @@ router.get('/:id/modules', authMiddleware, ctrl.getModulesByProfesseur);
 // Affectation module précise (professeur_modules : module + niveau + semestre)
 router.post('/:id/modules',                     authMiddleware, requireRole('admin'), ctrl.assignerModule);
 router.delete('/:id/modules/:affectationId',    authMiddleware, requireRole('admin'), ctrl.retirerModule);
+
+// Réinitialisation du mot de passe par l'administration (compte sans email)
+router.post('/:id/reinitialiser-mdp', authMiddleware, requireRole('admin'), ctrl.reinitialiserMotDePasse);
 
 // Photo d'identité d'un professeur (multipart, champ `file`) — admin
 router.post('/:id/photo', authMiddleware, requireRole('admin'),

@@ -112,11 +112,13 @@ function validerAdmin(a) {
   return null;
 }
 
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+
 // GET /api/plateforme/etablissements
 const listerEtablissements = async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT e.id, e.nom, e.sigle, e.ville, e.campus, e.type, e.code, e.modele_matricule, e.logo_url, e.photo_accueil_url,
+      `SELECT e.id, e.nom, e.sigle, e.ville, e.campus, e.type, e.code, e.modele_matricule, e.logo_url, e.photo_accueil_url, e.email_contact,
               COALESCE(e.actif, true) AS actif,
               COALESCE(e.inscription_ouverte, false) AS inscription_ouverte,
               COALESCE(e.inscription_validation, true) AS inscription_validation,
@@ -139,6 +141,10 @@ const creerEtablissement = async (req, res) => {
   let etabId = null;
   try {
     const { nom, sigle, ville, campus, type, modele_matricule, admin } = req.body || {};
+    const emailContact = String(req.body.email_contact || '').trim().toLowerCase();
+    if (emailContact && !EMAIL_RE.test(emailContact)) {
+      return res.status(400).json({ success: false, message: "L'email de l'établissement est invalide." });
+    }
     if (!nom?.trim() || !sigle?.trim()) {
       return res.status(400).json({ success: false, message: "Le nom et le sigle de l'établissement sont obligatoires." });
     }
@@ -165,9 +171,9 @@ const creerEtablissement = async (req, res) => {
     }
 
     const ins = await pool.query(
-      `INSERT INTO etablissements (nom, sigle, ville, campus, type, code, modele_matricule, actif, inscription_ouverte, inscription_validation)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, true, false, true) RETURNING id, nom, sigle, ville, campus, type, code, modele_matricule`,
-      [nom.trim(), sigle.trim().toUpperCase(), ville?.trim() || '', campus?.trim() || '', type?.trim() || 'superieur', code, String(modele_matricule).trim()]
+      `INSERT INTO etablissements (nom, sigle, ville, campus, type, code, modele_matricule, actif, inscription_ouverte, inscription_validation, email_contact)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, true, false, true, $8) RETURNING id, nom, sigle, ville, campus, type, code, modele_matricule`,
+      [nom.trim(), sigle.trim().toUpperCase(), ville?.trim() || '', campus?.trim() || '', type?.trim() || 'superieur', code, String(modele_matricule).trim(), emailContact || null]
     );
     const etab = ins.rows[0];
     etabId = etab.id;
@@ -207,6 +213,11 @@ const modifierEtablissement = async (req, res) => {
 
     for (const col of ['nom', 'sigle', 'ville', 'campus', 'type']) {
       if (b[col] !== undefined) ajoute(col, String(b[col]).trim());
+    }
+    if (b.email_contact !== undefined) {
+      const ec = String(b.email_contact || '').trim().toLowerCase();
+      if (ec && !EMAIL_RE.test(ec)) return res.status(400).json({ success: false, message: "L'email de l'établissement est invalide." });
+      ajoute('email_contact', ec || null);
     }
     if (b.code !== undefined) {
       const code = String(b.code).trim().toUpperCase();

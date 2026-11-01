@@ -2,6 +2,7 @@ const pool = require('../config/db');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { envoyerNotificationAuto } = require('./notifications.controller');
+const { messageConflitUnique } = require('../utils/erreursSql');
 
 // ── Multi-établissement ─────────────────────────────────────────────────────
 // req.etablissementId vient du jeton ; s'il est absent (anciens jetons), pas de filtre.
@@ -121,7 +122,7 @@ const getParents = async (req, res) => {
     });
   } catch (err) {
     console.error('[parents.controller] GET /', err.message);
-    res.status(500).json({ success: false, message: err.message });
+    res.status(500).json({ success: false, message: 'Erreur lors du chargement des parents.' });
   }
 };
 
@@ -217,7 +218,9 @@ const createParent = async (req, res) => {
     });
   } catch (err) {
     console.error('[parents.controller] POST / ERREUR:', err.message);
-    res.status(500).json({ success: false, message: `Erreur: ${err.message}` });
+    const doublon = messageConflitUnique(err);
+    if (doublon) return res.status(409).json({ success: false, message: doublon });
+    res.status(500).json({ success: false, message: 'Erreur lors de la création du parent.' });
   } finally {
     client.release();
   }
@@ -258,6 +261,15 @@ const finaliserPremiereConnexion = async (req, res) => {
     const parent = pRes.rows[0];
     if (!parent) return res.status(404).json({ message: 'Parent introuvable.' });
     if (parent.user_id) return res.status(409).json({ message: 'Ce compte a déjà été activé.' });
+
+    // Route publique : sans preuve d'identité, quiconque devinerait un parentId (numéro
+    // séquentiel) pourrait activer le compte d'un autre parent et lire les notes de ses
+    // enfants. On exige donc le téléphone saisi à l'identification, qui doit correspondre
+    // à celui de la fiche (8 derniers chiffres, pour tolérer +226, espaces, tirets).
+    const fin8 = (v) => String(v || '').replace(/\D/g, '').slice(-8);
+    if (fin8(telephone).length < 8 || fin8(telephone) !== fin8(parent.tel)) {
+      return res.status(403).json({ message: "Identification impossible. Vérifiez vos informations ou contactez l'administration." });
+    }
 
     const hashed = await bcrypt.hash(password, 10);
     const parentEtab = parent.etablissement_id || null;
@@ -314,15 +326,9 @@ const finaliserPremiereConnexion = async (req, res) => {
     });
   } catch (err) {
     console.error('[finaliserPremiereConnexion]', err);
-    if (err.code === '23505') {
-      const c = String(err.constraint || '');
-      return res.status(409).json({
-        message: /tel/i.test(c) ? 'Ce numéro de téléphone est déjà utilisé par un autre compte.'
-               : /email/i.test(c) ? 'Cet email est déjà utilisé.'
-               : 'Un compte existe déjà avec ces informations.',
-      });
-    }
-    res.status(500).json({ message: err.message || 'Erreur lors de l\'activation du compte.' });
+    const doublon = messageConflitUnique(err);
+    if (doublon) return res.status(409).json({ message: doublon });
+    res.status(500).json({ message: 'Erreur lors de l\'activation du compte. Réessayez ou contactez l\'administration.' });
   }
 };
 
@@ -524,17 +530,154 @@ const getPresencesEnfant = async (req, res) => {
 // getMesEnfants qui liste les enfants rattachés.
 const getMonProfil = async (req, res) => {
   try {
+    // Coordonnées saisies par l'admin à la création du compte : on prend la
+    // fiche parent, et à défaut le compte utilisateur (users) lié.
     const result = await pool.query(
-      `SELECT p.id, p.nom, p.prenoms, p.tel, p.email
-       FROM parents p WHERE p.user_id::text = $1`,
+      `SELECT p.id, p.nom, p.prenoms,
+              COALESCE(NULLIF(p.tel, ''),   u.tel)   AS tel,
+              COALESCE(NULLIF(p.email, ''), u.email) AS email
+       FROM parents p
+       LEFT JOIN users u ON u.id::text = p.user_id::text
+       WHERE p.user_id::text = $1`,
       [req.user.id.toString()]
     );
     if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Profil parent introuvable.' });
+      const u = await pool.query(
+        `SELECT id, nom, prenoms, tel, email FROM users WHERE id::text = $1`,
+        [req.user.id.toString()]
+      );
+      if (u.rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Profil parent introuvable.' });
+      }
+      return res.json({ success: true, data: u.rows[0] });
     }
     res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     console.error('[parents] GET /mon-profil', err);
+    res.status(500).json({ success: false, message: 'Erreur serveur.' });
+  }
+};
+
+// ── GET /api/parents/enfant/:etudiantId/programme ─────────────────────────────
+// Même résultat que GET /api/edt/mon-programme (celui de l'étudiant), mais pour
+// l'enfant du parent connecté : programme actif + historique de sa filière.
+const getProgrammeEnfant = async (req, res) => {
+  try {
+    const { etudiantId } = req.params;
+    if (!(await accesEtudiant(req, etudiantId))) {
+      return res.status(403).json({ success: false, message: 'Accès refusé à cet étudiant.' });
+    }
+    const etu = await pool.query(
+      `SELECT e.filiere_id, e.niveau, f.nom AS filiere_nom, f.domaine
+         FROM etudiants e JOIN filieres f ON f.id = e.filiere_id
+        WHERE e.id = $1 LIMIT 1`,
+      [etudiantId]
+    );
+    const fiche = etu.rows[0];
+    if (!fiche) {
+      return res.json({ success: true, data: { filiere: {}, actif: null, historique: [] } });
+    }
+    const r = await pool.query(
+      `SELECT * FROM edt WHERE CAST(filiere AS TEXT) = $1 AND niveau = $2`,
+      [String(fiche.filiere_id), fiche.niveau]
+    );
+    const aujourdhui = new Date().toISOString().slice(0, 10);
+    const jour = (v) => (v ? String(v).slice(0, 10) : null);
+    const lignes = r.rows || [];
+    const nonArchives = lignes.filter((e) => !e.archive);
+    let actif = nonArchives
+      .filter((e) => jour(e.dateDebut) && jour(e.dateFin) && jour(e.dateDebut) <= aujourdhui && aujourdhui <= jour(e.dateFin))
+      .sort((a, b) => String(jour(b.dateDebut)).localeCompare(String(jour(a.dateDebut))))[0];
+    if (!actif) {
+      actif = nonArchives
+        .filter((e) => !jour(e.dateFin) || jour(e.dateFin) >= aujourdhui)
+        .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))[0] || null;
+    }
+    const historique = lignes
+      .filter((e) => e.archive || (jour(e.dateFin) && jour(e.dateFin) < aujourdhui))
+      .sort((a, b) => String(jour(b.dateFin) || '').localeCompare(String(jour(a.dateFin) || '')));
+    res.json({
+      success: true,
+      data: {
+        filiere: { id: fiche.filiere_id, nom: fiche.filiere_nom, domaine: fiche.domaine || '' },
+        niveau: fiche.niveau,
+        actif: actif || null,
+        historique,
+      },
+    });
+  } catch (err) {
+    console.error('[parents] GET /enfant/:id/programme', err);
+    res.status(500).json({ success: false, message: 'Erreur serveur.' });
+  }
+};
+
+// ── GET /api/parents/enfant/:etudiantId/contact-administration ────────────────
+// Renvoie le membre de l'administration habilité à répondre pour le domaine de
+// la filière de l'enfant : le Responsable Pédagogique du domaine
+// (Sciences & Technologies / Sciences de Gestion). Repli : Responsable
+// Pédagogique « Tous », puis un administrateur du domaine, puis un Super Admin.
+const norm = (v) => String(v || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+const getContactAdministration = async (req, res) => {
+  try {
+    const { etudiantId } = req.params;
+    if (!(await accesEtudiant(req, etudiantId))) {
+      return res.status(403).json({ success: false, message: 'Accès refusé à cet étudiant.' });
+    }
+    const f = await pool.query(
+      `SELECT f.domaine, f.nom, f.etablissement_id
+         FROM etudiants e LEFT JOIN filieres f ON f.id = e.filiere_id
+        WHERE e.id = $1 LIMIT 1`,
+      [etudiantId]
+    );
+    const fiche = f.rows[0] || {};
+    const etabId = req.etablissementId || fiche.etablissement_id || null;
+    const pl = [];
+    let filtreEtab = '';
+    if (etabId) { pl.push(etabId); filtreEtab = ` AND u.etablissement_id = $${pl.length}`; }
+    const r = await pool.query(
+      `SELECT u.id, u.nom, u.prenoms, u.photo_url, u.admin_sub_role,
+              COALESCE(m.permissions, '{}'::jsonb) AS permissions
+         FROM users u LEFT JOIN membres m ON m.user_id = u.id
+        WHERE u.role IN ('admin', 'admi', 'administrator')
+          AND COALESCE(u.statut, 'actif') = 'actif'${filtreEtab}`,
+      pl
+    );
+    const domEnfant = norm(fiche.domaine);
+    const membres = r.rows.map((u) => {
+      let perms = u.permissions || {};
+      if (typeof perms === 'string') { try { perms = JSON.parse(perms); } catch (_) { perms = {}; } }
+      const titre = norm(`${u.admin_sub_role || ''} ${perms.role || ''} ${perms.titre || ''}`);
+      const domaine = norm(perms.domaine || 'Tous') || 'tous';
+      return {
+        u, domaine,
+        estResp: titre.includes('responsable') && titre.includes('pedagogique'),
+        estSuper: norm(u.admin_sub_role) === 'super admin',
+        domOk: domaine === domEnfant,
+        domTous: domaine === 'tous',
+      };
+    });
+    const choix =
+      membres.find((m) => m.estResp && m.domOk) ||
+      membres.find((m) => m.estResp && m.domTous) ||
+      membres.find((m) => m.domOk && !m.estSuper) ||
+      membres.find((m) => m.estSuper) ||
+      membres[0];
+    if (!choix) {
+      return res.status(404).json({ success: false, message: "Aucun membre de l'administration disponible pour le moment." });
+    }
+    res.json({
+      success: true,
+      data: {
+        id: choix.u.id,
+        nom: choix.u.nom || '',
+        prenoms: choix.u.prenoms || '',
+        photo_url: choix.u.photo_url || null,
+        titre: choix.estResp ? 'Responsable Pédagogique' : (choix.estSuper ? 'Administration' : 'Administration'),
+        domaine: fiche.domaine || '',
+      },
+    });
+  } catch (err) {
+    console.error('[parents] GET /enfant/:id/contact-administration', err);
     res.status(500).json({ success: false, message: 'Erreur serveur.' });
   }
 };
@@ -599,9 +742,8 @@ const modifierParent = async (req, res) => {
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (_) {}
     console.error('[parents.controller] PUT /:id', err.message);
-    if (err.code === '23505') {
-      return res.status(409).json({ success: false, message: 'Email ou téléphone déjà utilisé.' });
-    }
+    const doublon = messageConflitUnique(err);
+    if (doublon) return res.status(409).json({ success: false, message: doublon });
     res.status(500).json({ success: false, message: 'Erreur serveur.' });
   } finally {
     client.release();
@@ -657,6 +799,8 @@ module.exports = {
   finaliserPremiereConnexion,
   getMesEnfants,
   getMonProfil,
+  getProgrammeEnfant,
+  getContactAdministration,
   marquerConsulte,
   getBulletinsEnfant,
   getInfoTuteur,

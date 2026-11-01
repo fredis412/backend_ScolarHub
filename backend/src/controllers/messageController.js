@@ -46,6 +46,39 @@ async function userDeMonEtab(userId, etabId) {
   const r = await pool.query('SELECT 1 FROM users WHERE id = $1 AND etablissement_id = $2', [userId, etabId]);
   return r.rows.length > 0;
 }
+// ── Groupes « filière + niveau » ────────────────────────────────────────────
+// Un groupe = UNE filière ET UN niveau (ex. RIT · Licence 2). Un étudiant n'a
+// accès qu'au groupe de sa propre filière ET de son propre niveau, lu côté
+// serveur dans la table etudiants (jamais fourni par le client). Le personnel
+// (admin / professeur) garde un accès de supervision.
+const ROLES_STAFF = ['admin', 'professeur', 'prof', 'enseignant', 'teacher'];
+const estStaff = (req) => ROLES_STAFF.includes(String(req.user.role || '').toLowerCase().trim());
+const roomGroupe = (filiereId, niveau) => `filiere:${filiereId}:${niveau}`;
+
+// → { ok, staff, niveau } : niveau = celui de l'étudiant, ou celui demandé (staff, peut être null).
+async function accesGroupe(req, filiereId, niveauDemande) {
+  if (!(await filiereDeMonEtab(filiereId, req.etablissementId))) return { ok: false };
+  if (estStaff(req)) return { ok: true, staff: true, niveau: niveauDemande || null };
+  const r = await pool.query(
+    `SELECT niveau FROM etudiants
+     WHERE user_id = $1 AND filiere_id = $2 AND COALESCE(niveau, '') <> '' LIMIT 1`,
+    [req.user.id, filiereId]
+  );
+  if (!r.rows.length) return { ok: false };
+  return { ok: true, staff: false, niveau: r.rows[0].niveau };
+}
+
+// Accès à un message de groupe précis (réaction, lecteurs, épinglage…).
+async function accesMessageGroupe(req, messageId) {
+  const m = await pool.query('SELECT filiere_id, niveau FROM messages_groupe WHERE id = $1', [messageId]);
+  if (!m.rows.length) return { ok: false, introuvable: true };
+  const { filiere_id, niveau } = m.rows[0];
+  const a = await accesGroupe(req, filiere_id, niveau);
+  if (!a.ok) return { ok: false };
+  if (!a.staff && String(a.niveau) !== String(niveau)) return { ok: false };
+  return { ok: true, filiere_id, niveau };
+}
+
 // Ajoute « AND <alias>.etablissement_id = $N » seulement si l'établissement est connu.
 function etabSql(params, etabId, alias) {
   if (!etabId) return '';
@@ -618,32 +651,18 @@ const getProfFilieres = async (req, res) => {
   }
 };
 
-// Messages du groupe filière
+// Messages du groupe filière + niveau
 const getMessagesGroupe = async (req, res) => {
   const { filiereId } = req.params;
   const limite = parseInt(req.query.limite) || 50;
 
   try {
-    if (!(await filiereDeMonEtab(filiereId, req.etablissementId))) {
-      return res.status(403).json({ success: false, error: 'Accès refusé' });
-    }
-    const role = String(req.user.role || '').toLowerCase();
-    const isStaff = ['admin', 'professeur', 'prof', 'enseignant', 'teacher'].includes(role);
-
-    // Vérifier que l'utilisateur appartient à la filière (étudiant) ou est staff
-    const appartientJwt = req.user.filiere_id != null &&
-      String(req.user.filiere_id) === String(filiereId);
-    const { rows: check } = (appartientJwt || isStaff)
-      ? { rows: [{ ok: true }] }
-      : await pool.query(
-          `SELECT 1 FROM etudiants WHERE user_id = $1 AND filiere_id = $2`,
-          [req.user.id, filiereId]
-        );
-    if (!check.length) {
-      return res.status(403).json({ success: false, error: 'Accès refusé' });
-    }
+    const acces = await accesGroupe(req, filiereId, req.query.niveau);
+    if (!acces.ok) return res.status(403).json({ success: false, error: 'Accès refusé' });
 
     // ✅ etudiant_role + niveau + photo_url ajoutés pour badge et photo.
+    // Étudiant : uniquement les messages de SON niveau. Staff : un niveau si
+    // demandé (?niveau=), sinon tous (supervision).
     const { rows } = await pool.query(
       `SELECT mg.id, mg.contenu, mg.created_at,
               mg.auteur_id, u.prenoms, u.nom, u.etudiant_role, u.photo_url,
@@ -657,6 +676,7 @@ const getMessagesGroupe = async (req, res) => {
       LEFT JOIN etudiants e ON e.user_id = u.id
       LEFT JOIN reactions r ON r.message_id = mg.id AND r.message_type = 'groupe'
       WHERE mg.filiere_id = $1
+        AND ($4::text IS NULL OR mg.niveau = $4)
         AND NOT EXISTS (
           SELECT 1 FROM messages_masques mm
           WHERE mm.message_id = mg.id AND mm.message_type = 'groupe' AND mm.user_id = $3
@@ -664,7 +684,7 @@ const getMessagesGroupe = async (req, res) => {
       GROUP BY mg.id, u.id
       ORDER BY mg.created_at DESC
       LIMIT $2`,
-      [filiereId, limite, req.user.id]
+      [filiereId, limite, req.user.id, acces.niveau]
     );
     res.json({ success: true, data: rows.reverse() });
   } catch (err) {
@@ -674,7 +694,7 @@ const getMessagesGroupe = async (req, res) => {
 };
 
 // ── POST /api/messages/groupe/:filiereId ─────────────────
-// Envoyer dans le groupe filière (fallback REST)
+// Envoyer dans le groupe filière + niveau (fallback REST)
 const envoyerMessageGroupe = async (req, res) => {
   const { filiereId } = req.params;
   const { contenu } = req.body;
@@ -684,29 +704,19 @@ const envoyerMessageGroupe = async (req, res) => {
   }
 
   try {
-    if (!(await filiereDeMonEtab(filiereId, req.etablissementId))) {
-      return res.status(403).json({ success: false, error: 'Vous n\'appartenez pas à cette filière' });
+    const acces = await accesGroupe(req, filiereId, req.body.niveau);
+    if (!acces.ok) {
+      return res.status(403).json({ success: false, error: 'Vous n\'appartenez pas à ce groupe (filière et niveau).' });
     }
-    const role = String(req.user.role || '').toLowerCase();
-    const isStaff = ['admin', 'professeur', 'prof', 'enseignant', 'teacher'].includes(role);
-
-    const appartientJwt = req.user.filiere_id != null &&
-      String(req.user.filiere_id) === String(filiereId);
-    const { rows: check } = (appartientJwt || isStaff)
-      ? { rows: [{ ok: true }] }
-      : await pool.query(
-          `SELECT 1 FROM etudiants WHERE user_id = $1 AND filiere_id = $2`,
-          [req.user.id, filiereId]
-        );
-    if (!check.length) {
-      return res.status(403).json({ success: false, error: 'Vous n\'appartenez pas à cette filière' });
+    if (!acces.niveau) {
+      return res.status(400).json({ success: false, error: 'Choisissez le niveau du groupe.' });
     }
 
     const { rows: inserted } = await pool.query(
-      `INSERT INTO messages_groupe (filiere_id, auteur_id, contenu, created_at)
-       VALUES ($1, $2, $3, NOW())
+      `INSERT INTO messages_groupe (filiere_id, niveau, auteur_id, contenu, created_at)
+       VALUES ($1, $2, $3, $4, NOW())
        RETURNING id, filiere_id, auteur_id, contenu, created_at`,
-      [filiereId, req.user.id, contenu.trim()]
+      [filiereId, acces.niveau, req.user.id, contenu.trim()]
     );
 
     // ✅ etudiant_role + niveau + photo_url ajoutés pour que badge et photo
@@ -727,8 +737,9 @@ const envoyerMessageGroupe = async (req, res) => {
       niveau: userRows[0]?.niveau,
     };
 
+    // Diffusion limitée à la salle « filière + niveau » : les autres niveaux ne reçoivent rien.
     const io = req.app.get('io');
-    if (io) io.to(`filiere:${filiereId}`).emit('message:groupe', messageAvecAuteur);
+    if (io) io.to(roomGroupe(filiereId, acces.niveau)).emit('message:groupe', messageAvecAuteur);
 
     res.status(201).json({ success: true, data: messageAvecAuteur });
   } catch (err) {
@@ -752,6 +763,12 @@ const ajouterReaction = async (req, res) => {
   }
 
   try {
+    // Message de groupe : seul un membre de SON groupe (filière + niveau) peut réagir.
+    let grp = null;
+    if (type === 'groupe') {
+      grp = await accesMessageGroupe(req, id);
+      if (!grp.ok) return res.status(403).json({ success: false, error: 'Accès refusé' });
+    }
     // ✅ CORRIGÉ — la clause ON CONFLICT doit correspondre EXACTEMENT à la
     // contrainte unique réelle de la table (message_id, user_id, emoji,
     // message_type). Avec seulement 3 colonnes ici, Postgres ne trouvait
@@ -769,8 +786,8 @@ const ajouterReaction = async (req, res) => {
     if (io) {
       if (type === 'canal' && canalId) {
         io.to(`canal:${canalId}`).emit('reaction:ajout', payload);
-      } else if (type === 'groupe' && filiereId) {
-        io.to(`filiere:${filiereId}`).emit('reaction:ajout', payload);
+      } else if (type === 'groupe' && grp) {
+        io.to(roomGroupe(grp.filiere_id, grp.niveau)).emit('reaction:ajout', payload);
       } else if (type === 'prive' && destinataireId) {
         notifierUser(io, destinataireId, 'reaction:ajout', payload);
       }
@@ -818,10 +835,9 @@ const epinglerMessage = async (req, res) => {
         }
         room = `canal:${rows[0].contexte}`;
       } else {
-        if (!(await filiereDeMonEtab(rows[0].contexte, req.etablissementId))) {
-          return res.status(403).json({ success: false, error: 'Accès refusé' });
-        }
-        room = `filiere:${rows[0].contexte}`;
+        const g = await accesMessageGroupe(req, id);
+        if (!g.ok) return res.status(403).json({ success: false, error: 'Accès refusé' });
+        room = roomGroupe(g.filiere_id, g.niveau);
       }
     }
 
@@ -933,13 +949,19 @@ const supprimerMessageType = async (req, res) => {
       return res.status(403).json({ success: false, error: 'Non autorisé' });
     }
 
+    let niveauGroupe = null;
+    if (type === 'groupe') {
+      const g = await pool.query('SELECT niveau FROM messages_groupe WHERE id = $1', [id]);
+      niveauGroupe = g.rows[0]?.niveau || null;
+    }
+
     await pool.query(`DELETE FROM ${cfg.table} WHERE id = $1`, [id]);
 
     const io = req.app.get('io');
     if (io) {
       const payload = { messageId: id, type };
       if (type === 'canal') io.to(`canal:${rows[0].contexte}`).emit('message:supprimer', payload);
-      else if (type === 'groupe') io.to(`filiere:${rows[0].contexte}`).emit('message:supprimer', payload);
+      else if (type === 'groupe') io.to(roomGroupe(rows[0].contexte, niveauGroupe)).emit('message:supprimer', payload);
       else if (type === 'prive') notifierUser(io, rows[0].contexte, 'message:supprimer', payload);
     }
 
@@ -1111,38 +1133,13 @@ const getUsersOnline = (req, res) => {
 };
 
 // ── GET /api/messages/groupe/:filiereId/membres ──────────
-// Vrais étudiants de la MÊME filière ET du MÊME niveau que le demandeur
-// (remplace l'ancienne liste codée en dur côté Flutter dans
-// groupe_filiere_screen.dart). Scopé par niveau, pas juste par filière —
-// sinon le nombre de membres ne correspond pas à ce que l'admin voit pour
-// une filière+niveau précis (ex. "Licence 2").
+// Vrais étudiants de la MÊME filière ET du MÊME niveau que le demandeur.
+// Le staff voit tout le monde (ou un niveau précis avec ?niveau=).
 const getMembresGroupe = async (req, res) => {
   const { filiereId } = req.params;
   try {
-    if (!(await filiereDeMonEtab(filiereId, req.etablissementId))) {
-      return res.status(403).json({ success: false, error: 'Accès refusé' });
-    }
-    const role = String(req.user.role || '').toLowerCase();
-    const isStaff = ['admin', 'professeur', 'prof', 'enseignant', 'teacher'].includes(role);
-    const appartientJwt = req.user.filiere_id != null &&
-      String(req.user.filiere_id) === String(filiereId);
-    const { rows: check } = (appartientJwt || isStaff)
-      ? { rows: [{ ok: true }] }
-      : await pool.query(
-          `SELECT 1 FROM etudiants WHERE user_id = $1 AND filiere_id = $2`,
-          [req.user.id, filiereId]
-        );
-    if (!check.length) {
-      return res.status(403).json({ success: false, error: 'Accès refusé' });
-    }
-
-    // Niveau du demandeur — le staff (admin/prof) voit tout le monde,
-    // un étudiant ne voit que sa propre classe (filière + niveau).
-    let niveauFiltre = null;
-    if (!isStaff) {
-      const moiRes = await pool.query('SELECT niveau FROM etudiants WHERE user_id = $1', [req.user.id]);
-      niveauFiltre = moiRes.rows[0]?.niveau || null;
-    }
+    const acces = await accesGroupe(req, filiereId, req.query.niveau);
+    if (!acces.ok) return res.status(403).json({ success: false, error: 'Accès refusé' });
 
     const { rows } = await pool.query(
       `SELECT u.id AS user_id, e.matricule, e.nom, e.prenoms, u.photo_url,
@@ -1153,7 +1150,7 @@ const getMembresGroupe = async (req, res) => {
          AND ($2::text IS NULL OR e.niveau = $2)
          AND COALESCE(u.statut, 'actif') NOT IN ('suspendu', 'renvoye')
        ORDER BY e.nom, e.prenoms`,
-      [filiereId, niveauFiltre]
+      [filiereId, acces.niveau]
     );
     res.json({ success: true, data: rows });
   } catch (err) {
@@ -1168,6 +1165,8 @@ const getMembresGroupe = async (req, res) => {
 const marquerGroupeLu = async (req, res) => {
   const { filiereId } = req.params;
   try {
+    const acces = await accesGroupe(req, filiereId, req.query.niveau);
+    if (!acces.ok) return res.status(403).json({ success: false, error: 'Accès refusé' });
     await pool.query(
       `INSERT INTO groupe_filiere_lectures (user_id, filiere_id, dernier_lu)
        VALUES ($1, $2, now())
@@ -1185,6 +1184,9 @@ const marquerGroupeLu = async (req, res) => {
 const getNombreNonLusGroupe = async (req, res) => {
   const { filiereId } = req.params;
   try {
+    const acces = await accesGroupe(req, filiereId, req.query.niveau);
+    if (!acces.ok) return res.status(403).json({ success: false, error: 'Accès refusé' });
+
     const dernierLuRes = await pool.query(
       `SELECT dernier_lu FROM groupe_filiere_lectures WHERE user_id = $1 AND filiere_id = $2`,
       [req.user.id, filiereId]
@@ -1192,10 +1194,10 @@ const getNombreNonLusGroupe = async (req, res) => {
     const dernierLu = dernierLuRes.rows[0]?.dernier_lu || null;
 
     const result = await pool.query(
-      dernierLu
-        ? `SELECT COUNT(*) FROM messages_groupe WHERE filiere_id = $1 AND created_at > $2 AND auteur_id != $3`
-        : `SELECT COUNT(*) FROM messages_groupe WHERE filiere_id = $1 AND auteur_id != $2`,
-      dernierLu ? [filiereId, dernierLu, req.user.id] : [filiereId, req.user.id]
+      `SELECT COUNT(*) FROM messages_groupe
+       WHERE filiere_id = $1 AND auteur_id != $2 AND ($3::text IS NULL OR niveau = $3)
+         ${dernierLu ? 'AND created_at > $4' : ''}`,
+      dernierLu ? [filiereId, req.user.id, acces.niveau, dernierLu] : [filiereId, req.user.id, acces.niveau]
     );
     res.json({ success: true, count: parseInt(result.rows[0].count, 10) || 0 });
   } catch (err) {
@@ -1212,6 +1214,10 @@ const getNombreNonLusGroupe = async (req, res) => {
 const marquerMessageLu = async (req, res) => {
   const { type, id } = req.params;
   try {
+    if (type === 'groupe') {
+      const g = await accesMessageGroupe(req, id);
+      if (!g.ok) return res.status(403).json({ success: false, error: 'Accès refusé' });
+    }
     await pool.query(
       `INSERT INTO messages_lectures (message_id, message_type, user_id)
        VALUES ($1, $2, $3)
@@ -1229,6 +1235,10 @@ const marquerMessageLu = async (req, res) => {
 const getLecteursMessage = async (req, res) => {
   const { type, id } = req.params;
   try {
+    if (type === 'groupe') {
+      const g = await accesMessageGroupe(req, id);
+      if (!g.ok) return res.status(403).json({ success: false, error: 'Accès refusé' });
+    }
     const { rows } = await pool.query(
       `SELECT u.id AS user_id, u.nom, u.prenoms, u.photo_url, l.lu_at
        FROM messages_lectures l

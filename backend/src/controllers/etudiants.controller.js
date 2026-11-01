@@ -1185,12 +1185,64 @@ const listerDocumentsEtudiant = async (req, res) => {
 // ── PUT /api/etudiants/:id — modifier la fiche d'un étudiant ──────────────────
 // :id = id de la table etudiants. Seuls les champs présents dans le body sont modifiés.
 // Le matricule n'est jamais modifiable ici.
+// ── Invitation (matricule + lien d'activation) ──────────────────────────────────────────
+// Renvoie à l'étudiant son mail de bienvenue (matricule + « Activer mon compte »), et son SMS
+// si demandé. Uniquement pour un compte NON ACTIVÉ (pas encore de mot de passe) et pas en attente.
+const envoyerInvitation = async (etuId, { avecSms = false } = {}) => {
+  const r = await pool.query(
+    `SELECT u.matricule, u.nom, u.prenoms, u.email, u.tel, u.statut, u.etablissement_id,
+            COALESCE(e.filiere_nom, u.filiere_nom) AS filiere,
+            (u.mot_de_passe IS NULL OR u.mot_de_passe = '' OR u.mot_de_passe = 'null') AS non_active
+     FROM etudiants e JOIN users u ON u.id = e.user_id WHERE e.id = $1`,
+    [etuId]
+  );
+  const u = r.rows[0];
+  if (!u) return { ok: false, raison: 'introuvable' };
+  if (!u.non_active) return { ok: false, raison: 'deja_active' };
+  if (u.statut === 'en_attente' || u.statut === 'suspendu' || u.statut === 'renvoye') return { ok: false, raison: 'statut' };
+  const emailReel = u.email && !/@sans-email\.scolarhub$/i.test(u.email) ? u.email : null;
+  if (!emailReel && !(avecSms && u.tel)) return { ok: false, raison: 'aucun_contact' };
+  const notifications = await notifierInscription({
+    prenoms: u.prenoms,
+    nom: String(u.nom || '').toUpperCase(),
+    matricule: u.matricule,
+    email: emailReel,
+    telephone: avecSms ? u.tel : null,
+    ecole: u.filiere,
+    etablissementId: u.etablissement_id,
+  });
+  return { ok: true, notifications, email: emailReel };
+};
+
+// POST /api/etudiants/:id/renvoyer-invitation (admin) — :id = id de la table etudiants.
+const renvoyerInvitation = async (req, res) => {
+  try {
+    const etu = await etudiantDeMonEtab(req.params.id, req.etablissementId);
+    if (!etu) return res.status(404).json({ success: false, message: 'Étudiant introuvable.' });
+    const r = await envoyerInvitation(etu.id, { avecSms: true });
+    if (!r.ok) {
+      const messages = {
+        deja_active: 'Ce compte est déjà activé : l\'étudiant a déjà choisi son mot de passe.',
+        statut: 'Ce compte n\'est pas en état de recevoir une invitation (en attente, suspendu ou renvoyé).',
+        aucun_contact: 'Aucune adresse e-mail valide ni numéro de téléphone pour cet étudiant. Modifiez sa fiche d\'abord.',
+        introuvable: 'Étudiant introuvable.',
+      };
+      return res.status(r.raison === 'introuvable' ? 404 : 409).json({ success: false, message: messages[r.raison] || 'Envoi impossible.' });
+    }
+    return res.status(200).json({ success: true, notifications: r.notifications, message: 'Invitation renvoyée.' });
+  } catch (err) {
+    console.error('[renvoyerInvitation]', err);
+    return res.status(500).json({ success: false, message: 'Erreur lors de l\'envoi.' });
+  }
+};
+
 const modifierEtudiant = async (req, res) => {
   try {
     const { id } = req.params;
     const b = req.body || {};
     const etu = await etudiantDeMonEtab(id, req.etablissementId);
     if (!etu) return res.status(404).json({ success: false, message: 'Étudiant introuvable.' });
+    const avant = (await pool.query('SELECT email FROM users WHERE id = $1', [etu.user_id])).rows[0] || {};
 
     const t = (v) => (v === undefined || v === null || String(v).trim() === '' ? null : String(v).trim());
     const has = (k) => Object.prototype.hasOwnProperty.call(b, k);
@@ -1242,7 +1294,19 @@ const modifierEtudiant = async (req, res) => {
       valsU.push(etu.user_id);
       await pool.query(`UPDATE users SET ${setsU.join(', ')} WHERE id = $${valsU.length}`, valsU);
     }
-    return res.status(200).json({ success: true });
+    // L'adresse e-mail vient d'être corrigée et l'étudiant n'a pas encore activé son compte :
+    // on lui envoie directement son matricule + le lien d'activation (e-mail seulement).
+    let invitation = null;
+    const nouvelEmail = has('email') ? t(b.email) : null;
+    if (nouvelEmail && String(avant.email || '').trim().toLowerCase() !== nouvelEmail.toLowerCase()) {
+      try {
+        const r = await envoyerInvitation(etu.id, { avecSms: false });
+        if (r.ok) invitation = { email: !!(r.notifications && r.notifications.email && r.notifications.email.envoye), adresse: nouvelEmail };
+      } catch (e) {
+        console.error('[modifierEtudiant] invitation', e.message);
+      }
+    }
+    return res.status(200).json({ success: true, ...(invitation ? { invitation } : {}) });
   } catch (err) {
     console.error('[modifierEtudiant]', err);
     const doublon = messageConflitUnique(err);
@@ -1275,6 +1339,7 @@ const reinitialiserMotDePasseEtudiant = async (req, res) => {
 };
 
 module.exports = {
+  renvoyerInvitation,
   creerOuLierParent,
   reinitialiserMotDePasseEtudiant,
   modifierEtudiant,

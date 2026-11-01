@@ -21,7 +21,6 @@ router.post('/refuser-inscriptions', authMiddleware, requireRole('admin'), etudi
 router.post('/:id/photo', authMiddleware, requireRole('admin'), upload.single('file'), uploadToCloudinary('scolarhub/photos-profil'), etudiantsController.uploaderPhotoEtudiant);
 router.post('/:id/document', authMiddleware, requireRole('admin'), upload.single('file'), uploadToCloudinary('scolarhub/documents-etudiants'), etudiantsController.ajouterDocumentEtudiant);
 router.get('/:id/documents', authMiddleware, requireRole('admin'), etudiantsController.listerDocumentsEtudiant);
-router.post('/:id/reinitialiser-mdp', authMiddleware, requireRole('admin'), etudiantsController.reinitialiserMotDePasseEtudiant);
 router.put('/:id/identite', authMiddleware, requireRole('admin'), etudiantsController.completerIdentite);
 
 router.get('/delegues', authMiddleware, etudiantsController.getDelegues);
@@ -33,6 +32,7 @@ router.post('/:id/nommer-bde', authMiddleware, etudiantsController.nommerBde);
 router.patch('/:id/revoquer-bde', authMiddleware, etudiantsController.revoquerBde);
 
 // Modifier la fiche d'un étudiant (⚠️ après les autres PUT, comme /parametres-inscription)
+router.post('/:id/renvoyer-invitation', authMiddleware, requireRole('admin'), etudiantsController.renvoyerInvitation);
 router.put('/:id', authMiddleware, requireRole('admin'), etudiantsController.modifierEtudiant);
 
 module.exports = router;

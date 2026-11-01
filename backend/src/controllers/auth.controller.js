@@ -768,27 +768,40 @@ const register = async (req, res) => {
     }
     const {
       nom, prenoms, email, telephone, motDePasse, matricule: matriculeBody, filiere, niveau,
-      nomPersonne, telPersonne,
+      dateNaissance, lieuNaissance, nationalite, sexe, regime, adresse,
+      urgenceNom, urgenceTel, urgenceLien,
+      nomParent, prenomParent, telParent, emailParent,
+      nomPersonne, telPersonne, // anciens noms de champs (= personne à prévenir)
     } = req.body;
 
-    if (!nom?.trim() || !prenoms?.trim()) {
-      return res.status(400).json({ message: 'Nom et prénom requis.' });
-    }
-    if (!matriculeBody?.trim()) {
-      return res.status(400).json({ message: 'Matricule requis.' });
-    }
-    if (!email?.trim()) {
-      return res.status(400).json({ message: 'Email requis.' });
-    }
-    if (!motDePasse || motDePasse.length < 4) {
-      return res.status(400).json({ message: 'Mot de passe requis (4 caractères minimum).' });
-    }
-    if (!filiere?.trim()) {
-      return res.status(400).json({ message: 'Filière requise.' });
-    }
-    if (!niveau?.trim()) {
-      return res.status(400).json({ message: 'Niveau requis.' });
-    }
+    const t = (v) => String(v ?? '').trim();
+    const tel8 = (v) => t(v).replace(/\D/g, '').length >= 8;
+    const urgNom = t(urgenceNom || nomPersonne);
+    const urgTel = t(urgenceTel || telPersonne);
+    const urgLien = t(urgenceLien);
+    const sexeNorm = ['M', 'F'].includes(t(sexe).toUpperCase()) ? t(sexe).toUpperCase() : null;
+    const naissance = t(dateNaissance);
+
+    const erreur =
+      (!t(nom) || !t(prenoms)) ? 'Nom et prénom requis.'
+      : !t(matriculeBody) ? 'Matricule requis.'
+      : !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t(email)) ? 'Une adresse email valide est requise.'
+      : !tel8(telephone) ? 'Numéro de téléphone requis (8 chiffres minimum).'
+      : (!motDePasse || motDePasse.length < 4) ? 'Mot de passe requis (4 caractères minimum).'
+      : !t(filiere) ? 'Filière requise.'
+      : !t(niveau) ? 'Niveau requis.'
+      : !/^\d{4}-\d{2}-\d{2}$/.test(naissance) || isNaN(Date.parse(naissance)) || new Date(naissance) > new Date()
+        || new Date(naissance).getFullYear() < 1940 ? 'Date de naissance invalide.'
+      : !t(lieuNaissance) ? 'Lieu de naissance requis.'
+      : !t(nationalite) ? 'Nationalité requise.'
+      : !sexeNorm ? 'Sexe requis.'
+      : !t(adresse) ? 'Adresse requise.'
+      : !urgNom ? 'Nom de la personne à prévenir requis.'
+      : !tel8(urgTel) ? 'Téléphone de la personne à prévenir requis (8 chiffres minimum).'
+      : !urgLien ? 'Lien avec la personne à prévenir requis (ex. Père, Oncle).'
+      : (t(telParent) && (!tel8(telParent) || !t(nomParent))) ? 'Tuteur / parent : nom et téléphone valides requis (ou laissez cette partie vide).'
+      : null;
+    if (erreur) return res.status(400).json({ message: erreur });
 
     const etabReg = await resolveEtablissement(req);
     if (etabReg.invalide) return res.status(404).json({ message: 'Établissement introuvable.' });
@@ -820,7 +833,7 @@ const register = async (req, res) => {
         message: 'Ce matricule est déjà enregistré. Utilisez « Se connecter » (première connexion) ou contactez l\'administration.',
       });
     }
-    const existingEmail = await client.query('SELECT 1 FROM users WHERE email = $1', [email.trim()]);
+    const existingEmail = await client.query('SELECT 1 FROM users WHERE LOWER(email) = LOWER($1)', [t(email)]);
     if (existingEmail.rows.length > 0) {
       return res.status(409).json({ message: 'Cet email est déjà utilisé.' });
     }
@@ -828,28 +841,74 @@ const register = async (req, res) => {
     const hashed = await bcrypt.hash(motDePasse, 10);
 
     const filiereRes = await client.query(
-      'SELECT id FROM filieres WHERE nom = $1 AND etablissement_id = $2',
-      [filiere.trim(), etabIdReg]
+      'SELECT id FROM filieres WHERE LOWER(TRIM(nom)) = LOWER($1) AND etablissement_id = $2',
+      [t(filiere), etabIdReg]
     );
     const filiereId = filiereRes.rows[0]?.id || null;
+    if (!filiereId) {
+      return res.status(400).json({ message: `Filière « ${t(filiere)} » introuvable dans cet établissement.` });
+    }
 
     const enAttente = etab.inscription_validation !== false;
     const statut = enAttente ? 'en_attente' : 'actif';
 
+    const f = t(filiere).toLowerCase();
+    const domaine = (f.includes('marketing') || f.includes('gestion') || f.includes('finance') || f.includes('comptab'))
+      ? 'Sciences de Gestion' : 'Sciences & Technologies';
+    const emailNorm = t(email).toLowerCase();
+    const nomMaj = t(nom).toUpperCase();
+    // Tuteur / parent (facultatif) : champs « parent ». La personne à prévenir est
+    // stockée à part (urgence_*) et ne donne AUCUN accès parent.
+    // Pas de colonne « prénom » côté parent : on stocke « NOM Prénom » dans nom_parent
+    // (séparé à la validation pour créer le compte parent).
+    const tutNom = [t(nomParent).toUpperCase(), t(prenomParent)].filter(Boolean).join(' ') || null;
+    const tutPrenom = null;
+    const tutTel = t(telParent) || null;
+    const tutEmail = t(emailParent) || null;
+
     const userRes = await client.query(
-      `INSERT INTO users (matricule, nom, prenoms, email, tel, role, statut, mot_de_passe, etablissement_id, filiere_nom, niveau, nom_parent, tel_parent)
-       VALUES ($1, $2, $3, $4, $5, 'etudiant', $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
-      [matricule, nom.trim().toUpperCase(), prenoms.trim(), email.trim(), telephone?.trim() || null, statut, hashed,
-        etabIdReg, filiere.trim(), niveau.trim(), nomPersonne?.trim() || null, telPersonne?.trim() || null]
+      `INSERT INTO users (matricule, nom, prenoms, email, tel, role, statut, mot_de_passe, etablissement_id,
+                          filiere_nom, domaine, niveau, date_naissance, nationalite, adresse,
+                          nom_parent, tel_parent, email_parent)
+       VALUES ($1, $2, $3, $4, $5, 'etudiant', $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING *`,
+      [matricule, nomMaj, t(prenoms), emailNorm, t(telephone), statut, hashed, etabIdReg,
+        t(filiere), domaine, t(niveau), naissance, t(nationalite), t(adresse),
+        tutNom, tutTel, tutEmail]
     );
     const user = userRes.rows[0];
 
-    await client.query(
-      `INSERT INTO etudiants (user_id, filiere_id, premierefois, matricule, nom, prenoms, email, tel, filiere_nom, niveau, statut, etablissement_id, nom_parent, tel_parent)
-       VALUES ($1, $2, false, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-      [user.id, filiereId, matricule, nom.trim().toUpperCase(), prenoms.trim(), email.trim(), telephone?.trim() || null,
-        filiere.trim(), niveau.trim(), statut, etabIdReg, nomPersonne?.trim() || null, telPersonne?.trim() || null]
-    );
+    try {
+      await client.query(
+        `INSERT INTO etudiants (user_id, filiere_id, premierefois, matricule, nom, prenoms, email, tel,
+                                filiere_nom, domaine, niveau, date_naissance, nationalite, adresse,
+                                nom_parent, tel_parent, email_parent, statut, etablissement_id,
+                                sexe, lieu_naissance, urgence_nom, urgence_tel, urgence_lien, regime)
+         VALUES ($1, $2, false, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                 $19, $20, $21, $22, $23, $24)`,
+        [user.id, filiereId, matricule, nomMaj, t(prenoms), emailNorm, t(telephone),
+          t(filiere), domaine, t(niveau), naissance, t(nationalite), t(adresse),
+          tutNom, tutTel, tutEmail, statut, etabIdReg,
+          sexeNorm, t(lieuNaissance), urgNom, urgTel, urgLien, t(regime) === 'soir' ? 'soir' : 'jour']
+      );
+    } catch (e) {
+      // Pas de compte à moitié créé si la fiche étudiant échoue.
+      await client.query('DELETE FROM users WHERE id = $1', [user.id]).catch(() => {});
+      throw e;
+    }
+
+    // Validation automatique désactivée : le tuteur est lié tout de suite
+    // (sinon la liaison se fait à la validation par l'administration).
+    if (!enAttente && tutTel) {
+      try {
+        const { creerOuLierParent } = require('./etudiants.controller');
+        const er2 = await client.query('SELECT id FROM etudiants WHERE user_id = $1', [user.id]);
+        if (er2.rows[0]) {
+          await creerOuLierParent(client, { nomParent: tutNom, telParent: tutTel, emailParent: tutEmail }, er2.rows[0].id);
+        }
+      } catch (e) {
+        console.warn('[register] liaison tuteur:', e.message);
+      }
+    }
 
     if (enAttente) {
       return res.status(201).json({
@@ -867,8 +926,8 @@ const register = async (req, res) => {
         matricule: user.matricule,
         role: user.role,
         statut: user.statut,
-        filiere: filiere.trim(),
-        niveau: niveau.trim(),
+        filiere: t(filiere),
+        niveau: t(niveau),
       },
     });
   } catch (err) {

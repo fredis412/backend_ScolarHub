@@ -81,17 +81,27 @@ const creerOuLierParent = async (client, { nomParent, prenomParent, telParent, e
       lienExistant = true;
     } else {
       // 2. Créer le parent sans compte (user_id = null)
+      // L'établissement du parent = celui de l'étudiant (nécessaire pour qu'il retrouve
+      // son espace à la connexion).
       const nouveau = await client.query(
-        `INSERT INTO parents (nom, prenoms, tel, email, statut)
-         VALUES ($1, $2, $3, $4, 'actif') RETURNING id`,
+        `INSERT INTO parents (nom, prenoms, tel, email, statut, etablissement_id)
+         VALUES ($1, $2, $3, $4, 'actif', (SELECT etablissement_id FROM etudiants WHERE id = $5)) RETURNING id`,
         [
           (nomParent?.trim() || '').toUpperCase(),
           prenomParent?.trim() || null,
           tel,
           emailParent?.trim() || null,
+          etuId,
         ]
       );
       parentId = nouveau.rows[0].id;
+    }
+    if (lienExistant) {
+      await client.query(
+        `UPDATE parents SET etablissement_id = (SELECT etablissement_id FROM etudiants WHERE id = $2)
+         WHERE id = $1 AND etablissement_id IS NULL`,
+        [parentId, etuId]
+      ).catch(() => {});
     }
 
     // 3. Lier au nouvel étudiant (ON CONFLICT protège si un tuteur principal
@@ -293,6 +303,16 @@ const inscrireEtudiant = async (req, res) => {
     }
     if (!filiere?.trim()) {
       return res.status(400).json({ message: 'Filière requise.' });
+    }
+    // Fiche complète obligatoire : contact de l'étudiant + personne à prévenir.
+    const nb = (v) => String(v ?? '').replace(/\D/g, '').length;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email ?? '').trim())) {
+      return res.status(400).json({ message: 'Une adresse e-mail valide est requise.' });
+    }
+    if (nb(telephone) < 8) return res.status(400).json({ message: 'Téléphone de l\'étudiant requis (8 chiffres minimum).' });
+    if (!String(adresse ?? '').trim()) return res.status(400).json({ message: 'Adresse requise.' });
+    if (!String(urgenceNom ?? '').trim() || !String(urgenceLien ?? '').trim() || nb(urgenceTel) < 8) {
+      return res.status(400).json({ message: 'Personne à prévenir requise (nom, téléphone de 8 chiffres minimum et lien).' });
     }
 
     client = await pool.connect();
@@ -1011,7 +1031,10 @@ async function chargerEnAttente(req) {
     where += ` AND u.id IN (${ids.map((id) => { params.push(id); return `$${params.length}`; }).join(', ')})`;
   }
   const r = await pool.query(
-    `SELECT u.id, u.matricule, e.filiere_id, COALESCE(e.filiere_nom, u.filiere_nom) AS filiere
+    `SELECT u.id, u.matricule, e.id AS etudiant_id, e.filiere_id, COALESCE(e.filiere_nom, u.filiere_nom) AS filiere,
+            COALESCE(e.nom_parent, u.nom_parent) AS nom_parent,
+            COALESCE(e.tel_parent, u.tel_parent) AS tel_parent,
+            COALESCE(e.email_parent, u.email_parent) AS email_parent
      FROM users u LEFT JOIN etudiants e ON e.user_id = u.id WHERE ${where}`,
     params
   );
@@ -1027,6 +1050,17 @@ const validerInscriptions = async (req, res) => {
       await pool.query("UPDATE etudiants SET statut = 'actif' WHERE user_id = $1", [c.id]);
       if (c.filiere_id) {
         await integrerDansGroupeFiliere(pool, c.id, c.filiere_id, c.filiere || '', c.matricule);
+      }
+      // Tuteur / parent renseigné à l'auto-inscription : compte parent créé ou lié maintenant
+      // que l'inscription est validée (non bloquant).
+      if (c.tel_parent && c.etudiant_id) {
+        // nom_parent = « NOM Prénom(s) » → premier mot = nom, le reste = prénoms
+        const mots = String(c.nom_parent || '').trim().split(/\s+/);
+        await creerOuLierParent(
+          pool,
+          { nomParent: mots[0] || '', prenomParent: mots.slice(1).join(' ') || null, telParent: c.tel_parent, emailParent: c.email_parent },
+          c.etudiant_id
+        );
       }
       envoyerNotificationAuto(
         c.id, 'Inscription validée',
@@ -1241,6 +1275,7 @@ const reinitialiserMotDePasseEtudiant = async (req, res) => {
 };
 
 module.exports = {
+  creerOuLierParent,
   reinitialiserMotDePasseEtudiant,
   modifierEtudiant,
   uploaderPhotoEtudiant,

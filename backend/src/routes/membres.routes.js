@@ -18,6 +18,7 @@ router.post('/', membresController.createMembre);
 router.patch('/:id/permissions', membresController.updatePermissions);
 router.patch('/:id/statut', membresController.changerStatutMembre);
 router.put('/:id', membresController.updateMembre);
+router.post('/:id/renvoyer-invitation', membresController.renvoyerInvitation);
 router.post('/:id/reinitialiser-mdp', membresController.reinitialiserMotDePasse);
 router.delete('/:id', membresController.deleteMembre);
 

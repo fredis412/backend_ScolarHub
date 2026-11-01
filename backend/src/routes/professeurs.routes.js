@@ -12,6 +12,7 @@ router.get('/lookup', ctrl.lookupProfesseur);
 router.get('/',    authMiddleware, requireRole('admin'), ctrl.getAllProfesseurs);
 router.post('/',   authMiddleware, requireRole('admin'), ctrl.createProfesseur);
 router.put('/:id', authMiddleware, requireRole('admin'), ctrl.updateProfesseur);
+router.post('/:id/renvoyer-invitation', authMiddleware, requireRole('admin'), ctrl.renvoyerInvitation);
 router.delete('/:id', authMiddleware, requireRole('admin'), ctrl.deleteProfesseur);
 
 // ── Routes professeur connecté ────────────────────────────────────────────────

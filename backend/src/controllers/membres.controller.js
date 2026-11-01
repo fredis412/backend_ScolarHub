@@ -2,6 +2,7 @@ const pool = require('../config/db');
 const supabase = require('../config/supabase');
 const bcrypt = require('bcryptjs');
 const { messageConflitUnique } = require('../utils/erreursSql');
+const { inviterMembre, compteActive } = require('../services/compte.notify');
 
 // ── Multi-établissement ─────────────────────────────────────────────────────
 // req.etablissementId vient du jeton ; s'il est absent (anciens jetons), pas de filtre.
@@ -293,9 +294,13 @@ const createMembre = async (req, res) => {
       await pool.query('UPDATE administrateurs SET domaine_admin = $1 WHERE user_id = $2', [domaineFinal, createdUser.id]);
     } catch (_) { /* colonne absente : le domaine reste lu depuis permissions.domaine */ }
 
+    // Mail de bienvenue (rôle, autorisations, connexion) — best-effort, ne bloque jamais la création.
+    const invitation = await inviterMembre(createdUser.id);
+
     return res.status(201).json({
       success: true,
       message: 'Administrateur créé avec succès en base de données.',
+      invitation,
       data: {
         id: createdUser.id,
         nom: createdUser.nom,
@@ -373,7 +378,9 @@ const updateMembre = async (req, res) => {
     }
 
     const emailFinal = email ? String(email).trim().toLowerCase() : undefined;
+    let emailAvant = null;
     if (emailFinal) {
+      emailAvant = (await pool.query('SELECT LOWER(email) AS e FROM users WHERE id = $1', [id])).rows[0]?.e || null;
       const dup = await pool.query('SELECT id FROM users WHERE LOWER(email) = $1 AND id <> $2', [emailFinal, id]);
       if (dup.rows.length > 0) {
         return res.status(409).json({ success: false, message: 'Cet email est déjà utilisé par un autre compte.' });
@@ -438,12 +445,37 @@ const updateMembre = async (req, res) => {
       console.warn('[updateMembre] miroir administrateurs:', admErr.message);
     }
 
-    return res.status(200).json({ success: true, message: 'Membre mis à jour.' });
+    // Email corrigé avant la première connexion : on renvoie le mail de bienvenue à la nouvelle adresse.
+    let invitation;
+    if (emailFinal && emailFinal !== emailAvant && !(await compteActive(id))) {
+      invitation = await inviterMembre(id);
+    }
+
+    return res.status(200).json({ success: true, message: 'Membre mis à jour.', ...(invitation ? { invitation } : {}) });
   } catch (err) {
     console.error('updateMembre error:', err);
     const doublon = messageConflitUnique(err);
     if (doublon) return res.status(409).json({ success: false, message: doublon });
     return res.status(500).json({ success: false, message: 'Erreur serveur lors de la modification.' });
+  }
+};
+
+// ── POST /api/membres/:id/renvoyer-invitation — renvoie le mail de bienvenue ─
+const renvoyerInvitation = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!(await membreDeMonEtab(id, req.etablissementId))) {
+      return res.status(404).json({ success: false, message: 'Membre introuvable.' });
+    }
+    const r = await inviterMembre(id);
+    if (!r.envoye) {
+      const code = r.raison === 'aucun_email' ? 409 : (r.raison === 'introuvable' ? 404 : 502);
+      return res.status(code).json({ success: false, message: r.error || "L'envoi du mail a échoué." });
+    }
+    return res.json({ success: true, message: 'Mail envoyé.' });
+  } catch (err) {
+    console.error('renvoyerInvitation membre:', err);
+    return res.status(500).json({ success: false, message: "Erreur lors de l'envoi du mail." });
   }
 };
 
@@ -543,6 +575,7 @@ module.exports = {
   getMesPermissions,
   updatePermissions,
   updateMembre,
+  renvoyerInvitation,
   changerStatutMembre,
   deleteMembre,
 };

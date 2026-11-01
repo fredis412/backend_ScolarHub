@@ -2,6 +2,7 @@ const db = require('../config/db');
 const bcrypt = require('bcryptjs');
 const { getOrCreateCanalProfDelegue } = require('../utils/canauxProfDelegue');
 const { messageConflitUnique } = require('../utils/erreursSql');
+const { inviterProfesseur, compteActive } = require('../services/compte.notify');
 
 // ── Multi-établissement ─────────────────────────────────────────────────────
 // req.etablissementId vient du jeton ; s'il est absent (anciens jetons), pas de filtre.
@@ -226,9 +227,13 @@ exports.createProfesseur = async (req, res) => {
     // 4. Champs d'identité / complémentaires (p35)
     await enregistrerChampsProf(client, user.id, req.body);
 
+    // Mail de bienvenue (filières + niveaux assignés) — après enregistrement des affectations.
+    const invitation = user.email ? await inviterProfesseur(user.id) : { envoye: false, raison: 'aucun_email' };
+
     res.status(201).json({
       message: 'Professeur créé avec succès. Il pourra se connecter avec son nom, prénom et numéro de téléphone.',
       professeur: user,
+      invitation,
     });
   } catch (err) {
     console.error('createProfesseur:', err.message);
@@ -251,6 +256,8 @@ exports.updateProfesseur = async (req, res) => {
     if (!(await profDeMonEtab(id, req.etablissementId))) {
       return res.status(404).json({ error: 'Professeur non trouvé.' });
     }
+
+    const emailAvant = (await client.query('SELECT LOWER(email) AS e FROM users WHERE id = $1', [id])).rows[0]?.e || null;
 
     await client.query(
       `UPDATE users SET nom=COALESCE($1,nom), prenoms=COALESCE($2,prenoms),
@@ -275,7 +282,14 @@ exports.updateProfesseur = async (req, res) => {
       return res.status(404).json({ error: 'Professeur non trouvé.' });
     }
 
-    res.json(result.rows[0]);
+    // Email corrigé / ajouté avant la première connexion : on envoie le mail de bienvenue.
+    const nouveau = result.rows[0];
+    let invitation;
+    if (email && nouveau.email && String(nouveau.email).toLowerCase() !== emailAvant && !(await compteActive(id))) {
+      invitation = await inviterProfesseur(id);
+    }
+
+    res.json(invitation ? { ...nouveau, invitation } : nouveau);
   } catch (err) {
     console.error('updateProfesseur:', err.message);
     const doublon = messageConflitUnique(err);
@@ -298,6 +312,24 @@ exports.uploaderPhotoProfesseur = async (req, res) => {
   } catch (err) {
     console.error('[uploaderPhotoProfesseur]', err);
     res.status(500).json({ success: false, message: "Erreur lors de l'enregistrement de la photo." });
+  }
+};
+
+// ── POST /api/professeurs/:id/renvoyer-invitation — renvoie le mail de bienvenue ──
+exports.renvoyerInvitation = async (req, res) => {
+  try {
+    if (!(await profDeMonEtab(req.params.id, req.etablissementId))) {
+      return res.status(404).json({ success: false, message: 'Professeur introuvable.' });
+    }
+    const r = await inviterProfesseur(req.params.id);
+    if (!r.envoye) {
+      const code = r.raison === 'aucun_email' ? 409 : (r.raison === 'introuvable' ? 404 : 502);
+      return res.status(code).json({ success: false, message: r.error || "L'envoi du mail a échoué." });
+    }
+    res.json({ success: true, message: 'Mail envoyé.' });
+  } catch (err) {
+    console.error('[renvoyerInvitation prof]', err);
+    res.status(500).json({ success: false, message: "Erreur lors de l'envoi du mail." });
   }
 };
 

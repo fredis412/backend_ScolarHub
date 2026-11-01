@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const { getOrCreateCanalProfDelegue } = require('../utils/canauxProfDelegue');
 const { messageConflitUnique } = require('../utils/erreursSql');
 const { inviterProfesseur, compteActive } = require('../services/compte.notify');
+const { parseSemestre, niveauCompatible, niveauDuSemestre } = require('../utils/semestres');
 
 // ── Multi-établissement ─────────────────────────────────────────────────────
 // req.etablissementId vient du jeton ; s'il est absent (anciens jetons), pas de filtre.
@@ -46,7 +47,7 @@ exports.getAllProfesseurs = async (req, res) => {
                         json_build_object('affectation_id', pm.id, 'module_id', m.id, 'module_nom', m.nom,
                                           'filiere_id', pm.filiere_id, 'filiere_nom', f2.nom,
                                           'abreviation', f2.abreviation, 'niveau', pm.niveau,
-                                          'semestre', pm.semestre)
+                                          'semestre', COALESCE(m.semestre, pm.semestre))
                         ORDER BY f2.nom, pm.niveau, pm.semestre, m.nom), '[]')
                  FROM professeur_modules pm
                  JOIN modules m ON m.id = pm.module_id
@@ -459,7 +460,8 @@ exports.getModules = async (req, res) => {
   try {
     const result = await db.query(
       `SELECT pm.id AS affectation_id, m.id, m.nom, m.coefficient, m.volume_horaire,
-              m.filiere_id, m.filiere_nom, pm.niveau, pm.semestre
+              m.filiere_id, m.filiere_nom, pm.niveau,
+              COALESCE(m.semestre, pm.semestre) AS semestre, (m.semestre IS NOT NULL) AS semestre_defini
        FROM professeur_modules pm
        JOIN modules m ON m.id = pm.module_id
        WHERE pm.professeur_id = $1
@@ -479,7 +481,8 @@ exports.getModulesByProfesseur = async (req, res) => {
     }
     const result = await db.query(
       `SELECT pm.id AS affectation_id, m.id, m.nom, m.coefficient, m.volume_horaire,
-              m.filiere_id, m.filiere_nom, pm.niveau, pm.semestre
+              m.filiere_id, m.filiere_nom, pm.niveau,
+              COALESCE(m.semestre, pm.semestre) AS semestre, (m.semestre IS NOT NULL) AS semestre_defini
        FROM professeur_modules pm
        JOIN modules m ON m.id = pm.module_id
        WHERE pm.professeur_id = $1
@@ -628,14 +631,16 @@ exports.patchModuleAssignment = async (req, res) => {
 };
 
 // ── POST /api/professeurs/:id/modules ─────────────────────────────────────────
-// Affecte un module précis à un prof, pour un niveau et un semestre donnés.
-// body: { module_id, filiere_id, niveau, semestre }
+// Affecte un module précis à un prof, pour un niveau donné. Le SEMESTRE est celui du module
+// (défini par l'administration) : le `semestre` éventuellement envoyé n'est utilisé que pour
+// les anciens modules qui n'ont pas encore de semestre.
+// body: { module_id, filiere_id, niveau, semestre? }
 exports.assignerModule = async (req, res) => {
   const { id: professeurId } = req.params;
   const { module_id, filiere_id, niveau, semestre } = req.body;
 
-  if (!module_id || !filiere_id || !niveau || !semestre) {
-    return res.status(400).json({ success: false, message: 'module_id, filiere_id, niveau et semestre sont requis.' });
+  if (!module_id || !filiere_id || !niveau) {
+    return res.status(400).json({ success: false, message: 'module_id, filiere_id et niveau sont requis.' });
   }
 
   try {
@@ -643,12 +648,31 @@ exports.assignerModule = async (req, res) => {
         !(await filiereDeMonEtab(filiere_id, req.etablissementId))) {
       return res.status(404).json({ success: false, message: 'Professeur ou filière introuvable.' });
     }
+    const mod = await db.query('SELECT nom, semestre FROM modules WHERE id = $1', [module_id]);
+    if (!mod.rows[0]) {
+      return res.status(404).json({ success: false, message: 'Module introuvable.' });
+    }
+    // Semestre du module (source de vérité) ; à défaut (ancien module), celui envoyé.
+    let sem = parseSemestre(mod.rows[0].semestre);
+    if (sem === null) sem = parseSemestre(semestre);
+    if (sem === null) {
+      return res.status(400).json({
+        success: false,
+        message: `Le module « ${mod.rows[0].nom} » n'a pas encore de semestre : définissez-le d'abord dans Filières.`,
+      });
+    }
+    if (!niveauCompatible(niveau, sem)) {
+      return res.status(400).json({
+        success: false,
+        message: `Le module « ${mod.rows[0].nom} » est au semestre S${sem} (${niveauDuSemestre(sem)}) : il ne peut pas être affecté en ${niveau}.`,
+      });
+    }
     const result = await db.query(
       `INSERT INTO professeur_modules (professeur_id, module_id, filiere_id, niveau, semestre)
        VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (professeur_id, module_id, niveau) DO UPDATE SET semestre = EXCLUDED.semestre
        RETURNING id, professeur_id, module_id, filiere_id, niveau, semestre, created_at`,
-      [professeurId, module_id, filiere_id, niveau, semestre]
+      [professeurId, module_id, filiere_id, niveau, sem]
     );
 
     // Crée (ou récupère) le sous-fil "Professeurs & Délégués" pour ce trio

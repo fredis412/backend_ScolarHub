@@ -1,6 +1,7 @@
 const PDFDocument = require('pdfkit');
 const pool = require('../config/db');
 const { envoyerNotificationAuto } = require('./notifications.controller');
+const { parseSemestre, niveauCompatible, niveauDuSemestre } = require('../utils/semestres');
 
 // ── Multi-établissement ─────────────────────────────────────────────────────
 // req.etablissementId vient du jeton (auth.middleware). S'il est absent (anciens
@@ -174,12 +175,36 @@ const createGradeSession = async (req, res) => {
         if (!filiere_id || !module_id) {
             return res.status(400).json({ success: false, message: 'filiere_id et module_id sont requis.' });
         }
-        if (!semestre || !annee_academique) {
-            return res.status(400).json({ success: false, message: 'semestre et annee_academique sont requis.' });
+        if (!annee_academique) {
+            return res.status(400).json({ success: false, message: 'annee_academique est requise.' });
         }
 
         if (!(await filiereDeMonEtab(filiere_id, req.etablissementId))) {
             return res.status(403).json({ success: false, message: 'Filière inconnue pour votre établissement.' });
+        }
+
+        // Le semestre est celui du MODULE (défini par l'administration) : celui envoyé par
+        // l'application est ignoré, pour qu'un professeur ne puisse pas se tromper de semestre.
+        const modRes = await pool.query('SELECT nom, semestre FROM modules WHERE id = $1', [module_id]);
+        if (!modRes.rows[0]) {
+            return res.status(404).json({ success: false, message: 'Module introuvable.' });
+        }
+        const semModule = parseSemestre(modRes.rows[0].semestre);
+        let semestreFinal;
+        if (semModule !== null) {
+            if (!niveauCompatible(niveau, semModule)) {
+                return res.status(400).json({
+                    success: false,
+                    message: `Le module « ${modRes.rows[0].nom} » est au semestre S${semModule} (${niveauDuSemestre(semModule)}) : il ne peut pas recevoir de notes pour ${niveau}.`,
+                });
+            }
+            semestreFinal = `S${semModule}`;
+        } else {
+            // Ancien module sans semestre défini : on garde le semestre envoyé (comportement historique).
+            if (!semestre) {
+                return res.status(400).json({ success: false, message: "Ce module n'a pas encore de semestre : demandez à l'administration de le définir." });
+            }
+            semestreFinal = semestre;
         }
 
         // ✅ La mention (Très Bien/Bien/Assez Bien/Passable/Insuffisant) est
@@ -190,7 +215,7 @@ const createGradeSession = async (req, res) => {
         const sessionResult = await pool.query(`
             INSERT INTO sessions_notes (filiere_id, filiere_nom, niveau, module_id, professeur_id, statut, is_sent, semestre, annee_academique)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id
-        `, [filiere_id, filiere_nom || '', niveau || 'Tous', module_id, professeur_id, statutFinal, statutFinal === 'validee', semestre, annee_academique]);
+        `, [filiere_id, filiere_nom || '', niveau || 'Tous', module_id, professeur_id, statutFinal, statutFinal === 'validee', semestreFinal, annee_academique]);
 
         const session_id = sessionResult.rows[0].id;
         const skippedStudents = [];
@@ -215,7 +240,7 @@ const createGradeSession = async (req, res) => {
             }
         }
 
-        const response = { success: true, message: 'Session de notes créée avec succès', session_id };
+        const response = { success: true, message: 'Session de notes créée avec succès', session_id, semestre: semestreFinal };
         if (skippedStudents.length > 0) {
             response.warnings = skippedStudents;
             response.message = `Session créée avec ${skippedStudents.length} note(s) non enregistrée(s).`;
@@ -576,19 +601,25 @@ const getMonApercu = async (req, res) => {
 // ordre chronologique des sessions validées — pas de titre de session requis.
 const getListeClasseAvecNotes = async (req, res) => {
     try {
-        const { filiere_id, niveau, module_id, semestre, annee_academique } = req.query;
-        if (!filiere_id || !niveau || !module_id || !semestre || !annee_academique) {
+        const { filiere_id, niveau, module_id, annee_academique } = req.query;
+        if (!filiere_id || !niveau || !module_id || !annee_academique) {
             return res.status(400).json({
                 success: false,
-                message: 'filiere_id, niveau, module_id, semestre et annee_academique sont requis.',
+                message: 'filiere_id, niveau, module_id et annee_academique sont requis.',
             });
         }
 
-        const moduleRes = await pool.query('SELECT nom, coefficient FROM modules WHERE id = $1', [module_id]);
+        const moduleRes = await pool.query('SELECT nom, coefficient, semestre FROM modules WHERE id = $1', [module_id]);
         if (moduleRes.rows.length === 0) {
             return res.status(404).json({ success: false, message: 'Module introuvable.' });
         }
         const module = moduleRes.rows[0];
+        // Semestre du module (source de vérité) ; à défaut, celui de la requête.
+        const semModule = parseSemestre(module.semestre);
+        const semestre = semModule !== null ? `S${semModule}` : req.query.semestre;
+        if (!semestre) {
+            return res.status(400).json({ success: false, message: "Ce module n'a pas encore de semestre." });
+        }
 
         const pSes = [module_id, semestre, annee_academique];
         const sessionsRes = await pool.query(

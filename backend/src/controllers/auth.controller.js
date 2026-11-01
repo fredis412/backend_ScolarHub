@@ -1012,6 +1012,17 @@ const forgotPassword = async (req, res) => {
       'ScolarHub - Réinitialisation de mot de passe',
       {
         etablissementId: etab.id,
+        modele: {
+          titre: 'Réinitialisation du mot de passe',
+          sousTitre: 'Code de sécurité à usage temporaire',
+          salutation: `Bonjour ${user.nom},`,
+          preheader: 'Votre code de réinitialisation ScolarHub',
+          blocs: [
+            { type: 'p', texte: 'Vous avez demandé à réinitialiser votre mot de passe ScolarHub. Saisissez le code ci-dessous dans l\'application.' },
+            { type: 'code', label: 'Code de réinitialisation', valeur: resetCode },
+            { type: 'note', ton: 'alerte', texte: 'Ce code expire dans 15 minutes. Ne le communiquez à personne. Si vous n\'êtes pas à l\'origine de cette demande, ignorez ce message : votre mot de passe reste inchangé.' },
+          ],
+        },
         text: `Bonjour ${user.nom},\n\nVotre code de réinitialisation est : ${resetCode}\n\nCe code expire dans 15 minutes. Si vous n'êtes pas à l'origine de cette demande, ignorez ce message.\n\nL'équipe ScolarHub`,
       }
     );

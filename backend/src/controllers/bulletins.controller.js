@@ -60,10 +60,18 @@ const _calculerMoyennesModules = async (filiere_id, niveau, semestre, annee_acad
     `, [filiere_id, semestre, annee_academique]);
     const modules = modulesRes.rows;
 
-    const etudiantsRes = await pool.query(
+    let etudiantsRes = await pool.query(
+    `SELECT e.id, e.matricule, e.nom, e.prenoms FROM etudiants e
+     JOIN inscriptions_annuelles ia ON ia.etudiant_id = e.id AND ia.annee_academique = $3
+     WHERE ia.filiere_id = $1 AND ia.niveau = $2 ORDER BY e.nom, e.prenoms`,
+    [filiere_id, niveau, annee_academique]
+);
+if (etudiantsRes.rows.length === 0) {
+    etudiantsRes = await pool.query(
         `SELECT id, matricule, nom, prenoms FROM etudiants WHERE filiere_id = $1 AND niveau = $2 ORDER BY nom, prenoms`,
         [filiere_id, niveau]
     );
+}
 
     if (modules.length === 0) {
         return { modules: [], etudiants: etudiantsRes.rows.map(e => ({ ...e, modules: [] })) };

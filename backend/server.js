@@ -56,7 +56,6 @@ app.use('/api/evenements',    require('./src/routes/evenements.routes'));
 app.use('/api/edt',           require('./src/routes/edt.routes'));
 app.use('/api/calendrier',    require('./src/routes/calendrier.routes'));
 app.use('/api/upload',        require('./src/routes/upload.routes'));
-app.use('/api/upload',        require('./src/routes/upload.routes'));
 app.use('/api/cours',         require('./src/routes/cours.routes'));
 app.use('/api/ia',            require('./src/routes/ia.routes'));
 app.use('/api/statistiques',  require('./src/routes/statistiques.routes'));
@@ -70,6 +69,7 @@ app.use('/api/cantine', require('./src/routes/cantine.routes'));
 app.use('/api/gifs', require('./src/routes/gifs.routes'));
 app.use('/api/profil-public', require('./src/routes/profilPublic.routes'));
 app.use('/api/plateforme', require('./src/routes/plateforme.routes'));
+app.use('/api/annees',        require('./src/routes/annees.routes'));
  
 app.get('/', (req, res) => res.json({ message: 'ScolarHub API — IST Ouaga 2000', status: 'OK' }));
  

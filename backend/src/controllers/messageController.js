@@ -35,10 +35,19 @@ const TYPES_ACCES_RESTREINT = ['prof_delegue_niveau'];
 // req.etablissementId vient du jeton ; absent (anciens jetons) = pas de filtre.
 // Un canal appartient à un établissement (canaux.etablissement_id) ; les
 // messages suivent leur canal ; les groupes filière suivent filieres.etablissement_id.
+// ⚡ Cache mémoire : l'appartenance d'une filière à un établissement ne change
+// quasiment jamais — inutile de refaire cette requête à chaque ouverture de
+// discussion (chaque requête SQL coûte un aller-retour vers Supabase).
+const _filiereEtabCache = new Map(); // "filiereId:etabId" -> expiration (ms)
+const TTL_FILIERE_ETAB = 10 * 60 * 1000;
 async function filiereDeMonEtab(filiereId, etabId) {
   if (!etabId) return true;
   if (filiereId === undefined || filiereId === null || filiereId === '') return false;
+  const cle = `${filiereId}:${etabId}`;
+  const exp = _filiereEtabCache.get(cle);
+  if (exp && exp > Date.now()) return true;
   const r = await pool.query('SELECT 1 FROM filieres WHERE id = $1 AND etablissement_id = $2', [filiereId, etabId]);
+  if (r.rows.length > 0) _filiereEtabCache.set(cle, Date.now() + TTL_FILIERE_ETAB);
   return r.rows.length > 0;
 }
 async function userDeMonEtab(userId, etabId) {
@@ -55,16 +64,25 @@ const ROLES_STAFF = ['admin', 'professeur', 'prof', 'enseignant', 'teacher'];
 const estStaff = (req) => ROLES_STAFF.includes(String(req.user.role || '').toLowerCase().trim());
 const roomGroupe = (filiereId, niveau) => `filiere:${filiereId}:${niveau}`;
 
+// ⚡ Cache court du niveau d'un étudiant dans une filière (60 s) : évite une
+// requête SQL à chaque appel. Le niveau ne change qu'à la réinscription.
+const _niveauEtudiantCache = new Map(); // "userId:filiereId" -> { niveau, exp }
+const TTL_NIVEAU_ETUDIANT = 60 * 1000;
+
 // → { ok, staff, niveau } : niveau = celui de l'étudiant, ou celui demandé (staff, peut être null).
 async function accesGroupe(req, filiereId, niveauDemande) {
   if (!(await filiereDeMonEtab(filiereId, req.etablissementId))) return { ok: false };
   if (estStaff(req)) return { ok: true, staff: true, niveau: niveauDemande || null };
+  const cleNiveau = `${req.user.id}:${filiereId}`;
+  const enCache = _niveauEtudiantCache.get(cleNiveau);
+  if (enCache && enCache.exp > Date.now()) return { ok: true, staff: false, niveau: enCache.niveau };
   const r = await pool.query(
     `SELECT niveau FROM etudiants
      WHERE user_id = $1 AND filiere_id = $2 AND COALESCE(niveau, '') <> '' LIMIT 1`,
     [req.user.id, filiereId]
   );
   if (!r.rows.length) return { ok: false };
+  _niveauEtudiantCache.set(cleNiveau, { niveau: r.rows[0].niveau, exp: Date.now() + TTL_NIVEAU_ETUDIANT });
   return { ok: true, staff: false, niveau: r.rows[0].niveau };
 }
 

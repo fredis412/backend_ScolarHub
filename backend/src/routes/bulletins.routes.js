@@ -2,10 +2,11 @@ const express = require('express');
 const router = express.Router();
 const bulletinsController = require('../controllers/bulletins.controller');
 const { authMiddleware, requireRole } = require('../middleware/auth.middleware');
+const { exigerAnneeOuverte } = require('../middleware/anneeOuverte');
 
 // ── Admin : préparation et publication des bulletins ────────────────────────
 router.get('/preparation', authMiddleware, requireRole('admin'), bulletinsController.getPreparationBulletin);
-router.post('/publier', authMiddleware, requireRole('admin'), bulletinsController.publierBulletins);
+router.post('/publier', authMiddleware, requireRole('admin'), exigerAnneeOuverte(), bulletinsController.publierBulletins);
 
 // ── Admin : règles de validation du semestre (général ou par UE) ────────────
 router.get('/regles', authMiddleware, requireRole('admin'), bulletinsController.getRegles);

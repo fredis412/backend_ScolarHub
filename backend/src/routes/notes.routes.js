@@ -3,6 +3,7 @@ const router = express.Router();
 const notesController = require('../controllers/notes.controller');
 const { authMiddleware, requireRole } = require('../middleware/auth.middleware');
 const gestion = require('../controllers/notesGestion.controller');
+const { exigerAnneeOuverte, anneeDeLaSession } = require('../middleware/anneeOuverte');
 
 // Notes de l'étudiant connecté
 router.get('/etudiant', authMiddleware, notesController.getNotesEtudiant);
@@ -32,16 +33,16 @@ router.get('/moyennes-provisoires/apercu', authMiddleware, requireRole('admin'),
 router.post('/moyennes-provisoires/publier', authMiddleware, requireRole('admin'), gestion.publierMoyennesProvisoires);
 router.get('/moyennes-provisoires/mes', authMiddleware, gestion.mesMoyennesProvisoires);
 
-router.patch('/sessions/:session_id/valider', authMiddleware, requireRole('admin'), notesController.validateSessionAdmin);
+router.patch('/sessions/:session_id/valider', authMiddleware, requireRole('admin'), exigerAnneeOuverte(anneeDeLaSession), notesController.validateSessionAdmin);
 router.patch('/sessions/:session_id/rejeter', authMiddleware, requireRole('admin'), notesController.rejectSessionAdmin);
 
 // Sessions de notes — vue professeur/admin (création directe)
-router.post('/sessions', authMiddleware, notesController.createGradeSession);
+router.post('/sessions', authMiddleware, exigerAnneeOuverte(), notesController.createGradeSession);
 router.get('/sessions', authMiddleware, notesController.getGradeSessions);
 router.get('/sessions/:session_id', authMiddleware, notesController.getSessionDetail);
 router.get('/liste-classe', authMiddleware, notesController.getListeClasseAvecNotes);
 router.get('/sessions/en-attente/count', authMiddleware, notesController.getNombreSessionsEnAttente);
-router.put('/sessions/:session_id', authMiddleware, notesController.updateGradeSession);
+router.put('/sessions/:session_id', authMiddleware, exigerAnneeOuverte(anneeDeLaSession), notesController.updateGradeSession);
 router.patch('/sessions/:session_id/send', authMiddleware, notesController.markSessionSent);
 
 module.exports = router;

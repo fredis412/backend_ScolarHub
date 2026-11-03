@@ -50,7 +50,7 @@ const appreciationSuggeree = (m) => {
 // étudiant de la filière+niveau, la liste de ses modules du semestre avec
 // notes (dans l'ordre chronologique des sessions) + moyenne simple du
 // module (sans coefficient).
-const _calculerMoyennesModules = async (filiere_id, niveau, semestre, annee_academique) => {
+const _calculerMoyennesModules = async (filiere_id, niveau, semestre, annee_academique, options = {}) => {
     const modulesRes = await pool.query(`
         SELECT DISTINCT m.id, m.nom, m.coefficient
         FROM modules m
@@ -60,18 +60,20 @@ const _calculerMoyennesModules = async (filiere_id, niveau, semestre, annee_acad
     `, [filiere_id, semestre, annee_academique]);
     const modules = modulesRes.rows;
 
+    // La classe est lue dans l'inscription de CETTE année (étape 1) ; à défaut (année sans
+    // inscriptions), on retombe sur la liste actuelle des étudiants.
     let etudiantsRes = await pool.query(
-    `SELECT e.id, e.matricule, e.nom, e.prenoms FROM etudiants e
-     JOIN inscriptions_annuelles ia ON ia.etudiant_id = e.id AND ia.annee_academique = $3
-     WHERE ia.filiere_id = $1 AND ia.niveau = $2 ORDER BY e.nom, e.prenoms`,
-    [filiere_id, niveau, annee_academique]
-);
-if (etudiantsRes.rows.length === 0) {
-    etudiantsRes = await pool.query(
-        `SELECT id, matricule, nom, prenoms FROM etudiants WHERE filiere_id = $1 AND niveau = $2 ORDER BY nom, prenoms`,
-        [filiere_id, niveau]
+        `SELECT e.id, e.matricule, e.nom, e.prenoms FROM etudiants e
+         JOIN inscriptions_annuelles ia ON ia.etudiant_id = e.id AND ia.annee_academique = $3
+         WHERE ia.filiere_id = $1 AND ia.niveau = $2 ORDER BY e.nom, e.prenoms`,
+        [filiere_id, niveau, annee_academique]
     );
-}
+    if (etudiantsRes.rows.length === 0) {
+        etudiantsRes = await pool.query(
+            `SELECT id, matricule, nom, prenoms FROM etudiants WHERE filiere_id = $1 AND niveau = $2 ORDER BY nom, prenoms`,
+            [filiere_id, niveau]
+        );
+    }
 
     if (modules.length === 0) {
         return { modules: [], etudiants: etudiantsRes.rows.map(e => ({ ...e, modules: [] })) };
@@ -120,6 +122,38 @@ if (etudiantsRes.rows.length === 0) {
         });
         return { etudiant_id: e.id, matricule: e.matricule, nom: e.nom, prenoms: e.prenoms, modules: modulesEtudiant };
     });
+
+    // ── Après rattrapage : la note de rattrapage d'un module remplace la moyenne normale
+    // (règle « remplace »), ou on garde la meilleure des deux (règle « meilleure »).
+    if (options.rattrapage) {
+        let regle = 'remplace';
+        try {
+            const rr = await pool.query(
+                `SELECT a.regle_rattrapage FROM annees_academiques a
+                 JOIN filieres f ON f.etablissement_id = a.etablissement_id
+                 WHERE f.id = $1 AND a.libelle = $2 LIMIT 1`, [filiere_id, annee_academique]);
+            if (rr.rows[0]?.regle_rattrapage) regle = rr.rows[0].regle_rattrapage;
+        } catch (err) { console.error('[_calculerMoyennesModules] règle rattrapage', err.message); }
+
+        const rat = await pool.query(
+            `SELECT n.etudiant_id, s.module_id, n.valeur
+             FROM notes_rattrapage n JOIN sessions_rattrapage s ON s.id = n.session_id
+             WHERE s.statut = 'validee' AND s.filiere_id = $1 AND s.niveau = $2
+               AND s.semestre = $3 AND s.annee_academique = $4`,
+            [filiere_id, niveau, semestre, annee_academique]);
+        const parEtuModule = {};
+        for (const r of rat.rows) parEtuModule[`${r.etudiant_id}|${r.module_id}`] = parseFloat(r.valeur);
+
+        for (const e of etudiants) {
+            e.modules = e.modules.map(m => {
+                const r = parEtuModule[`${e.etudiant_id}|${m.module_id}`];
+                if (r === undefined) return m;
+                const normale = m.moyenne_module;
+                const finale = regle === 'meilleure' && normale !== null ? Math.max(normale, r) : r;
+                return { ...m, moyenne_normale: normale, note_rattrapage: r, moyenne_module: Math.round(finale * 100) / 100 };
+            });
+        }
+    }
 
     return { modules, etudiants };
 };
@@ -262,12 +296,27 @@ const getPreparationBulletin = async (req, res) => {
             return res.status(404).json(REFUS_FILIERE);
         }
 
-        const { modules: modulesListe, etudiants: etudiantsModules } = await _calculerMoyennesModules(filiere_id, niveau, semestre, annee_academique);
+        const sessionType = req.query.session === 'rattrapage' ? 'rattrapage' : 'normale';
+        const { modules: modulesListe, etudiants: tousEtudiants } = await _calculerMoyennesModules(
+            filiere_id, niveau, semestre, annee_academique, { rattrapage: sessionType === 'rattrapage' });
         const regle = await _chargerRegle(filiere_id, niveau, semestre);
 
+        // Rattrapage : seuls les étudiants dont le bulletin normal publié n'est pas « valide ».
+        const moyenneNormale = {};
+        let etudiantsModules = tousEtudiants;
+        if (sessionType === 'rattrapage') {
+            const elig = await pool.query(
+                `SELECT etudiant_id, moyenne_generale FROM bulletins
+                 WHERE filiere_id = $1 AND niveau = $2 AND semestre = $3 AND annee_academique = $4
+                   AND session_type = 'normale' AND publie = true AND statut <> 'valide'`,
+                [filiere_id, niveau, semestre, annee_academique]);
+            for (const r of elig.rows) moyenneNormale[r.etudiant_id] = r.moyenne_generale;
+            etudiantsModules = tousEtudiants.filter(e => moyenneNormale[e.etudiant_id] !== undefined);
+        }
+
         const bulletinsRes = await pool.query(
-            `SELECT etudiant_id, id, statut, publie, date_publication, appreciation, moyenne_generale FROM bulletins WHERE semestre = $1 AND annee_academique = $2`,
-            [semestre, annee_academique]
+            `SELECT etudiant_id, id, statut, publie, date_publication, appreciation, moyenne_generale FROM bulletins WHERE semestre = $1 AND annee_academique = $2 AND session_type = $3`,
+            [semestre, annee_academique, sessionType]
         );
 
         // Scolarité à régulariser : au moins un frais actif, échu et non payé.
@@ -319,6 +368,9 @@ const getPreparationBulletin = async (req, res) => {
                 moyenne_publiee: b?.moyenne_generale ?? null,
                 scolarite_a_regulariser: scolariteImpayee.has(String(e.etudiant_id)),
                 detail_modules: e.modules,
+                session_type: sessionType,
+                moyenne_normale_bulletin: moyenneNormale[e.etudiant_id] ?? null,
+                a_compose_rattrapage: e.modules.some(m => m.note_rattrapage !== undefined),
             };
         });
 
@@ -327,6 +379,7 @@ const getPreparationBulletin = async (req, res) => {
             data,
             modules: modulesListe.map(m => ({ id: m.id, nom: m.nom, coefficient: m.coefficient })),
             regle,
+            session_type: sessionType,
             modules_hors_ue: regle.mode === 'ue'
                 ? modulesListe.filter(m => !regle.ues.some(u => (u.module_ids || []).map(String).includes(String(m.id)))).map(m => m.nom)
                 : [],
@@ -346,6 +399,7 @@ const getPreparationBulletin = async (req, res) => {
 const publierBulletins = async (req, res) => {
     try {
         const { filiere_id, niveau, semestre, annee_academique, resultats } = req.body;
+        const sessionType = req.body.session_type === 'rattrapage' ? 'rattrapage' : 'normale';
         // publier=false → « Enregistrer sans publier » : gardé côté admin, invisible
         // aux étudiants, sans notification.
         const publier = req.body.publier !== false;
@@ -374,10 +428,22 @@ const publierBulletins = async (req, res) => {
             return res.status(404).json(REFUS_FILIERE);
         }
 
-        const { etudiants: etudiantsModules } = await _calculerMoyennesModules(filiere_id, niveau, semestre, annee_academique);
+        const { etudiants: etudiantsModules } = await _calculerMoyennesModules(
+            filiere_id, niveau, semestre, annee_academique, { rattrapage: sessionType === 'rattrapage' });
         const regle = await _chargerRegle(filiere_id, niveau, semestre);
         const modulesParEtudiant = {};
         for (const e of etudiantsModules) modulesParEtudiant[e.etudiant_id] = e.modules;
+
+        // Après rattrapage : seuls les étudiants dont le bulletin normal n'était pas « valide ».
+        let eligibles = null;
+        if (sessionType === 'rattrapage') {
+            const elig = await pool.query(
+                `SELECT etudiant_id FROM bulletins
+                 WHERE filiere_id = $1 AND niveau = $2 AND semestre = $3 AND annee_academique = $4
+                   AND session_type = 'normale' AND publie = true AND statut <> 'valide'`,
+                [filiere_id, niveau, semestre, annee_academique]);
+            eligibles = new Set(elig.rows.map(r => String(r.etudiant_id)));
+        }
 
         const publies = [];
         const echecs = [];
@@ -399,6 +465,10 @@ const publierBulletins = async (req, res) => {
                     echecs.push({ etudiant_id: r.etudiant_id, raison: 'Étudiant hors de cette classe.' });
                     continue;
                 }
+                if (eligibles && !eligibles.has(String(r.etudiant_id))) {
+                    echecs.push({ etudiant_id: r.etudiant_id, raison: 'Étudiant non concerné par le rattrapage.' });
+                    continue;
+                }
                 const modules = modulesParEtudiant[r.etudiant_id] || [];
                 const evaluation = _evaluer(modules, regle);
                 const moyenneCalculee = evaluation.moyenne;
@@ -411,10 +481,10 @@ const publierBulletins = async (req, res) => {
                 const upsert = await pool.query(`
                     INSERT INTO bulletins (
                         etudiant_id, filiere_id, niveau, semestre, annee_academique,
-                        moyenne_generale, statut, publie, admin_id, date_publication, detail_modules, appreciation, detail_ues
+                        moyenne_generale, statut, publie, admin_id, date_publication, detail_modules, appreciation, detail_ues, session_type
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, ${pubSql}, $8, ${publier ? 'now()' : 'NULL'}, $9, $10, $11)
-                    ON CONFLICT (etudiant_id, semestre, annee_academique)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, ${pubSql}, $8, ${publier ? 'now()' : 'NULL'}, $9, $10, $11, $12)
+                    ON CONFLICT (etudiant_id, semestre, annee_academique, session_type)
                     DO UPDATE SET
                         moyenne_generale = EXCLUDED.moyenne_generale,
                         statut = EXCLUDED.statut,
@@ -425,7 +495,7 @@ const publierBulletins = async (req, res) => {
                         appreciation = EXCLUDED.appreciation,
                         detail_ues = EXCLUDED.detail_ues
                     RETURNING id, etudiant_id, moyenne_generale, statut
-                `, [r.etudiant_id, filiere_id, niveau, semestre, annee_academique, moyenne, r.statut, admin_id, JSON.stringify(modules), appreciation, JSON.stringify(evaluation.ues)]);
+                `, [r.etudiant_id, filiere_id, niveau, semestre, annee_academique, moyenne, r.statut, admin_id, JSON.stringify(modules), appreciation, JSON.stringify(evaluation.ues), sessionType]);
 
                 if (upsert.rows[0]) {
                     publies.push(upsert.rows[0]);
@@ -434,7 +504,7 @@ const publierBulletins = async (req, res) => {
                         envoyerNotificationAuto(
                             destUserId,
                             'Bulletin publié',
-                            `Votre bulletin du ${semestre} (${annee_academique}) est disponible. Moyenne générale : ${moyenne ?? '--'}/20.`,
+                            `Votre bulletin${sessionType === 'rattrapage' ? ' après rattrapage' : ''} du ${semestre} (${annee_academique}) est disponible. Moyenne générale : ${moyenne ?? '--'}/20.`,
                             'bulletin',
                             { semestre, annee_academique }
                         ).catch(() => {});
@@ -477,10 +547,10 @@ const getMonBulletin = async (req, res) => {
         }
 
         const result = await pool.query(`
-            SELECT id, semestre, annee_academique, moyenne_generale, statut, appreciation, date_publication, detail_modules
+            SELECT id, semestre, annee_academique, moyenne_generale, statut, appreciation, date_publication, detail_modules, session_type
             FROM bulletins
             WHERE etudiant_id = $1 AND publie = true
-            ORDER BY annee_academique DESC, semestre DESC
+            ORDER BY annee_academique DESC, semestre DESC, session_type DESC
         `, [etudiant.id]);
 
         res.json({

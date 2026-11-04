@@ -5,6 +5,7 @@
 
 const express = require('express');
 const router  = express.Router();
+const { getNonLusCanaux, marquerCanalLu, marquerSectionVue } = require('../controllers/canauxNonLus.controller');
 const { authMiddleware: auth } = require('../middleware/auth.middleware');  // ← corrigé
 const {
   getCanaux,
@@ -52,6 +53,9 @@ router.post('/prives/read/:userId', marquerMessagesPrivesLus);
 
 // ── Gestion des membres de canaux ─────────────────────────
 router.post('/canaux/:id/membres', ajouterMembreCanal);
+router.get('/canaux/non-lus', getNonLusCanaux);
+router.post('/canaux/:id/lu', marquerCanalLu);
+router.post('/sections/:section/vu', marquerSectionVue);
 
 // ── Groupe filière ───────────────────────────────────────
 router.get('/groupe/mes-filieres', getProfFilieres);  // lister filières du prof

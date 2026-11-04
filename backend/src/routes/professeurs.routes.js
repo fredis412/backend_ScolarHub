@@ -11,9 +11,6 @@ router.get('/lookup', ctrl.lookupProfesseur);
 // ── Routes admin ──────────────────────────────────────────────────────────────
 router.get('/',    authMiddleware, requireRole('admin'), ctrl.getAllProfesseurs);
 router.post('/',   authMiddleware, requireRole('admin'), ctrl.createProfesseur);
-router.put('/:id', authMiddleware, requireRole('admin'), ctrl.updateProfesseur);
-router.post('/:id/renvoyer-invitation', authMiddleware, requireRole('admin'), ctrl.renvoyerInvitation);
-router.delete('/:id', authMiddleware, requireRole('admin'), ctrl.deleteProfesseur);
 
 // ── Routes professeur connecté ────────────────────────────────────────────────
 // IMPORTANT : les routes statiques (/profile, /classes, /modules, /disponibilites)
@@ -36,14 +33,22 @@ router.put('/disponibilites',     authMiddleware, ctrl.saveDisponibilites);
 // Assignation modules — ancien mécanisme (module_professeur, sans niveau)
 router.patch('/assign-module', authMiddleware, requireRole('admin'), ctrl.patchModuleAssignment);
 
+// Module terminé / rouvert par le professeur lui-même (avant les routes /:id)
+router.patch('/modules/:affectationId/termine', authMiddleware, ctrl.terminerMonModule);
+
 // Sous-fils "Professeurs & Délégués" du professeur connecté (étape 4 messagerie)
 router.get('/mes-canaux-coordination', authMiddleware, ctrl.getMesCanauxCoordination);
 
 // ── Routes paramétrées (en DERNIER pour ne pas capturer les routes statiques) ─
+// Modification / suppression admin — APRÈS les routes fixes (/disponibilites, /profile…)
+router.put('/:id', authMiddleware, requireRole('admin'), ctrl.updateProfesseur);
+router.delete('/:id', authMiddleware, requireRole('admin'), ctrl.deleteProfesseur);
 router.get('/:id',         authMiddleware, ctrl.getProfesseurById);
 router.get('/:id/modules', authMiddleware, ctrl.getModulesByProfesseur);
 
 // Affectation module précise (professeur_modules : module + niveau + semestre)
+router.patch('/:id/modules/:affectationId/termine', authMiddleware, requireRole('admin'), ctrl.terminerModuleAdmin);
+router.post('/:id/demander-disponibilites', authMiddleware, requireRole('admin'), ctrl.demanderDisponibilites);
 router.post('/:id/modules',                     authMiddleware, requireRole('admin'), ctrl.assignerModule);
 router.delete('/:id/modules/:affectationId',    authMiddleware, requireRole('admin'), ctrl.retirerModule);
 

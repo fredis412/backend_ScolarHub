@@ -3,7 +3,6 @@ const bcrypt = require('bcryptjs');
 const { getOrCreateCanalProfDelegue } = require('../utils/canauxProfDelegue');
 const { messageConflitUnique } = require('../utils/erreursSql');
 const { inviterProfesseur, compteActive } = require('../services/compte.notify');
-const { parseSemestre, niveauCompatible, niveauDuSemestre } = require('../utils/semestres');
 
 // ── Multi-établissement ─────────────────────────────────────────────────────
 // req.etablissementId vient du jeton ; s'il est absent (anciens jetons), pas de filtre.
@@ -33,7 +32,7 @@ exports.getAllProfesseurs = async (req, res) => {
     const pa = [];
     const fa = etabCol(pa, req.etablissementId, 'u.etablissement_id');
     const result = await db.query(
-      `SELECT u.id, u.nom, u.prenoms, u.email, u.tel, u.statut, u.domaine, u.photo_url,
+      `SELECT u.id, u.id AS user_id, u.nom, u.prenoms, u.email, u.tel, u.statut, u.domaine, u.photo_url,
               u.date_naissance, u.nationalite,
               p.sexe, p.lieu_naissance, p.grade, p.matricule, p.expertise, p.diplome, p.note,
               (SELECT COALESCE(json_agg(
@@ -47,7 +46,9 @@ exports.getAllProfesseurs = async (req, res) => {
                         json_build_object('affectation_id', pm.id, 'module_id', m.id, 'module_nom', m.nom,
                                           'filiere_id', pm.filiere_id, 'filiere_nom', f2.nom,
                                           'abreviation', f2.abreviation, 'niveau', pm.niveau,
-                                          'semestre', COALESCE(m.semestre, pm.semestre))
+                                          'semestre', pm.semestre,
+                                          'termine', COALESCE(pm.termine, false),
+                                          'demarre', COALESCE(pm.demarre, false))
                         ORDER BY f2.nom, pm.niveau, pm.semestre, m.nom), '[]')
                  FROM professeur_modules pm
                  JOIN modules m ON m.id = pm.module_id
@@ -460,8 +461,8 @@ exports.getModules = async (req, res) => {
   try {
     const result = await db.query(
       `SELECT pm.id AS affectation_id, m.id, m.nom, m.coefficient, m.volume_horaire,
-              m.filiere_id, m.filiere_nom, pm.niveau,
-              COALESCE(m.semestre, pm.semestre) AS semestre, (m.semestre IS NOT NULL) AS semestre_defini
+              m.filiere_id, m.filiere_nom, pm.niveau, pm.semestre,
+              COALESCE(pm.termine, false) AS termine, COALESCE(pm.demarre, false) AS demarre, pm.termine_le
        FROM professeur_modules pm
        JOIN modules m ON m.id = pm.module_id
        WHERE pm.professeur_id = $1
@@ -481,8 +482,8 @@ exports.getModulesByProfesseur = async (req, res) => {
     }
     const result = await db.query(
       `SELECT pm.id AS affectation_id, m.id, m.nom, m.coefficient, m.volume_horaire,
-              m.filiere_id, m.filiere_nom, pm.niveau,
-              COALESCE(m.semestre, pm.semestre) AS semestre, (m.semestre IS NOT NULL) AS semestre_defini
+              m.filiere_id, m.filiere_nom, pm.niveau, pm.semestre,
+              COALESCE(pm.termine, false) AS termine, COALESCE(pm.demarre, false) AS demarre, pm.termine_le
        FROM professeur_modules pm
        JOIN modules m ON m.id = pm.module_id
        WHERE pm.professeur_id = $1
@@ -581,10 +582,23 @@ exports.getStudentsByFilierePdf = async (req, res) => {
 // ── Disponibilités ────────────────────────────────────────────────────────────
 exports.getDisponibilites = async (req, res) => {
   try {
-    const r = await db.query('SELECT disponibilites FROM users WHERE id=$1', [req.user.id]);
+    const r = await db.query(
+      `SELECT disponibilites, disponibilites_maj, dispo_demandee_le,
+              EXISTS (SELECT 1 FROM professeur_modules pm
+                       WHERE pm.professeur_id = users.id
+                         AND COALESCE(pm.demarre, false) = true
+                         AND COALESCE(pm.termine, false) = false) AS actif
+         FROM users WHERE id=$1`, [req.user.id]);
     // Retourne { success, data } cohérent avec tous les autres endpoints
+    // + maj (date de dernière transmission) et actif (a encore un module en cours)
     const data = r.rows[0]?.disponibilites || [];
-    res.json({ success: true, data: Array.isArray(data) ? data : [] });
+    res.json({
+      success: true,
+      data: Array.isArray(data) ? data : [],
+      maj: r.rows[0]?.disponibilites_maj || null,
+      actif: r.rows[0]?.actif === true,
+      demande: r.rows[0]?.dispo_demandee_le || null,
+    });
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 };
 
@@ -592,7 +606,7 @@ exports.getAllDisponibilites = async (req, res) => {
   try {
     const pdv = [];
     const r = await db.query(
-      `SELECT id, nom, prenoms, disponibilites FROM users WHERE role='professeur' AND disponibilites IS NOT NULL${etabCol(pdv, req.etablissementId, 'etablissement_id')}`,
+      `SELECT id, nom, prenoms, disponibilites, disponibilites_maj FROM users WHERE role='professeur' AND disponibilites IS NOT NULL${etabCol(pdv, req.etablissementId, 'etablissement_id')}`,
       pdv
     );
     res.json({ success: true, data: r.rows });
@@ -603,7 +617,7 @@ exports.saveDisponibilites = async (req, res) => {
   try {
     // Flutter envoie { creneaux: [...] } (voir professor_service.dart)
     const creneaux = req.body.creneaux ?? req.body.disponibilites ?? [];
-    await db.query('UPDATE users SET disponibilites=$1 WHERE id=$2', [JSON.stringify(creneaux), req.user.id]);
+    await db.query('UPDATE users SET disponibilites=$1, disponibilites_maj=now() WHERE id=$2', [JSON.stringify(creneaux), req.user.id]);
     res.json({ success: true, message: 'Disponibilités enregistrées.' });
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 };
@@ -631,16 +645,14 @@ exports.patchModuleAssignment = async (req, res) => {
 };
 
 // ── POST /api/professeurs/:id/modules ─────────────────────────────────────────
-// Affecte un module précis à un prof, pour un niveau donné. Le SEMESTRE est celui du module
-// (défini par l'administration) : le `semestre` éventuellement envoyé n'est utilisé que pour
-// les anciens modules qui n'ont pas encore de semestre.
-// body: { module_id, filiere_id, niveau, semestre? }
+// Affecte un module précis à un prof, pour un niveau et un semestre donnés.
+// body: { module_id, filiere_id, niveau, semestre }
 exports.assignerModule = async (req, res) => {
   const { id: professeurId } = req.params;
   const { module_id, filiere_id, niveau, semestre } = req.body;
 
-  if (!module_id || !filiere_id || !niveau) {
-    return res.status(400).json({ success: false, message: 'module_id, filiere_id et niveau sont requis.' });
+  if (!module_id || !filiere_id || !niveau || !semestre) {
+    return res.status(400).json({ success: false, message: 'module_id, filiere_id, niveau et semestre sont requis.' });
   }
 
   try {
@@ -648,31 +660,12 @@ exports.assignerModule = async (req, res) => {
         !(await filiereDeMonEtab(filiere_id, req.etablissementId))) {
       return res.status(404).json({ success: false, message: 'Professeur ou filière introuvable.' });
     }
-    const mod = await db.query('SELECT nom, semestre FROM modules WHERE id = $1', [module_id]);
-    if (!mod.rows[0]) {
-      return res.status(404).json({ success: false, message: 'Module introuvable.' });
-    }
-    // Semestre du module (source de vérité) ; à défaut (ancien module), celui envoyé.
-    let sem = parseSemestre(mod.rows[0].semestre);
-    if (sem === null) sem = parseSemestre(semestre);
-    if (sem === null) {
-      return res.status(400).json({
-        success: false,
-        message: `Le module « ${mod.rows[0].nom} » n'a pas encore de semestre : définissez-le d'abord dans Filières.`,
-      });
-    }
-    if (!niveauCompatible(niveau, sem)) {
-      return res.status(400).json({
-        success: false,
-        message: `Le module « ${mod.rows[0].nom} » est au semestre S${sem} (${niveauDuSemestre(sem)}) : il ne peut pas être affecté en ${niveau}.`,
-      });
-    }
     const result = await db.query(
       `INSERT INTO professeur_modules (professeur_id, module_id, filiere_id, niveau, semestre)
        VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (professeur_id, module_id, niveau) DO UPDATE SET semestre = EXCLUDED.semestre
        RETURNING id, professeur_id, module_id, filiere_id, niveau, semestre, created_at`,
-      [professeurId, module_id, filiere_id, niveau, sem]
+      [professeurId, module_id, filiere_id, niveau, semestre]
     );
 
     // Crée (ou récupère) le sous-fil "Professeurs & Délégués" pour ce trio
@@ -747,5 +740,74 @@ exports.retirerModule = async (req, res) => {
   } catch (err) {
     console.error('[retirerModule]', err);
     res.status(500).json({ success: false, message: 'Erreur lors du retrait du module.' });
+  }
+};
+
+// ── Statut d'un module affecté : à venir / en cours / terminé ────────────────
+//   a_venir  : affecté mais pas encore programmé (pas de rappel d'heures libres)
+//   en_cours : l'administration l'a lancé (rappel du jeudi actif)
+//   termine  : fini (plus de rappel)
+const _appliquerStatut = async (affectationId, professeurId, statut, par) => {
+  const demarre = statut !== 'a_venir';
+  const termine = statut === 'termine';
+  const r = await db.query(
+    `UPDATE professeur_modules
+        SET demarre = $1,
+            termine = $2,
+            termine_le = CASE WHEN $2 THEN now() ELSE NULL END,
+            termine_par = CASE WHEN $2 THEN $3 ELSE NULL END
+      WHERE id = $4 AND professeur_id = $5
+      RETURNING id, demarre, termine, termine_le`,
+    [demarre, termine, par, affectationId, professeurId]
+  );
+  return r.rows[0] || null;
+};
+
+// PATCH /api/professeurs/modules/:affectationId/termine   { termine: true|false }
+// Le professeur peut terminer son module ou le rouvrir (=> en cours).
+exports.terminerMonModule = async (req, res) => {
+  try {
+    const statut = req.body.termine === false ? 'en_cours' : 'termine';
+    const row = await _appliquerStatut(req.params.affectationId, req.user.id, statut, 'professeur');
+    if (!row) return res.status(404).json({ success: false, message: 'Module non trouvé.' });
+    res.json({ success: true, data: row });
+  } catch (err) {
+    console.error('[terminerMonModule]', err);
+    res.status(500).json({ success: false, message: 'Erreur lors de la mise à jour du module.' });
+  }
+};
+
+// PATCH /api/professeurs/:id/modules/:affectationId/termine   (admin)
+// Corps : { statut: 'a_venir' | 'en_cours' | 'termine' }  (ou { termine: bool })
+exports.terminerModuleAdmin = async (req, res) => {
+  try {
+    if (!(await profDeMonEtab(req.params.id, req.etablissementId))) {
+      return res.status(404).json({ success: false, message: 'Professeur non trouvé.' });
+    }
+    let statut = req.body.statut;
+    if (!['a_venir', 'en_cours', 'termine'].includes(statut)) {
+      statut = req.body.termine === false ? 'en_cours' : 'termine';
+    }
+    const row = await _appliquerStatut(req.params.affectationId, req.params.id, statut, 'admin');
+    if (!row) return res.status(404).json({ success: false, message: 'Affectation non trouvée.' });
+    res.json({ success: true, data: row });
+  } catch (err) {
+    console.error('[terminerModuleAdmin]', err);
+    res.status(500).json({ success: false, message: 'Erreur lors de la mise à jour du module.' });
+  }
+};
+
+// POST /api/professeurs/:id/demander-disponibilites   (admin)
+// Demande ponctuelle des heures libres (ex. professeur dont le module va démarrer).
+exports.demanderDisponibilites = async (req, res) => {
+  try {
+    if (!(await profDeMonEtab(req.params.id, req.etablissementId))) {
+      return res.status(404).json({ success: false, message: 'Professeur non trouvé.' });
+    }
+    await db.query('UPDATE users SET dispo_demandee_le = now() WHERE id = $1', [req.params.id]);
+    res.json({ success: true, message: 'Demande envoyée.' });
+  } catch (err) {
+    console.error('[demanderDisponibilites]', err);
+    res.status(500).json({ success: false, message: 'Erreur lors de la demande.' });
   }
 };

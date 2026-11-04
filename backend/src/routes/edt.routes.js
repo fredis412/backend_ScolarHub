@@ -3,6 +3,7 @@ const router = express.Router();
 const { authMiddleware, requireRole } = require('../middleware/auth.middleware');
 const { upload, uploadToCloudinary } = require('../middleware/upload.middleware');
 const edtController = require('../controllers/edt.controller');
+const { getMonProgramme: getPlanningProf } = require('../controllers/edtProf.controller');
 
 /**
  * Routes pour la gestion des Emplois Du Temps (EDT)
@@ -23,7 +24,7 @@ router.get(
   authMiddleware,
   edtController.getMonProgramme
 );
-
+router.get('/professeur/planning', authMiddleware, requireRole('professeur'), getPlanningProf);
 // GET /api/edt/admin/all - Récupérer tous les EDT (admin seulement)
 router.get(
   '/admin/all',

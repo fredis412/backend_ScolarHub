@@ -423,10 +423,11 @@ const getBulletinsEnfant = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Accès refusé à cet étudiant.' });
     }
     const result = await pool.query(
-      `SELECT id, semestre, annee_academique, moyenne_generale, statut, date_publication
+      `SELECT id, semestre, annee_academique, moyenne_generale, statut, date_publication,
+              COALESCE(session_type, 'normale') AS session_type
        FROM bulletins
        WHERE etudiant_id = $1 AND publie = true
-       ORDER BY annee_academique DESC, semestre DESC`,
+       ORDER BY annee_academique DESC, semestre DESC, COALESCE(session_type, 'normale') DESC`,
       [etudiantId]
     );
     res.json({ success: true, data: result.rows });

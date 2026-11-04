@@ -35,6 +35,11 @@ if (process.env.NODE_ENV !== 'production') {
   app.use(morgan('dev'));
 }
 app.use(express.json({ limit: '1mb' }));
+app.use((req, res, next) => {
+  const t = Date.now();
+  res.on('finish', () => console.log(`[${res.statusCode}] ${req.method} ${req.originalUrl} ${Date.now() - t}ms`));
+  next();
+});
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
  

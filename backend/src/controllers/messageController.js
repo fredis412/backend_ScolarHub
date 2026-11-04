@@ -297,7 +297,7 @@ const getMessagesCanal = async (req, res) => {
                 JSON_AGG(r.emoji) FILTER (WHERE r.emoji IS NOT NULL), '[]'
               ) AS reactions,
               EXISTS (SELECT 1 FROM messages_epingles me WHERE me.message_id = m.id AND me.message_type = 'canal') AS epingle,
-              EXISTS (SELECT 1 FROM messages_lectures ml WHERE ml.message_id = m.id AND ml.message_type = 'canal' AND ml.user_id = $4) AS lu
+              EXISTS (SELECT 1 FROM messages_lectures ml WHERE ml.message_id = m.id::text AND ml.message_type = 'canal' AND ml.user_id::text = $4::text) AS lu
        FROM messages m
        JOIN users u ON u.id = m.auteur_id
        LEFT JOIN etudiants e ON e.user_id = u.id

@@ -249,7 +249,47 @@ exports.createAnnonce = async (req, res) => {
   }
 };
 
-async function syncAnnonceToCanalAndNotify(annonce, app, etabId) {
+// ── Pièces jointes d'une annonce → messages « fichier » du canal ─────────────
+// Les fichiers d'une annonce (image, vidéo, PDF…) sont stockés comme URLs dans
+// annonces.fichiers. Pour qu'ils apparaissent dans le canal côté étudiant, on les
+// transforme en messages « [FICHIER]type|url|nom » (format déjà géré par l'appli),
+// affichés juste après le message de l'annonce.
+function typeFichierDepuisUrl(url) {
+  const ext = String(url).split('?')[0].split('.').pop().toLowerCase();
+  if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) return 'image';
+  if (['mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv'].includes(ext)) return 'video';
+  if (['mp3', 'm4a', 'wav', 'aac', 'ogg'].includes(ext)) return 'audio';
+  return 'document';
+}
+function nomFichierDepuisUrl(url) {
+  let nom = String(url).split('?')[0].split('/').pop() || 'Fichier';
+  try { nom = decodeURIComponent(nom); } catch (_) {}
+  return nom.replace(/^\d{10,}-/, '');
+}
+function messagesFichiersAnnonce(annonce, urls, canalId, depuisIndex = 0) {
+  const liste = urls || (Array.isArray(annonce.fichiers) ? annonce.fichiers : []);
+  const base = new Date(annonce.created_at || annonce.createdAt || Date.now()).getTime();
+  return liste.map((url, i) => {
+    const idx = depuisIndex + i;
+    return {
+      id: `ann_${annonce.id}_f${idx}`,
+      canal_id: canalId,
+      canalId,
+      auteur_id: annonce.auteur_id || annonce.auteur,
+      prenoms: annonce.prenoms || 'Administration',
+      nom: annonce.nom || '',
+      contenu: `[FICHIER]${typeFichierDepuisUrl(url)}|${url}|${nomFichierDepuisUrl(url)}`,
+      type: 'annonce',
+      created_at: new Date(base + (idx + 1) * 1000).toISOString(),
+      reactions: [],
+      epingle: false,
+    };
+  });
+}
+
+// opts.fichiersSeuls = [urls] : ne diffuse QUE ces pièces jointes (fichier ajouté
+// après la publication), sans renvoyer le texte ni les notifications.
+async function syncAnnonceToCanalAndNotify(annonce, app, etabId, opts = {}) {
   try {
     const io = app?.get('io');
     let extra = '';
@@ -282,6 +322,16 @@ async function syncAnnonceToCanalAndNotify(annonce, app, etabId) {
       created_at: new Date().toISOString(),
       reactions: []
     };
+
+    // Messages à diffuser : l'annonce puis ses pièces jointes (ou seulement les nouvelles).
+    const fichiersSeuls = opts.fichiersSeuls || null;
+    const idxDepart = fichiersSeuls
+      ? Math.max(0, (Array.isArray(annonce.fichiers) ? annonce.fichiers.length : 0) - fichiersSeuls.length)
+      : 0;
+    const msgFichiers = (cid) => messagesFichiersAnnonce(
+      { ...annonce, prenoms: socketMsg.prenoms, nom: socketMsg.nom, created_at: socketMsg.created_at },
+      fichiersSeuls || (Array.isArray(annonce.fichiers) ? annonce.fichiers : []), cid, idxDepart);
+    const aDiffuser = (cid) => (fichiersSeuls ? [] : [{ ...socketMsg, canal_id: cid, canalId: cid }]).concat(msgFichiers(cid));
 
     // 1. Récupérer les étudiants ciblés
     try {
@@ -334,27 +384,27 @@ async function syncAnnonceToCanalAndNotify(annonce, app, etabId) {
             cibles = tous.rows;
           }
           for (const s of cibles) {
-            io.to(`user:${s.id}`).emit('message:canal', socketMsg);
+            for (const m of aDiffuser(canalAdminId)) io.to(`user:${s.id}`).emit('message:canal', m);
           }
           if (annonce.filiere) {
-            io.to(`filiere:${annonce.filiere}`).emit('message:canal', socketMsg);
+            for (const m of aDiffuser(canalAdminId)) io.to(`filiere:${annonce.filiere}`).emit('message:canal', m);
           }
         } else if (!annonce.filiere && !annonce.niveau) {
           // Annonce globale : diffuser à tout le canal
-          io.to('canal:1').emit('message:canal', socketMsg);
+          for (const m of aDiffuser(canalAdminId)) io.to('canal:1').emit('message:canal', m);
         } else {
           // Annonce ciblée : diffuser uniquement aux étudiants concernés
           for (const s of students) {
-            io.to(`user:${s.id}`).emit('message:canal', socketMsg);
+            for (const m of aDiffuser(canalAdminId)) io.to(`user:${s.id}`).emit('message:canal', m);
           }
           if (annonce.filiere) {
-            io.to(`filiere:${annonce.filiere}`).emit('message:canal', socketMsg);
-            io.to('canal:2').emit('message:canal', { ...socketMsg, canal_id: 2, canalId: 2 });
+            for (const m of aDiffuser(canalAdminId)) io.to(`filiere:${annonce.filiere}`).emit('message:canal', m);
+            for (const m of aDiffuser(2)) io.to('canal:2').emit('message:canal', m);
           }
         }
 
-        // Envoyer les notifications
-        for (const s of students) {
+        // Envoyer les notifications (pas pour un simple ajout de fichier)
+        if (!fichiersSeuls) for (const s of students) {
           pool.query(
             `INSERT INTO notifications (user_id, titre, corps, created_at) VALUES ($1, $2, $3, NOW())`,
             [s.id, `Annonce : ${annonce.titre}`, annonce.contenu]
@@ -568,6 +618,14 @@ exports.uploadAnnonceFile = async (req, res) => {
 
     // Ajouter le fichier
     const updatedAnnonce = await AnnonceModel.addFile(id, req.uploadedFileUrl);
+
+    // Annonce déjà publiée : les étudiants ont reçu le texte SANS ce fichier →
+    // on leur diffuse maintenant la pièce jointe (image / vidéo / document).
+    if (annonce.statut === 'publie' || (updatedAnnonce && updatedAnnonce.statut === 'publie')) {
+      syncAnnonceToCanalAndNotify(updatedAnnonce || annonce, req.app, req.etablissementId, {
+        fichiersSeuls: [req.uploadedFileUrl],
+      });
+    }
 
     res.status(200).json({
       success: true,

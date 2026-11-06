@@ -235,16 +235,33 @@ function initSocket(io) {
 
     // ── Événement : message privé ─────────────────────────
     socket.on('message:prive', async (data, callback) => {
-      const { destinataireId, contenu } = data;
+      const { destinataireId, contenu, reponse_a_id } = data;
       if (!contenu?.trim()) return callback?.({ error: 'Contenu vide' });
 
       try {
         if (!(await userDeMonEtab(destinataireId, etab))) return callback?.({ error: 'Destinataire introuvable' });
+        // Réponse ciblée : le message cité doit appartenir à cette conversation.
+        let citation = null;
+        const rid = parseInt(reponse_a_id, 10);
+        if (Number.isInteger(rid)) {
+          const cit = await pool.query(
+            `SELECT mp.id, mp.contenu, u.prenoms, u.nom
+             FROM messages_prives mp JOIN users u ON u.id = mp.expediteur_id
+             WHERE mp.id = $1
+               AND ((mp.expediteur_id = $2 AND mp.destinataire_id = $3)
+                 OR (mp.expediteur_id = $3 AND mp.destinataire_id = $2))`,
+            [rid, userId, destinataireId]
+          );
+          if (cit.rows.length) {
+            citation = { id: cit.rows[0].id, texte: cit.rows[0].contenu,
+              auteur: `${cit.rows[0].prenoms || ''} ${cit.rows[0].nom || ''}`.trim() };
+          }
+        }
         const { rows } = await pool.query(
-          `INSERT INTO messages_prives (expediteur_id, destinataire_id, contenu, created_at)
-           VALUES ($1, $2, $3, NOW())
-           RETURNING id, expediteur_id, destinataire_id, contenu, created_at`,
-          [userId, destinataireId, contenu.trim()]
+          `INSERT INTO messages_prives (expediteur_id, destinataire_id, contenu, reponse_a_id, created_at)
+           VALUES ($1, $2, $3, $4, NOW())
+           RETURNING id, expediteur_id, destinataire_id, contenu, reponse_a_id, created_at`,
+          [userId, destinataireId, contenu.trim(), citation ? citation.id : null]
         );
         const { rows: senderRows } = await pool.query(
           `SELECT prenoms, nom, role FROM users WHERE id = $1`,
@@ -255,6 +272,8 @@ function initSocket(io) {
           prenoms: senderRows[0]?.prenoms || '',
           nom: senderRows[0]?.nom || '',
           role: senderRows[0]?.role || '',
+          reponse_texte: citation ? citation.texte : null,
+          reponse_auteur: citation ? citation.auteur : null,
         };
 
         // Envoyer au destinataire s'il est en ligne

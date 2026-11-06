@@ -270,6 +270,44 @@ const getCanaux = async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 };
+// ── Pièces jointes d'une annonce → messages « fichier » du canal ─────────────
+// Les fichiers d'une annonce (image, vidéo, PDF…) sont stockés comme URLs dans
+// annonces.fichiers. Pour qu'ils apparaissent dans le canal côté étudiant, on les
+// transforme en messages « [FICHIER]type|url|nom » (format déjà géré par l'appli),
+// affichés juste après le message de l'annonce.
+function typeFichierDepuisUrl(url) {
+  const ext = String(url).split('?')[0].split('.').pop().toLowerCase();
+  if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) return 'image';
+  if (['mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv'].includes(ext)) return 'video';
+  if (['mp3', 'm4a', 'wav', 'aac', 'ogg'].includes(ext)) return 'audio';
+  return 'document';
+}
+function nomFichierDepuisUrl(url) {
+  let nom = String(url).split('?')[0].split('/').pop() || 'Fichier';
+  try { nom = decodeURIComponent(nom); } catch (_) {}
+  return nom.replace(/^\d{10,}-/, '');
+}
+function messagesFichiersAnnonce(annonce, urls, canalId, depuisIndex = 0) {
+  const liste = urls || (Array.isArray(annonce.fichiers) ? annonce.fichiers : []);
+  const base = new Date(annonce.created_at || annonce.createdAt || Date.now()).getTime();
+  return liste.map((url, i) => {
+    const idx = depuisIndex + i;
+    return {
+      id: `ann_${annonce.id}_f${idx}`,
+      canal_id: canalId,
+      canalId,
+      auteur_id: annonce.auteur_id || annonce.auteur,
+      prenoms: annonce.prenoms || 'Administration',
+      nom: annonce.nom || '',
+      contenu: `[FICHIER]${typeFichierDepuisUrl(url)}|${url}|${nomFichierDepuisUrl(url)}`,
+      type: 'annonce',
+      created_at: new Date(base + (idx + 1) * 1000).toISOString(),
+      reactions: [],
+      epingle: false,
+    };
+  });
+}
+
 // ── GET /api/messages/canal/:id ───────────────────────────
 // Historique des messages d'un canal (50 derniers)
 const getMessagesCanal = async (req, res) => {
@@ -336,7 +374,7 @@ const getMessagesCanal = async (req, res) => {
         const userNiveauNorm = normalizeNiveau(user.e_niv || user.niveau);
 
         let annonceQuery = `
-          SELECT a.id, a.titre, a.contenu, a.filiere, a.filiere_nom, a.niveau, a."cibleRole",
+          SELECT a.id, a.titre, a.contenu, a.filiere, a.filiere_nom, a.niveau, a."cibleRole", a.fichiers,
                  COALESCE(a."createdAt", a."updatedAt", NOW()) AS created_at,
                  u.id AS auteur_id, COALESCE(u.prenoms, 'Administration') AS prenoms, COALESCE(u.nom, 'IST') AS nom
           FROM annonces a
@@ -378,11 +416,11 @@ const getMessagesCanal = async (req, res) => {
         annonceQuery += ` ORDER BY a."createdAt" DESC LIMIT 50`;
         const { rows: annoncesRows } = await pool.query(annonceQuery, params);
 
-        const annonceMsgs = annoncesRows.map(a => {
+        const annonceMsgs = annoncesRows.flatMap(a => {
           let extra = '';
           if (a.filiere_nom) extra += `\n\n📍 Filière : ${a.filiere_nom}`;
           if (a.niveau) extra += `\n🎓 Niveau : ${a.niveau}`;
-          return {
+          const msgAnnonce = {
             id: 'ann_' + a.id,
             canal_id: parseInt(id),
             auteur_id: a.auteur_id,
@@ -394,6 +432,10 @@ const getMessagesCanal = async (req, res) => {
             reactions: [],
             epingle: false
           };
+          // Pièces jointes de l'annonce (image / vidéo / document), juste après le texte.
+          return [msgAnnonce, ...messagesFichiersAnnonce(
+            { id: a.id, auteur_id: a.auteur_id, prenoms: msgAnnonce.prenoms, nom: msgAnnonce.nom, created_at: a.created_at },
+            Array.isArray(a.fichiers) ? a.fichiers : [], parseInt(id))];
         });
 
         const allMsgs = [...msgs, ...annonceMsgs];
@@ -503,6 +545,29 @@ const getConversationsPrivees = async (req, res) => {
   }
 };
 
+// ── Réponse ciblée (messages privés) ─────────────────────
+// Vérifie que le message cité appartient bien à la conversation entre les
+// deux interlocuteurs, et renvoie son texte + son auteur (aperçu de la citation).
+const citationPrivee = async (reponseId, userA, userB) => {
+  const id = parseInt(reponseId, 10);
+  if (!Number.isInteger(id)) return null;
+  const { rows } = await pool.query(
+    `SELECT mp.id, mp.contenu, u.prenoms, u.nom
+     FROM messages_prives mp
+     JOIN users u ON u.id = mp.expediteur_id
+     WHERE mp.id = $1
+       AND ((mp.expediteur_id = $2 AND mp.destinataire_id = $3)
+         OR (mp.expediteur_id = $3 AND mp.destinataire_id = $2))`,
+    [id, userA, userB]
+  );
+  if (!rows.length) return null;
+  return {
+    id: rows[0].id,
+    texte: rows[0].contenu,
+    auteur: `${rows[0].prenoms || ''} ${rows[0].nom || ''}`.trim(),
+  };
+};
+
 // ── GET /api/messages/prives/:userId ─────────────────────
 // Messages d'une conversation privée
 const getMessagesPrives = async (req, res) => {
@@ -514,11 +579,16 @@ const getMessagesPrives = async (req, res) => {
       `SELECT mp.id, mp.contenu, mp.created_at, mp.is_read,
               mp.expediteur_id, mp.destinataire_id,
               u.prenoms, u.nom, u.role, u.photo_url,
+              mp.reponse_a_id,
+              rp.contenu AS reponse_texte,
+              NULLIF(TRIM(CONCAT(ru.prenoms, ' ', ru.nom)), '') AS reponse_auteur,
               COALESCE((SELECT JSON_AGG(r.emoji) FROM reactions r
                         WHERE r.message_id = mp.id AND r.message_type = 'prive'), '[]') AS reactions,
               EXISTS (SELECT 1 FROM messages_epingles me WHERE me.message_id = mp.id AND me.message_type = 'prive') AS epingle
        FROM messages_prives mp
        JOIN users u ON u.id = mp.expediteur_id
+       LEFT JOIN messages_prives rp ON rp.id = mp.reponse_a_id
+       LEFT JOIN users ru ON ru.id = rp.expediteur_id
        WHERE ((mp.expediteur_id = $1 AND mp.destinataire_id = $2)
           OR (mp.expediteur_id = $2 AND mp.destinataire_id = $1))
          AND NOT EXISTS (
@@ -540,7 +610,7 @@ const getMessagesPrives = async (req, res) => {
 // Envoyer un message privé (fallback REST)
 const envoyerMessagePrive = async (req, res) => {
   const { userId } = req.params;
-  const { contenu } = req.body;
+  const { contenu, reponse_a_id } = req.body;
 
   if (!contenu?.trim()) {
     return res.status(400).json({ success: false, error: 'Contenu requis' });
@@ -550,11 +620,13 @@ const envoyerMessagePrive = async (req, res) => {
     if (!(await userDeMonEtab(userId, req.etablissementId))) {
       return res.status(403).json({ success: false, error: 'Destinataire introuvable.' });
     }
+    // Réponse ciblée : le message cité doit appartenir à cette conversation.
+    const citation = reponse_a_id ? await citationPrivee(reponse_a_id, req.user.id, userId) : null;
     const { rows } = await pool.query(
-      `INSERT INTO messages_prives (expediteur_id, destinataire_id, contenu, created_at)
-       VALUES ($1, $2, $3, NOW())
-       RETURNING id, expediteur_id, destinataire_id, contenu, created_at`,
-      [req.user.id, userId, contenu.trim()]
+      `INSERT INTO messages_prives (expediteur_id, destinataire_id, contenu, reponse_a_id, created_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       RETURNING id, expediteur_id, destinataire_id, contenu, reponse_a_id, created_at`,
+      [req.user.id, userId, contenu.trim(), citation ? citation.id : null]
     );
 
     const { rows: senderRows } = await pool.query(
@@ -567,6 +639,8 @@ const envoyerMessagePrive = async (req, res) => {
       prenoms: senderRows[0]?.prenoms || req.user.prenoms || '',
       nom: senderRows[0]?.nom || req.user.nom || '',
       role: senderRows[0]?.role || req.user.role || '',
+      reponse_texte: citation ? citation.texte : null,
+      reponse_auteur: citation ? citation.auteur : null,
     };
 
     // userId est un UUID : ne surtout pas le convertir en entier

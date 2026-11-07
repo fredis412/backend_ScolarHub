@@ -594,7 +594,9 @@ const lookup = async (req, res) => {
           annee_naissance: row.date_naissance ? String(row.date_naissance).slice(0, 4) : '',
           lieu_naissance: row.lieu_naissance || '',
         }
-      : {};
+      // Autres rôles (professeur, BDE...) : seul l'email enregistré par
+      // l'administration est renvoyé (masqué), pour ne pas le redemander.
+      : (!row.a_mot_de_passe ? { email: masquerEmail(row.email_aff) } : {});
 
     return res.status(200).json({
       found: true,

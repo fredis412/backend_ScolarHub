@@ -50,6 +50,55 @@ async function niveauxDeFiliere(filiereId) {
   return r.rows.map((x) => x.niveau);
 }
 
+// ── Réponse ciblée (canaux et groupes) ──────────────────────────────────────
+// La colonne reponse_a_id est ajoutée automatiquement (idempotent) au premier
+// besoin ; migration_reponse_canal_groupe.sql fait la même chose à la main.
+let _colReponsePromise = null;
+function assurerColonnesReponse() {
+  if (!_colReponsePromise) {
+    _colReponsePromise = (async () => {
+      try {
+        await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS reponse_a_id BIGINT');
+        await pool.query('ALTER TABLE messages_groupe ADD COLUMN IF NOT EXISTS reponse_a_id BIGINT');
+      } catch (err) {
+        console.error('[Réponses] Colonne reponse_a_id non ajoutée (lancez migration_reponse_canal_groupe.sql) :', err.message);
+      }
+    })();
+  }
+  return _colReponsePromise;
+}
+
+// Vérifie que le message cité appartient bien au même canal, et renvoie son
+// texte + son auteur (aperçu de la citation). null si introuvable.
+async function citationCanal(reponseId, canalId) {
+  const id = parseInt(reponseId, 10);
+  if (!Number.isInteger(id)) return null;
+  const { rows } = await pool.query(
+    `SELECT m.id, m.contenu, u.prenoms, u.nom
+     FROM messages m JOIN users u ON u.id = m.auteur_id
+     WHERE m.id = $1 AND m.canal_id = $2`,
+    [id, canalId]
+  );
+  if (!rows.length) return null;
+  return { id: rows[0].id, texte: rows[0].contenu,
+    auteur: `${rows[0].prenoms || ''} ${rows[0].nom || ''}`.trim() };
+}
+
+// Idem pour un groupe « filière + niveau ».
+async function citationGroupe(reponseId, filiereId, niveau) {
+  const id = parseInt(reponseId, 10);
+  if (!Number.isInteger(id)) return null;
+  const { rows } = await pool.query(
+    `SELECT mg.id, mg.contenu, u.prenoms, u.nom
+     FROM messages_groupe mg JOIN users u ON u.id = mg.auteur_id
+     WHERE mg.id = $1 AND mg.filiere_id = $2 AND mg.niveau = $3`,
+    [id, filiereId, niveau]
+  );
+  if (!rows.length) return null;
+  return { id: rows[0].id, texte: rows[0].contenu,
+    auteur: `${rows[0].prenoms || ''} ${rows[0].nom || ''}`.trim() };
+}
+
 // Stocke les utilisateurs en ligne : { userId: socketId }
 const onlineUsers = new Map();
 
@@ -59,6 +108,7 @@ let ioRef = null;
 
 function initSocket(io) {
   ioRef = io;
+  assurerColonnesReponse();
 
   // ── Middleware d'authentification Socket ──────────────────
   io.use((socket, next) => {
@@ -183,11 +233,12 @@ function initSocket(io) {
 
     // ── Événement : envoyer un message dans un canal ──────
     socket.on('message:canal', async (data, callback) => {
-      const { canalId, contenu } = data;
+      const { canalId, contenu, reponse_a_id } = data;
       if (!contenu?.trim()) return callback?.({ error: 'Contenu vide' });
 
       try {
         if (!(await canalDeMonEtab(canalId, etab))) return callback?.({ error: 'Accès refusé à ce canal' });
+        await assurerColonnesReponse();
 
         // Vérifier que l'utilisateur a le droit d'écrire
         const normRole = String(socket.userRole || '').toLowerCase().trim();
@@ -205,12 +256,15 @@ function initSocket(io) {
           if (!access.length) return callback?.({ error: 'Accès refusé à ce canal' });
         }
 
+        // Réponse ciblée : le message cité doit appartenir à ce canal.
+        const citation = reponse_a_id ? await citationCanal(reponse_a_id, canalId) : null;
+
         // Persister le message
         const { rows: inserted } = await pool.query(
-          `INSERT INTO messages (canal_id, auteur_id, contenu, type, created_at)
-           VALUES ($1, $2, $3, 'canal', NOW())
+          `INSERT INTO messages (canal_id, auteur_id, contenu, type, reponse_a_id, created_at)
+           VALUES ($1, $2, $3, 'canal', $4, NOW())
            RETURNING id, canal_id, auteur_id, contenu, created_at`,
-          [canalId, userId, contenu.trim()]
+          [canalId, userId, contenu.trim(), citation ? citation.id : null]
         );
         const msgId = inserted[0].id;
 
@@ -222,7 +276,12 @@ function initSocket(io) {
            WHERE m.id = $1`,
           [msgId]
         );
-        const message = fullMsgs[0] || inserted[0];
+        const message = {
+          ...(fullMsgs[0] || inserted[0]),
+          reponse_a_id: citation ? citation.id : null,
+          reponse_texte: citation ? citation.texte : null,
+          reponse_auteur: citation ? citation.auteur : null,
+        };
 
         // Diffuser à tous les membres du canal
         io.to(`canal:${canalId}`).emit('message:canal', message);
@@ -317,11 +376,12 @@ function initSocket(io) {
 
     // ── Événement : message dans groupe filière + niveau ─────
     socket.on('message:groupe', async (data, callback) => {
-      const { filiereId, contenu } = data;
+      const { filiereId, contenu, reponse_a_id } = data;
       if (!contenu?.trim()) return callback?.({ error: 'Contenu vide' });
 
       try {
         if (!(await filiereDeMonEtab(filiereId, etab))) return callback?.({ error: 'Filière introuvable' });
+        await assurerColonnesReponse();
 
         // Étudiant : son niveau (lu en base) ; staff : le niveau choisi dans la requête.
         const staff = estStaffRole(socket.userRole);
@@ -330,11 +390,14 @@ function initSocket(io) {
           return callback?.({ error: staff ? 'Choisissez le niveau du groupe.' : 'Vous n\'appartenez pas à ce groupe (filière et niveau).' });
         }
 
+        // Réponse ciblée : le message cité doit appartenir à ce groupe.
+        const citation = reponse_a_id ? await citationGroupe(reponse_a_id, filiereId, niveau) : null;
+
         const { rows } = await pool.query(
-          `INSERT INTO messages_groupe (filiere_id, niveau, auteur_id, contenu, created_at)
-           VALUES ($1, $2, $3, $4, NOW())
+          `INSERT INTO messages_groupe (filiere_id, niveau, auteur_id, contenu, reponse_a_id, created_at)
+           VALUES ($1, $2, $3, $4, $5, NOW())
            RETURNING id, filiere_id, auteur_id, contenu, created_at`,
-          [filiereId, niveau, userId, contenu.trim()]
+          [filiereId, niveau, userId, contenu.trim(), citation ? citation.id : null]
         );
         const { rows: auteurs } = await pool.query(
           `SELECT mg.id, mg.filiere_id, mg.auteur_id, mg.contenu, mg.created_at,
@@ -344,7 +407,12 @@ function initSocket(io) {
            WHERE mg.id = $1`,
           [rows[0].id]
         );
-        const message = auteurs[0];
+        const message = {
+          ...auteurs[0],
+          reponse_a_id: citation ? citation.id : null,
+          reponse_texte: citation ? citation.texte : null,
+          reponse_auteur: citation ? citation.auteur : null,
+        };
 
         // Diffuser UNIQUEMENT au groupe filière + niveau
         io.to(roomGroupe(filiereId, niveau)).emit('message:groupe', message);
@@ -462,4 +530,4 @@ function getOnlineUsers() {
   return Array.from(onlineUsers.keys());
 }
 
-module.exports = { initSocket, notifierUser, pushToUser, getOnlineUsers };
+module.exports = { initSocket, notifierUser, pushToUser, getOnlineUsers, assurerColonnesReponse, citationCanal, citationGroupe };

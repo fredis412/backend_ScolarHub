@@ -5,7 +5,7 @@
 
 const pool = require('../config/db');
 const supabase = require('../config/supabase');
-const { notifierUser } = require('../socket/socketHandler');
+const { notifierUser, assurerColonnesReponse, citationCanal, citationGroupe } = require('../socket/socketHandler');
 
 const { resolveFiliere, normalizeNiveau } = require('../utils/filieres');
 const { ensureCanauxStandard } = require('../utils/canauxStandard');
@@ -320,6 +320,7 @@ const getMessagesCanal = async (req, res) => {
     if (!(await accesCanal(id, req.user.id, req.user.role, req.etablissementId))) {
       return res.status(403).json({ success: false, error: 'Accès refusé à ce canal' });
     }
+    await assurerColonnesReponse();
 
     // ✅ u.etudiant_role + niveau (via etudiants, fallback users.niveau) ajoutés
     // pour afficher le badge Délégué/Adjoint sur chaque bulle de message.
@@ -331,6 +332,9 @@ const getMessagesCanal = async (req, res) => {
       `SELECT m.id, m.canal_id, m.contenu, m.type, m.created_at,
               u.id AS auteur_id, u.prenoms, u.nom, u.etudiant_role, u.photo_url,
               COALESCE(MAX(e.niveau), u.niveau) AS niveau,
+              m.reponse_a_id,
+              rm.contenu AS reponse_texte,
+              NULLIF(TRIM(CONCAT(ru.prenoms, ' ', ru.nom)), '') AS reponse_auteur,
               COALESCE(
                 JSON_AGG(r.emoji) FILTER (WHERE r.emoji IS NOT NULL), '[]'
               ) AS reactions,
@@ -338,6 +342,8 @@ const getMessagesCanal = async (req, res) => {
               EXISTS (SELECT 1 FROM messages_lectures ml WHERE ml.message_id = m.id::text AND ml.message_type = 'canal' AND ml.user_id::text = $4::text) AS lu
        FROM messages m
        JOIN users u ON u.id = m.auteur_id
+       LEFT JOIN messages rm ON rm.id = m.reponse_a_id
+       LEFT JOIN users ru ON ru.id = rm.auteur_id
        LEFT JOIN etudiants e ON e.user_id = u.id
        LEFT JOIN reactions r ON r.message_id = m.id AND r.message_type = 'canal'
        WHERE m.canal_id = $1 AND COALESCE(m.type, 'canal') != 'annonce'
@@ -346,7 +352,7 @@ const getMessagesCanal = async (req, res) => {
            WHERE mm.message_id = m.id AND mm.message_type = 'canal' AND mm.user_id = $4
          )
          ${avant ? 'AND m.created_at < $3' : ''}
-       GROUP BY m.id, u.id
+       GROUP BY m.id, u.id, rm.id, ru.id
        ORDER BY m.created_at DESC
        LIMIT $2`,
       avant ? [id, limite, avant, req.user.id] : [id, limite, null, req.user.id]
@@ -457,7 +463,7 @@ const getMessagesCanal = async (req, res) => {
 // Envoyer un message dans un canal (fallback REST si WebSocket échoue)
 const envoyerMessageCanal = async (req, res) => {
   const { id } = req.params;
-  const { contenu } = req.body;
+  const { contenu, reponse_a_id } = req.body;
 
   if (!contenu?.trim()) {
     return res.status(400).json({ success: false, error: 'Contenu requis' });
@@ -477,11 +483,15 @@ const envoyerMessageCanal = async (req, res) => {
       });
     }
 
+    await assurerColonnesReponse();
+    // Réponse ciblée : le message cité doit appartenir à ce canal.
+    const citation = reponse_a_id ? await citationCanal(reponse_a_id, id) : null;
+
     const { rows: inserted } = await pool.query(
-      `INSERT INTO messages (canal_id, auteur_id, contenu, type, created_at)
-       VALUES ($1, $2, $3, 'canal', NOW())
+      `INSERT INTO messages (canal_id, auteur_id, contenu, type, reponse_a_id, created_at)
+       VALUES ($1, $2, $3, 'canal', $4, NOW())
        RETURNING id, canal_id, auteur_id, contenu, created_at`,
-      [id, req.user.id, contenu.trim()]
+      [id, req.user.id, contenu.trim(), citation ? citation.id : null]
     );
     const msgId = inserted[0].id;
 
@@ -497,7 +507,12 @@ const envoyerMessageCanal = async (req, res) => {
        WHERE m.id = $1`,
       [msgId]
     );
-    const message = fullMsgs[0] || inserted[0];
+    const message = {
+      ...(fullMsgs[0] || inserted[0]),
+      reponse_a_id: citation ? citation.id : null,
+      reponse_texte: citation ? citation.texte : null,
+      reponse_auteur: citation ? citation.auteur : null,
+    };
 
     // Émettre via Socket.io si disponible
     const io = req.app.get('io');
@@ -752,6 +767,7 @@ const getMessagesGroupe = async (req, res) => {
   try {
     const acces = await accesGroupe(req, filiereId, req.query.niveau);
     if (!acces.ok) return res.status(403).json({ success: false, error: 'Accès refusé' });
+    await assurerColonnesReponse();
 
     // ✅ etudiant_role + niveau + photo_url ajoutés pour badge et photo.
     // Étudiant : uniquement les messages de SON niveau. Staff : un niveau si
@@ -760,12 +776,17 @@ const getMessagesGroupe = async (req, res) => {
       `SELECT mg.id, mg.contenu, mg.created_at,
               mg.auteur_id, u.prenoms, u.nom, u.etudiant_role, u.photo_url,
               COALESCE(MAX(e.niveau), u.niveau) AS niveau,
+              mg.reponse_a_id,
+              rg.contenu AS reponse_texte,
+              NULLIF(TRIM(CONCAT(ru.prenoms, ' ', ru.nom)), '') AS reponse_auteur,
               COALESCE(
                 JSON_AGG(r.emoji) FILTER (WHERE r.emoji IS NOT NULL), '[]'
               ) AS reactions,
               EXISTS (SELECT 1 FROM messages_epingles me WHERE me.message_id = mg.id AND me.message_type = 'groupe') AS epingle
       FROM messages_groupe mg
       JOIN users u ON u.id = mg.auteur_id
+      LEFT JOIN messages_groupe rg ON rg.id = mg.reponse_a_id
+      LEFT JOIN users ru ON ru.id = rg.auteur_id
       LEFT JOIN etudiants e ON e.user_id = u.id
       LEFT JOIN reactions r ON r.message_id = mg.id AND r.message_type = 'groupe'
       WHERE mg.filiere_id = $1
@@ -774,7 +795,7 @@ const getMessagesGroupe = async (req, res) => {
           SELECT 1 FROM messages_masques mm
           WHERE mm.message_id = mg.id AND mm.message_type = 'groupe' AND mm.user_id = $3
         )
-      GROUP BY mg.id, u.id
+      GROUP BY mg.id, u.id, rg.id, ru.id
       ORDER BY mg.created_at DESC
       LIMIT $2`,
       [filiereId, limite, req.user.id, acces.niveau]
@@ -790,7 +811,7 @@ const getMessagesGroupe = async (req, res) => {
 // Envoyer dans le groupe filière + niveau (fallback REST)
 const envoyerMessageGroupe = async (req, res) => {
   const { filiereId } = req.params;
-  const { contenu } = req.body;
+  const { contenu, reponse_a_id } = req.body;
 
   if (!contenu?.trim()) {
     return res.status(400).json({ success: false, error: 'Contenu requis' });
@@ -805,11 +826,15 @@ const envoyerMessageGroupe = async (req, res) => {
       return res.status(400).json({ success: false, error: 'Choisissez le niveau du groupe.' });
     }
 
+    await assurerColonnesReponse();
+    // Réponse ciblée : le message cité doit appartenir à ce groupe (filière + niveau).
+    const citation = reponse_a_id ? await citationGroupe(reponse_a_id, filiereId, acces.niveau) : null;
+
     const { rows: inserted } = await pool.query(
-      `INSERT INTO messages_groupe (filiere_id, niveau, auteur_id, contenu, created_at)
-       VALUES ($1, $2, $3, $4, NOW())
+      `INSERT INTO messages_groupe (filiere_id, niveau, auteur_id, contenu, reponse_a_id, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
        RETURNING id, filiere_id, auteur_id, contenu, created_at`,
-      [filiereId, acces.niveau, req.user.id, contenu.trim()]
+      [filiereId, acces.niveau, req.user.id, contenu.trim(), citation ? citation.id : null]
     );
 
     // ✅ etudiant_role + niveau + photo_url ajoutés pour que badge et photo
@@ -828,6 +853,9 @@ const envoyerMessageGroupe = async (req, res) => {
       etudiant_role: userRows[0]?.etudiant_role,
       photo_url: userRows[0]?.photo_url,
       niveau: userRows[0]?.niveau,
+      reponse_a_id: citation ? citation.id : null,
+      reponse_texte: citation ? citation.texte : null,
+      reponse_auteur: citation ? citation.auteur : null,
     };
 
     // Diffusion limitée à la salle « filière + niveau » : les autres niveaux ne reçoivent rien.

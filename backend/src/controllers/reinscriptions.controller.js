@@ -5,6 +5,7 @@
 // Les frais sont fixés par l'établissement pour chaque niveau.
 const pool = require('../config/db');
 const { envoyerNotificationAuto } = require('./notifications.controller');
+const { envoyerNotification } = require('../services/onesignal.service');
 
 const STATUTS = ['a_faire', 'demandee', 'validee', 'refusee'];
 
@@ -256,6 +257,16 @@ const valider = async (req, res) => {
         if (r.user_id) {
             envoyerNotificationAuto(r.user_id, 'Réinscription validée',
                 `Ta réinscription pour ${annee} est validée (${r.niveau_cible}). Bonne année !`, 'info', null).catch(() => {});
+            // 🔔 OneSignal push
+            const { rows: mat } = await pool.query('SELECT matricule FROM etudiants WHERE id = $1', [r.etudiant_id]);
+            if (mat[0]?.matricule) {
+                envoyerNotification({
+                    titre: '🎓 Réinscription validée !',
+                    message: `Ta réinscription pour ${annee} est confirmée. Tu passes en ${r.niveau_cible}. Bonne année !`,
+                    destinataires: mat[0].matricule,
+                    donnees: { type: 'reinscription_validee', niveau: r.niveau_cible, annee },
+                }).catch(() => {});
+            }
         }
     } catch (err) {
         console.error('[reinscriptions.valider]', err);
@@ -283,9 +294,18 @@ const refuser = async (req, res) => {
         if (!r.rows.length) return res.status(404).json({ success: false, message: 'Réinscription introuvable ou déjà validée.' });
         res.json({ success: true, message: 'Demande refusée : l\'étudiant peut la refaire.' });
 
-        const u = await pool.query('SELECT user_id FROM etudiants WHERE id = $1', [r.rows[0].etudiant_id]);
+        const u = await pool.query('SELECT user_id, matricule FROM etudiants WHERE id = $1', [r.rows[0].etudiant_id]);
         if (u.rows[0]?.user_id) {
             envoyerNotificationAuto(u.rows[0].user_id, 'Réinscription refusée', `Motif : ${motif}`, 'info', null).catch(() => {});
+            // 🔔 OneSignal push
+            if (u.rows[0].matricule) {
+                envoyerNotification({
+                    titre: '❌ Réinscription refusée',
+                    message: `Ta demande de réinscription a été refusée. Motif : ${motif}`,
+                    destinataires: u.rows[0].matricule,
+                    donnees: { type: 'reinscription_refusee', motif },
+                }).catch(() => {});
+            }
         }
     } catch (err) {
         console.error('[reinscriptions.refuser]', err);

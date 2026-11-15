@@ -1,6 +1,7 @@
 // Années académiques et inscriptions annuelles (étape 1 : passage de niveau et archives).
 // Toutes les requêtes sont filtrées par l'établissement du jeton (req.etablissementId).
 const pool = require('../config/db');
+const { envoyerNotification } = require('../services/onesignal.service');
 
 const LIBELLE = /^\d{4}-\d{4}$/;
 
@@ -74,6 +75,29 @@ const creerAnnee = async (req, res) => {
             return res.status(409).json({ success: false, message: 'Cette année existe déjà.' });
         }
         res.status(201).json({ success: true, message: `Année ${libelle} ouverte.`, id: r.rows[0].id });
+
+        // 🔔 OneSignal — notifier tous les étudiants actifs de l'établissement
+        (async () => {
+            try {
+                const etus = await pool.query(
+                    `SELECT u.matricule FROM users u
+                     JOIN etudiants e ON e.user_id = u.id
+                     WHERE e.etablissement_id = $1
+                       AND COALESCE(u.statut, 'actif') NOT IN ('suspendu', 'renvoye')
+                       AND u.matricule IS NOT NULL`,
+                    [req.etablissementId]
+                );
+                const matricules = etus.rows.map(e => e.matricule);
+                if (matricules.length > 0) {
+                    envoyerNotification({
+                        titre: '📅 Période de réinscription ouverte',
+                        message: `L'année académique ${libelle} est ouverte. Connectez-vous pour faire votre demande de réinscription.`,
+                        destinataires: matricules,
+                        donnees: { type: 'reinscription_ouverte', annee: libelle },
+                    }).catch(e => console.warn('[OneSignal] Erreur notif nouvelle année:', e.message));
+                }
+            } catch (err) { console.warn('[OneSignal] creerAnnee notif', err.message); }
+        })();
     } catch (e) {
         console.error('[creerAnnee]', e);
         res.status(500).json({ success: false, message: 'Erreur lors de la création de l\'année.' });
@@ -99,6 +123,33 @@ const reglerRattrapage = async (req, res) => {
               WHERE id = $1${etab} RETURNING id`, p);
         if (!r.rows.length) return res.status(404).json({ success: false, message: 'Année introuvable.' });
         res.json({ success: true, message: 'Paramètres du rattrapage enregistrés.' });
+
+        // 🔔 OneSignal — notifier tous les étudiants de la session de rattrapage
+        if (date_debut) {
+            (async () => {
+                try {
+                    const etus = await pool.query(
+                        `SELECT u.matricule FROM users u
+                         JOIN etudiants e ON e.user_id = u.id
+                         WHERE e.etablissement_id = $1
+                           AND COALESCE(u.statut, 'actif') NOT IN ('suspendu', 'renvoye')
+                           AND u.matricule IS NOT NULL`,
+                        [req.etablissementId]
+                    );
+                    const matricules = etus.rows.map(e => e.matricule);
+                    if (matricules.length > 0) {
+                        const dateDebut = date_debut ? new Date(date_debut).toLocaleDateString('fr-FR') : '';
+                        const dateFin = date_fin ? new Date(date_fin).toLocaleDateString('fr-FR') : '';
+                        envoyerNotification({
+                            titre: '🔄 Session de rattrapage planifiée',
+                            message: `La session de rattrapage se déroulera du ${dateDebut} au ${dateFin}. Consultez vos résultats pour savoir si vous êtes concerné(e).`,
+                            destinataires: matricules,
+                            donnees: { type: 'session_rattrapage', date_debut, date_fin },
+                        }).catch(e => console.warn('[OneSignal] Erreur notif rattrapage dates:', e.message));
+                    }
+                } catch (err) { console.warn('[OneSignal] reglerRattrapage notif', err.message); }
+            })();
+        }
     } catch (e) {
         console.error('[reglerRattrapage]', e);
         res.status(500).json({ success: false, message: 'Erreur lors de l\'enregistrement.' });

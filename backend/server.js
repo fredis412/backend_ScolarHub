@@ -11,6 +11,7 @@ const path = require('path');
 dotenv.config({ path: path.join(__dirname, 'src', '.env') });
  
 const app = express();
+app.get('/health', (req, res) => res.status(200).send('ok'));
 const server = http.createServer(app);
 const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:3000').split(',');
 const isLocalhostOrigin = (origin) => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);

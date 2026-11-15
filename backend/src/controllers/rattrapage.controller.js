@@ -12,6 +12,7 @@
 // Tables : sessions_rattrapage, notes_rattrapage (voir migration_rattrapage.sql).
 const pool = require('../config/db');
 const { envoyerNotificationAuto } = require('./notifications.controller');
+const { envoyerNotification } = require('../services/onesignal.service');
 const { parseSemestre } = require('../utils/semestres');
 
 const SEUIL_MODULE = 10;
@@ -367,11 +368,22 @@ const validerSession = async (req, res) => {
                 const m = await pool.query('SELECT nom FROM modules WHERE id = $1', [r.rows[0].module_id]);
                 const moduleNom = m.rows[0]?.nom || 'un module';
                 const etus = await pool.query(
-                    `SELECT DISTINCT e.user_id FROM notes_rattrapage n JOIN etudiants e ON e.id = n.etudiant_id
+                    `SELECT DISTINCT e.user_id, e.matricule FROM notes_rattrapage n JOIN etudiants e ON e.id = n.etudiant_id
                      WHERE n.session_id = $1 AND e.user_id IS NOT NULL`, [r.rows[0].id]);
+                const matricules = [];
                 for (const row of etus.rows) {
                     await envoyerNotificationAuto(row.user_id, 'Note de rattrapage publiée',
                         `Ta note de rattrapage pour ${moduleNom} est disponible.`, 'note', null);
+                    if (row.matricule) matricules.push(row.matricule);
+                }
+                // 🔔 OneSignal push individuel
+                if (matricules.length > 0) {
+                    envoyerNotification({
+                        titre: '🔄 Note de rattrapage disponible',
+                        message: `Ta note de rattrapage pour ${moduleNom} a été publiée.`,
+                        destinataires: matricules,
+                        donnees: { type: 'note_rattrapage', session_id: r.rows[0].id, module_nom: moduleNom },
+                    }).catch(e => console.warn('[OneSignal] Erreur notif rattrapage:', e.message));
                 }
             } catch (err) { console.error('[rattrapage.validerSession] notif', err.message); }
         })();

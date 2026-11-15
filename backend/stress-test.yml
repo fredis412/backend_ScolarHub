@@ -1,0 +1,56 @@
+## ═══════════════════════════════════════════════════════════════
+## Test de charge ScolarHub — Artillery
+##
+## Usage :
+##   npm install -g artillery
+##   artillery run stress-test.yml
+##
+## Le test simule des utilisateurs qui se connectent et utilisent l'API.
+## ═══════════════════════════════════════════════════════════════
+
+config:
+  target: "https://backend-scolarhub.onrender.com"
+  phases:
+    # Phase 1 : Montée progressive (warm-up)
+    - duration: 30       # 30 secondes
+      arrivalRate: 5     # 5 nouveaux utilisateurs/seconde
+      name: "Montée progressive"
+
+    # Phase 2 : Charge normale
+    - duration: 60       # 60 secondes
+      arrivalRate: 20    # 20 nouveaux utilisateurs/seconde
+      name: "Charge normale"
+
+    # Phase 3 : Pic de charge (stress)
+    - duration: 30       # 30 secondes
+      arrivalRate: 50    # 50 nouveaux utilisateurs/seconde
+      name: "Pic de charge"
+
+  defaults:
+    headers:
+      Content-Type: "application/json"
+
+scenarios:
+  # Scénario 1 : Simple vérification que le serveur répond
+  - name: "Health check"
+    weight: 3
+    flow:
+      - get:
+          url: "/api/auth/me"
+
+  # Scénario 2 : Consultation des annonces (lecture)
+  - name: "Consulter les annonces"
+    weight: 4
+    flow:
+      - get:
+          url: "/api/annonces"
+
+  # Scénario 3 : Login complet (écriture)
+  - name: "Tentative de connexion"
+    weight: 3
+    flow:
+      - post:
+          url: "/api/auth/lookup"
+          json:
+            matricule: "TEST-0001"
+

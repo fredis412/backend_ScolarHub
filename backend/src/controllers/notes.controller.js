@@ -1,6 +1,7 @@
 const PDFDocument = require('pdfkit');
 const pool = require('../config/db');
 const { envoyerNotificationAuto } = require('./notifications.controller');
+const { envoyerNotification } = require('../services/onesignal.service');
 const { parseSemestre, niveauCompatible, niveauDuSemestre } = require('../utils/semestres');
 
 // ── Multi-établissement ─────────────────────────────────────────────────────
@@ -23,6 +24,15 @@ async function filiereDeMonEtab(filiereId, etabId) {
     if (filiereId === undefined || filiereId === null || filiereId === '') return false;
     const r = await pool.query('SELECT 1 FROM filieres WHERE id = $1 AND etablissement_id = $2', [filiereId, etabId]);
     return r.rows.length > 0;
+}
+
+// Normalise une note reçue (nombre ou texte « 12,5 »). Renvoie null si invalide
+// ou hors barème 0–20 (la base refuse de toute façon ces valeurs).
+function normaliserNote(v) {
+    if (v === undefined || v === null || v === '') return null;
+    const n = typeof v === 'number' ? v : Number(String(v).trim().replace(',', '.'));
+    if (!Number.isFinite(n) || n < 0 || n > 20) return null;
+    return Math.round(n * 100) / 100;
 }
 
 const getNotesEtudiant = async (req, res) => {
@@ -207,6 +217,19 @@ const createGradeSession = async (req, res) => {
             semestreFinal = semestre;
         }
 
+        // Toutes les notes doivent être valides (0–20, virgule acceptée) AVANT de
+        // créer la session : sinon on se retrouverait avec une session vide.
+        if (Array.isArray(notes)) {
+            for (const note of notes) {
+                if (note && note.valeur !== undefined && note.valeur !== null && normaliserNote(note.valeur) === null) {
+                    return res.status(400).json({
+                        success: false,
+                        message: `Note invalide (« ${note.valeur} ») pour ${note.matricule || 'un étudiant'} : entrez un nombre entre 0 et 20.`,
+                    });
+                }
+            }
+        }
+
         // ✅ La mention (Très Bien/Bien/Assez Bien/Passable/Insuffisant) est
         // désormais saisie PAR ÉTUDIANT (chaque note a la sienne), pas une
         // seule mention pour toute la session — tous les étudiants d'une
@@ -233,7 +256,7 @@ const createGradeSession = async (req, res) => {
                     await pool.query(`
                         INSERT INTO notes (etudiant_id, module_id, session_id, valeur, mention)
                         VALUES ($1, $2, $3, $4, $5)
-                    `, [e_id, module_id, session_id, note.valeur, note.mention || null]);
+                    `, [e_id, module_id, session_id, normaliserNote(note.valeur), note.mention || null]);
                 } else {
                     skippedStudents.push({ matricule: note.matricule, reason: 'étudiant introuvable' });
                 }
@@ -327,11 +350,13 @@ const validateSessionAdmin = async (req, res) => {
                 const moduleRes = await pool.query('SELECT nom FROM modules WHERE id = $1', [result.rows[0].module_id]);
                 const moduleNom = moduleRes.rows[0]?.nom || 'un module';
                 const etusRes = await pool.query(
-                    `SELECT DISTINCT e.user_id FROM notes n
+                    `SELECT DISTINCT e.user_id, u.matricule FROM notes n
                      JOIN etudiants e ON e.id = n.etudiant_id
+                     JOIN users u ON u.id = e.user_id
                      WHERE n.session_id = $1 AND e.user_id IS NOT NULL`,
                     [session_id]
                 );
+                const matricules = [];
                 for (const row of etusRes.rows) {
                     await envoyerNotificationAuto(
                         row.user_id,
@@ -340,6 +365,16 @@ const validateSessionAdmin = async (req, res) => {
                         'note',
                         null
                     );
+                    if (row.matricule) matricules.push(row.matricule);
+                }
+                // 🔔 Notification push OneSignal à tous les étudiants concernés
+                if (matricules.length > 0) {
+                    envoyerNotification({
+                        titre: '📝 Nouvelle note disponible',
+                        message: `Vos notes de ${moduleNom} ont été publiées. Consultez vos résultats.`,
+                        destinataires: matricules,
+                        donnees: { type: 'note_publiee', session_id },
+                    }).catch(e => console.warn('[OneSignal] Erreur notif notes:', e.message));
                 }
             } catch (notifErr) {
                 console.error('[validateSessionAdmin] notification', notifErr.message);
@@ -422,6 +457,17 @@ const updateGradeSession = async (req, res) => {
             return res.status(403).json({ success: false, message: 'Accès refusé.' });
         }
 
+        if (Array.isArray(notes)) {
+            for (const note of notes) {
+                if (note && note.valeur !== undefined && note.valeur !== null && normaliserNote(note.valeur) === null) {
+                    return res.status(400).json({
+                        success: false,
+                        message: `Note invalide (« ${note.valeur} ») pour ${note.matricule || 'un étudiant'} : entrez un nombre entre 0 et 20.`,
+                    });
+                }
+            }
+        }
+
         if (notes && notes.length > 0) {
             for (const note of notes) {
                 if (!note.matricule || note.valeur === undefined || note.valeur === null) continue;
@@ -435,11 +481,11 @@ const updateGradeSession = async (req, res) => {
                     [session_id, e_id]
                 );
                 if (existing.rows.length > 0) {
-                    await pool.query(`UPDATE notes SET valeur = $1, mention = $2 WHERE id = $3`, [note.valeur, note.mention || null, existing.rows[0].id]);
+                    await pool.query(`UPDATE notes SET valeur = $1, mention = $2 WHERE id = $3`, [normaliserNote(note.valeur), note.mention || null, existing.rows[0].id]);
                 } else {
                     await pool.query(
                         `INSERT INTO notes (etudiant_id, module_id, session_id, valeur, mention) VALUES ($1, $2, $3, $4, $5)`,
-                        [e_id, session.module_id, session_id, note.valeur, note.mention || null]
+                        [e_id, session.module_id, session_id, normaliserNote(note.valeur), note.mention || null]
                     );
                 }
             }

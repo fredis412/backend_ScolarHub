@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 
 const { envoyerNotificationAuto } = require('./notifications.controller');
+const { envoyerNotification } = require('../services/onesignal.service');
 const { envoyerSMS } = require('../services/sms.service');
 
 // ── Multi-établissement ─────────────────────────────────────────────────────
@@ -67,6 +68,15 @@ const createAppel = async (req, res) => {
                             'Absence enregistrée',
                             `Vous avez été marqué(e) absent(e) au cours de ${module_nom} (${filiere_nom || ''}).`
                         );
+                    }
+                    // 🔔 Notification push OneSignal à l'étudiant absent
+                    if (p.matricule) {
+                        envoyerNotification({
+                            titre: '⚠️ Absence enregistrée',
+                            message: `Vous avez été marqué(e) absent(e) au cours de ${module_nom}${filiere_nom ? ' (' + filiere_nom + ')' : ''}.`,
+                            destinataires: p.matricule,
+                            donnees: { type: 'absence', appel_id, module_nom },
+                        }).catch(e => console.warn('[OneSignal] Erreur notif absence:', e.message));
                     }
                     if (etudiant.tel_parent) {
                         await envoyerSMS(

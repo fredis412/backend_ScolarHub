@@ -1,5 +1,6 @@
 const pool = require('../config/db');
 const { envoyerNotificationAuto } = require('./notifications.controller');
+const { envoyerNotification } = require('../services/onesignal.service');
 
 // ════════════════════════════════════════════════════════════════════════════
 // BULLETINS — deux étapes distinctes, conçues avec Ib :
@@ -593,13 +594,14 @@ const envoyerPrevision = async (req, res) => {
         (async () => {
             try {
                 const etusRes = await pool.query(
-                    `SELECT u.id FROM users u
+                    `SELECT u.id, u.matricule FROM users u
                      JOIN etudiants e ON e.user_id = u.id
                      WHERE e.filiere_id = $1 AND e.niveau = $2
                        AND (u.role ILIKE '%etudiant%' OR u.role ILIKE '%delegue%' OR u.role ILIKE '%bde%')
                        AND COALESCE(u.statut, 'actif') NOT IN ('suspendu', 'renvoye')`,
                     [filiere_id, niveau]
                 );
+                const matricules = [];
                 for (const e of etusRes.rows) {
                     await envoyerNotificationAuto(
                         e.id,
@@ -608,6 +610,16 @@ const envoyerPrevision = async (req, res) => {
                         'prevision',
                         null
                     );
+                    if (e.matricule) matricules.push(e.matricule);
+                }
+                // 🔔 OneSignal push
+                if (matricules.length > 0) {
+                    envoyerNotification({
+                        titre: '📊 Prévision de moyennes disponible',
+                        message: `Vos résultats prévisionnels pour ${semestre} (${annee_academique}) sont disponibles.`,
+                        destinataires: matricules,
+                        donnees: { type: 'prevision_bulletin', semestre, annee_academique },
+                    }).catch(e => console.warn('[OneSignal] Erreur notif prévision:', e.message));
                 }
             } catch (notifErr) {
                 console.error('[envoyerPrevision] notification', notifErr.message);

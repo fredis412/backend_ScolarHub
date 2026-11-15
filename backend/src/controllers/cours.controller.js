@@ -4,6 +4,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const { envoyerNotificationAuto } = require('./notifications.controller');
+const { envoyerNotification } = require('../services/onesignal.service');
 
 // Supabase client for Storage (reuse env vars)
 function getSupabaseClient() {
@@ -97,10 +98,11 @@ exports.uploadCours = async (req, res) => {
 
       let filtreEtab = '';
       if (req.etablissementId) { params.push(req.etablissementId); filtreEtab = ` AND etablissement_id = $${params.length}`; }
-      const etudiantsRes = await db.query(`SELECT user_id FROM etudiants WHERE filiere_id = $1${filtreNiveau} AND (statut = 'actif' OR statut IS NULL)${filtreEtab}`, params);
+      const etudiantsRes = await db.query(`SELECT user_id, matricule FROM etudiants WHERE filiere_id = $1${filtreNiveau} AND (statut = 'actif' OR statut IS NULL)${filtreEtab}`, params);
       const moduleRes = await db.query('SELECT nom FROM modules WHERE id = $1', [module_id]);
       const module_nom = moduleRes.rows.length > 0 ? moduleRes.rows[0].nom : 'Module';
 
+      const matricules = [];
       for (const e of etudiantsRes.rows) {
         if (e.user_id) {
           await envoyerNotificationAuto(
@@ -109,6 +111,16 @@ exports.uploadCours = async (req, res) => {
             `Le professeur a publié le support "${titre}" pour le cours de ${module_nom}.`
           );
         }
+        if (e.matricule) matricules.push(e.matricule);
+      }
+      // 🔔 OneSignal push
+      if (matricules.length > 0) {
+        envoyerNotification({
+          titre: '📚 Nouveau cours disponible',
+          message: `"${titre}" a été publié pour ${module_nom}. Consultez vos supports de cours.`,
+          destinataires: matricules,
+          donnees: { type: 'nouveau_cours', cours_id: newCours.id, module_nom },
+        }).catch(e => console.warn('[OneSignal] Erreur notif cours:', e.message));
       }
     } catch (notifErr) {
       console.error('[Notification cours]', notifErr);

@@ -5,7 +5,8 @@
 
 const pool = require('../config/db');
 const supabase = require('../config/supabase');
-const { notifierUser } = require('../socket/socketHandler');
+const { notifierUser, assurerColonnesReponse, citationCanal, citationGroupe } = require('../socket/socketHandler');
+const { envoyerNotification } = require('../services/onesignal.service');
 
 const { resolveFiliere, normalizeNiveau } = require('../utils/filieres');
 const { ensureCanauxStandard } = require('../utils/canauxStandard');
@@ -270,6 +271,44 @@ const getCanaux = async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 };
+// ── Pièces jointes d'une annonce → messages « fichier » du canal ─────────────
+// Les fichiers d'une annonce (image, vidéo, PDF…) sont stockés comme URLs dans
+// annonces.fichiers. Pour qu'ils apparaissent dans le canal côté étudiant, on les
+// transforme en messages « [FICHIER]type|url|nom » (format déjà géré par l'appli),
+// affichés juste après le message de l'annonce.
+function typeFichierDepuisUrl(url) {
+  const ext = String(url).split('?')[0].split('.').pop().toLowerCase();
+  if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) return 'image';
+  if (['mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv'].includes(ext)) return 'video';
+  if (['mp3', 'm4a', 'wav', 'aac', 'ogg'].includes(ext)) return 'audio';
+  return 'document';
+}
+function nomFichierDepuisUrl(url) {
+  let nom = String(url).split('?')[0].split('/').pop() || 'Fichier';
+  try { nom = decodeURIComponent(nom); } catch (_) {}
+  return nom.replace(/^\d{10,}-/, '');
+}
+function messagesFichiersAnnonce(annonce, urls, canalId, depuisIndex = 0) {
+  const liste = urls || (Array.isArray(annonce.fichiers) ? annonce.fichiers : []);
+  const base = new Date(annonce.created_at || annonce.createdAt || Date.now()).getTime();
+  return liste.map((url, i) => {
+    const idx = depuisIndex + i;
+    return {
+      id: `ann_${annonce.id}_f${idx}`,
+      canal_id: canalId,
+      canalId,
+      auteur_id: annonce.auteur_id || annonce.auteur,
+      prenoms: annonce.prenoms || 'Administration',
+      nom: annonce.nom || '',
+      contenu: `[FICHIER]${typeFichierDepuisUrl(url)}|${url}|${nomFichierDepuisUrl(url)}`,
+      type: 'annonce',
+      created_at: new Date(base + (idx + 1) * 1000).toISOString(),
+      reactions: [],
+      epingle: false,
+    };
+  });
+}
+
 // ── GET /api/messages/canal/:id ───────────────────────────
 // Historique des messages d'un canal (50 derniers)
 const getMessagesCanal = async (req, res) => {
@@ -282,6 +321,7 @@ const getMessagesCanal = async (req, res) => {
     if (!(await accesCanal(id, req.user.id, req.user.role, req.etablissementId))) {
       return res.status(403).json({ success: false, error: 'Accès refusé à ce canal' });
     }
+    await assurerColonnesReponse();
 
     // ✅ u.etudiant_role + niveau (via etudiants, fallback users.niveau) ajoutés
     // pour afficher le badge Délégué/Adjoint sur chaque bulle de message.
@@ -293,6 +333,9 @@ const getMessagesCanal = async (req, res) => {
       `SELECT m.id, m.canal_id, m.contenu, m.type, m.created_at,
               u.id AS auteur_id, u.prenoms, u.nom, u.etudiant_role, u.photo_url,
               COALESCE(MAX(e.niveau), u.niveau) AS niveau,
+              m.reponse_a_id,
+              rm.contenu AS reponse_texte,
+              NULLIF(TRIM(CONCAT(ru.prenoms, ' ', ru.nom)), '') AS reponse_auteur,
               COALESCE(
                 JSON_AGG(r.emoji) FILTER (WHERE r.emoji IS NOT NULL), '[]'
               ) AS reactions,
@@ -300,6 +343,8 @@ const getMessagesCanal = async (req, res) => {
               EXISTS (SELECT 1 FROM messages_lectures ml WHERE ml.message_id = m.id::text AND ml.message_type = 'canal' AND ml.user_id::text = $4::text) AS lu
        FROM messages m
        JOIN users u ON u.id = m.auteur_id
+       LEFT JOIN messages rm ON rm.id = m.reponse_a_id
+       LEFT JOIN users ru ON ru.id = rm.auteur_id
        LEFT JOIN etudiants e ON e.user_id = u.id
        LEFT JOIN reactions r ON r.message_id = m.id AND r.message_type = 'canal'
        WHERE m.canal_id = $1 AND COALESCE(m.type, 'canal') != 'annonce'
@@ -308,7 +353,7 @@ const getMessagesCanal = async (req, res) => {
            WHERE mm.message_id = m.id AND mm.message_type = 'canal' AND mm.user_id = $4
          )
          ${avant ? 'AND m.created_at < $3' : ''}
-       GROUP BY m.id, u.id
+       GROUP BY m.id, u.id, rm.id, ru.id
        ORDER BY m.created_at DESC
        LIMIT $2`,
       avant ? [id, limite, avant, req.user.id] : [id, limite, null, req.user.id]
@@ -336,7 +381,7 @@ const getMessagesCanal = async (req, res) => {
         const userNiveauNorm = normalizeNiveau(user.e_niv || user.niveau);
 
         let annonceQuery = `
-          SELECT a.id, a.titre, a.contenu, a.filiere, a.filiere_nom, a.niveau, a."cibleRole",
+          SELECT a.id, a.titre, a.contenu, a.filiere, a.filiere_nom, a.niveau, a."cibleRole", a.fichiers,
                  COALESCE(a."createdAt", a."updatedAt", NOW()) AS created_at,
                  u.id AS auteur_id, COALESCE(u.prenoms, 'Administration') AS prenoms, COALESCE(u.nom, 'IST') AS nom
           FROM annonces a
@@ -378,11 +423,11 @@ const getMessagesCanal = async (req, res) => {
         annonceQuery += ` ORDER BY a."createdAt" DESC LIMIT 50`;
         const { rows: annoncesRows } = await pool.query(annonceQuery, params);
 
-        const annonceMsgs = annoncesRows.map(a => {
+        const annonceMsgs = annoncesRows.flatMap(a => {
           let extra = '';
           if (a.filiere_nom) extra += `\n\n📍 Filière : ${a.filiere_nom}`;
           if (a.niveau) extra += `\n🎓 Niveau : ${a.niveau}`;
-          return {
+          const msgAnnonce = {
             id: 'ann_' + a.id,
             canal_id: parseInt(id),
             auteur_id: a.auteur_id,
@@ -394,6 +439,10 @@ const getMessagesCanal = async (req, res) => {
             reactions: [],
             epingle: false
           };
+          // Pièces jointes de l'annonce (image / vidéo / document), juste après le texte.
+          return [msgAnnonce, ...messagesFichiersAnnonce(
+            { id: a.id, auteur_id: a.auteur_id, prenoms: msgAnnonce.prenoms, nom: msgAnnonce.nom, created_at: a.created_at },
+            Array.isArray(a.fichiers) ? a.fichiers : [], parseInt(id))];
         });
 
         const allMsgs = [...msgs, ...annonceMsgs];
@@ -415,7 +464,7 @@ const getMessagesCanal = async (req, res) => {
 // Envoyer un message dans un canal (fallback REST si WebSocket échoue)
 const envoyerMessageCanal = async (req, res) => {
   const { id } = req.params;
-  const { contenu } = req.body;
+  const { contenu, reponse_a_id } = req.body;
 
   if (!contenu?.trim()) {
     return res.status(400).json({ success: false, error: 'Contenu requis' });
@@ -435,11 +484,15 @@ const envoyerMessageCanal = async (req, res) => {
       });
     }
 
+    await assurerColonnesReponse();
+    // Réponse ciblée : le message cité doit appartenir à ce canal.
+    const citation = reponse_a_id ? await citationCanal(reponse_a_id, id) : null;
+
     const { rows: inserted } = await pool.query(
-      `INSERT INTO messages (canal_id, auteur_id, contenu, type, created_at)
-       VALUES ($1, $2, $3, 'canal', NOW())
+      `INSERT INTO messages (canal_id, auteur_id, contenu, type, reponse_a_id, created_at)
+       VALUES ($1, $2, $3, 'canal', $4, NOW())
        RETURNING id, canal_id, auteur_id, contenu, created_at`,
-      [id, req.user.id, contenu.trim()]
+      [id, req.user.id, contenu.trim(), citation ? citation.id : null]
     );
     const msgId = inserted[0].id;
 
@@ -455,11 +508,40 @@ const envoyerMessageCanal = async (req, res) => {
        WHERE m.id = $1`,
       [msgId]
     );
-    const message = fullMsgs[0] || inserted[0];
+    const message = {
+      ...(fullMsgs[0] || inserted[0]),
+      reponse_a_id: citation ? citation.id : null,
+      reponse_texte: citation ? citation.texte : null,
+      reponse_auteur: citation ? citation.auteur : null,
+    };
 
     // Émettre via Socket.io si disponible
     const io = req.app.get('io');
     if (io) io.to(`canal:${id}`).emit('message:canal', message);
+
+    // 🔔 Notification push OneSignal aux membres du canal (hors expéditeur)
+    try {
+      const { rows: membres } = await pool.query(
+        `SELECT u.matricule FROM canal_membres cm
+         JOIN users u ON u.id = cm.user_id
+         WHERE cm.canal_id = $1 AND cm.user_id != $2 AND u.matricule IS NOT NULL`,
+        [id, req.user.id]
+      );
+      if (membres.length > 0) {
+        const matricules = membres.map(m => m.matricule);
+        const canalNom = canal?.nom || 'Canal';
+        const expediteurNom = `${message.prenoms || ''} ${message.nom || ''}`.trim();
+        const apercu = contenu.trim().length > 80 ? contenu.trim().substring(0, 80) + '...' : contenu.trim();
+        envoyerNotification({
+          titre: `📢 ${canalNom}`,
+          message: `${expediteurNom}: ${apercu}`,
+          destinataires: matricules,
+          donnees: { type: 'message_canal', canal_id: id },
+        }).catch(e => console.warn('[OneSignal] Erreur notif canal:', e.message));
+      }
+    } catch (e) {
+      console.warn('[OneSignal] Erreur notif canal:', e.message);
+    }
 
     res.status(201).json({ success: true, data: message });
   } catch (err) {
@@ -503,6 +585,29 @@ const getConversationsPrivees = async (req, res) => {
   }
 };
 
+// ── Réponse ciblée (messages privés) ─────────────────────
+// Vérifie que le message cité appartient bien à la conversation entre les
+// deux interlocuteurs, et renvoie son texte + son auteur (aperçu de la citation).
+const citationPrivee = async (reponseId, userA, userB) => {
+  const id = parseInt(reponseId, 10);
+  if (!Number.isInteger(id)) return null;
+  const { rows } = await pool.query(
+    `SELECT mp.id, mp.contenu, u.prenoms, u.nom
+     FROM messages_prives mp
+     JOIN users u ON u.id = mp.expediteur_id
+     WHERE mp.id = $1
+       AND ((mp.expediteur_id = $2 AND mp.destinataire_id = $3)
+         OR (mp.expediteur_id = $3 AND mp.destinataire_id = $2))`,
+    [id, userA, userB]
+  );
+  if (!rows.length) return null;
+  return {
+    id: rows[0].id,
+    texte: rows[0].contenu,
+    auteur: `${rows[0].prenoms || ''} ${rows[0].nom || ''}`.trim(),
+  };
+};
+
 // ── GET /api/messages/prives/:userId ─────────────────────
 // Messages d'une conversation privée
 const getMessagesPrives = async (req, res) => {
@@ -514,11 +619,16 @@ const getMessagesPrives = async (req, res) => {
       `SELECT mp.id, mp.contenu, mp.created_at, mp.is_read,
               mp.expediteur_id, mp.destinataire_id,
               u.prenoms, u.nom, u.role, u.photo_url,
+              mp.reponse_a_id,
+              rp.contenu AS reponse_texte,
+              NULLIF(TRIM(CONCAT(ru.prenoms, ' ', ru.nom)), '') AS reponse_auteur,
               COALESCE((SELECT JSON_AGG(r.emoji) FROM reactions r
                         WHERE r.message_id = mp.id AND r.message_type = 'prive'), '[]') AS reactions,
               EXISTS (SELECT 1 FROM messages_epingles me WHERE me.message_id = mp.id AND me.message_type = 'prive') AS epingle
        FROM messages_prives mp
        JOIN users u ON u.id = mp.expediteur_id
+       LEFT JOIN messages_prives rp ON rp.id = mp.reponse_a_id
+       LEFT JOIN users ru ON ru.id = rp.expediteur_id
        WHERE ((mp.expediteur_id = $1 AND mp.destinataire_id = $2)
           OR (mp.expediteur_id = $2 AND mp.destinataire_id = $1))
          AND NOT EXISTS (
@@ -540,7 +650,7 @@ const getMessagesPrives = async (req, res) => {
 // Envoyer un message privé (fallback REST)
 const envoyerMessagePrive = async (req, res) => {
   const { userId } = req.params;
-  const { contenu } = req.body;
+  const { contenu, reponse_a_id } = req.body;
 
   if (!contenu?.trim()) {
     return res.status(400).json({ success: false, error: 'Contenu requis' });
@@ -550,11 +660,13 @@ const envoyerMessagePrive = async (req, res) => {
     if (!(await userDeMonEtab(userId, req.etablissementId))) {
       return res.status(403).json({ success: false, error: 'Destinataire introuvable.' });
     }
+    // Réponse ciblée : le message cité doit appartenir à cette conversation.
+    const citation = reponse_a_id ? await citationPrivee(reponse_a_id, req.user.id, userId) : null;
     const { rows } = await pool.query(
-      `INSERT INTO messages_prives (expediteur_id, destinataire_id, contenu, created_at)
-       VALUES ($1, $2, $3, NOW())
-       RETURNING id, expediteur_id, destinataire_id, contenu, created_at`,
-      [req.user.id, userId, contenu.trim()]
+      `INSERT INTO messages_prives (expediteur_id, destinataire_id, contenu, reponse_a_id, created_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       RETURNING id, expediteur_id, destinataire_id, contenu, reponse_a_id, created_at`,
+      [req.user.id, userId, contenu.trim(), citation ? citation.id : null]
     );
 
     const { rows: senderRows } = await pool.query(
@@ -567,11 +679,33 @@ const envoyerMessagePrive = async (req, res) => {
       prenoms: senderRows[0]?.prenoms || req.user.prenoms || '',
       nom: senderRows[0]?.nom || req.user.nom || '',
       role: senderRows[0]?.role || req.user.role || '',
+      reponse_texte: citation ? citation.texte : null,
+      reponse_auteur: citation ? citation.auteur : null,
     };
 
     // userId est un UUID : ne surtout pas le convertir en entier
     const io = req.app.get('io');
     if (io) notifierUser(io, userId, 'message:prive', messageComplet);
+
+    // 🔔 Notification push OneSignal au destinataire
+    try {
+      const { rows: destRows } = await pool.query(
+        `SELECT matricule FROM users WHERE id = $1`,
+        [userId]
+      );
+      if (destRows[0]?.matricule) {
+        const expediteurNom = `${senderRows[0]?.prenoms || ''} ${senderRows[0]?.nom || ''}`.trim();
+        const apercu = contenu.trim().length > 80 ? contenu.trim().substring(0, 80) + '...' : contenu.trim();
+        envoyerNotification({
+          titre: `💬 ${expediteurNom}`,
+          message: apercu,
+          destinataires: destRows[0].matricule,
+          donnees: { type: 'message_prive', expediteur_id: req.user.id },
+        }).catch(e => console.warn('[OneSignal] Erreur notif message privé:', e.message));
+      }
+    } catch (e) {
+      console.warn('[OneSignal] Erreur notif message privé:', e.message);
+    }
 
     res.status(201).json({ success: true, data: messageComplet });
   } catch (err) {
@@ -678,6 +812,7 @@ const getMessagesGroupe = async (req, res) => {
   try {
     const acces = await accesGroupe(req, filiereId, req.query.niveau);
     if (!acces.ok) return res.status(403).json({ success: false, error: 'Accès refusé' });
+    await assurerColonnesReponse();
 
     // ✅ etudiant_role + niveau + photo_url ajoutés pour badge et photo.
     // Étudiant : uniquement les messages de SON niveau. Staff : un niveau si
@@ -686,12 +821,17 @@ const getMessagesGroupe = async (req, res) => {
       `SELECT mg.id, mg.contenu, mg.created_at,
               mg.auteur_id, u.prenoms, u.nom, u.etudiant_role, u.photo_url,
               COALESCE(MAX(e.niveau), u.niveau) AS niveau,
+              mg.reponse_a_id,
+              rg.contenu AS reponse_texte,
+              NULLIF(TRIM(CONCAT(ru.prenoms, ' ', ru.nom)), '') AS reponse_auteur,
               COALESCE(
                 JSON_AGG(r.emoji) FILTER (WHERE r.emoji IS NOT NULL), '[]'
               ) AS reactions,
               EXISTS (SELECT 1 FROM messages_epingles me WHERE me.message_id = mg.id AND me.message_type = 'groupe') AS epingle
       FROM messages_groupe mg
       JOIN users u ON u.id = mg.auteur_id
+      LEFT JOIN messages_groupe rg ON rg.id = mg.reponse_a_id
+      LEFT JOIN users ru ON ru.id = rg.auteur_id
       LEFT JOIN etudiants e ON e.user_id = u.id
       LEFT JOIN reactions r ON r.message_id = mg.id AND r.message_type = 'groupe'
       WHERE mg.filiere_id = $1
@@ -700,7 +840,7 @@ const getMessagesGroupe = async (req, res) => {
           SELECT 1 FROM messages_masques mm
           WHERE mm.message_id = mg.id AND mm.message_type = 'groupe' AND mm.user_id = $3
         )
-      GROUP BY mg.id, u.id
+      GROUP BY mg.id, u.id, rg.id, ru.id
       ORDER BY mg.created_at DESC
       LIMIT $2`,
       [filiereId, limite, req.user.id, acces.niveau]
@@ -716,7 +856,7 @@ const getMessagesGroupe = async (req, res) => {
 // Envoyer dans le groupe filière + niveau (fallback REST)
 const envoyerMessageGroupe = async (req, res) => {
   const { filiereId } = req.params;
-  const { contenu } = req.body;
+  const { contenu, reponse_a_id } = req.body;
 
   if (!contenu?.trim()) {
     return res.status(400).json({ success: false, error: 'Contenu requis' });
@@ -731,11 +871,15 @@ const envoyerMessageGroupe = async (req, res) => {
       return res.status(400).json({ success: false, error: 'Choisissez le niveau du groupe.' });
     }
 
+    await assurerColonnesReponse();
+    // Réponse ciblée : le message cité doit appartenir à ce groupe (filière + niveau).
+    const citation = reponse_a_id ? await citationGroupe(reponse_a_id, filiereId, acces.niveau) : null;
+
     const { rows: inserted } = await pool.query(
-      `INSERT INTO messages_groupe (filiere_id, niveau, auteur_id, contenu, created_at)
-       VALUES ($1, $2, $3, $4, NOW())
+      `INSERT INTO messages_groupe (filiere_id, niveau, auteur_id, contenu, reponse_a_id, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
        RETURNING id, filiere_id, auteur_id, contenu, created_at`,
-      [filiereId, acces.niveau, req.user.id, contenu.trim()]
+      [filiereId, acces.niveau, req.user.id, contenu.trim(), citation ? citation.id : null]
     );
 
     // ✅ etudiant_role + niveau + photo_url ajoutés pour que badge et photo
@@ -754,11 +898,39 @@ const envoyerMessageGroupe = async (req, res) => {
       etudiant_role: userRows[0]?.etudiant_role,
       photo_url: userRows[0]?.photo_url,
       niveau: userRows[0]?.niveau,
+      reponse_a_id: citation ? citation.id : null,
+      reponse_texte: citation ? citation.texte : null,
+      reponse_auteur: citation ? citation.auteur : null,
     };
 
     // Diffusion limitée à la salle « filière + niveau » : les autres niveaux ne reçoivent rien.
     const io = req.app.get('io');
     if (io) io.to(roomGroupe(filiereId, acces.niveau)).emit('message:groupe', messageAvecAuteur);
+
+    // 🔔 Notification push OneSignal aux étudiants du groupe (hors expéditeur)
+    try {
+      const { rows: membres } = await pool.query(
+        `SELECT u.matricule FROM etudiants e
+         JOIN users u ON u.id = e.user_id
+         WHERE e.filiere_id = $1 AND e.niveau = $2 AND e.user_id != $3
+           AND u.matricule IS NOT NULL
+           AND COALESCE(u.statut, 'actif') NOT IN ('suspendu', 'renvoye')`,
+        [filiereId, acces.niveau, req.user.id]
+      );
+      if (membres.length > 0) {
+        const matricules = membres.map(m => m.matricule);
+        const expediteurNom = `${userRows[0]?.prenoms || ''} ${userRows[0]?.nom || ''}`.trim();
+        const apercu = contenu.trim().length > 80 ? contenu.trim().substring(0, 80) + '...' : contenu.trim();
+        envoyerNotification({
+          titre: `👥 Groupe ${acces.niveau}`,
+          message: `${expediteurNom}: ${apercu}`,
+          destinataires: matricules,
+          donnees: { type: 'message_groupe', filiere_id: filiereId, niveau: acces.niveau },
+        }).catch(e => console.warn('[OneSignal] Erreur notif groupe:', e.message));
+      }
+    } catch (e) {
+      console.warn('[OneSignal] Erreur notif groupe:', e.message);
+    }
 
     res.status(201).json({ success: true, data: messageAvecAuteur });
   } catch (err) {

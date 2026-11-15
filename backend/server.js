@@ -13,12 +13,25 @@ dotenv.config({ path: path.join(__dirname, 'src', '.env') });
 const app = express();
 app.get('/health', (req, res) => res.status(200).send('ok'));
 const server = http.createServer(app);
-const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:3000').split(',');
+const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:3000')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+
 const isLocalhostOrigin = (origin) => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+const isVercelOrigin = (origin) => /^https:\/\/([a-zA-Z0-9_-]+\.)*vercel\.app$/.test(origin);
+
 const corsOriginCheck = (origin, callback) => {
-  if (!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin) || isLocalhostOrigin(origin)) {
+  if (
+    !origin ||
+    allowedOrigins.includes('*') ||
+    allowedOrigins.includes(origin) ||
+    isLocalhostOrigin(origin) ||
+    isVercelOrigin(origin)
+  ) {
     return callback(null, true);
   }
+  console.warn(`[CORS] Origine bloquée : "${origin}". Autorisé :`, allowedOrigins);
   return callback(new Error('Origine non autorisee par CORS.'));
 };
 const io = new Server(server, {

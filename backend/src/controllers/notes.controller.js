@@ -53,6 +53,9 @@ const getNotesEtudiant = async (req, res) => {
 
         const result = await pool.query(`
             SELECT n.id, n.valeur AS note, n.mention, m.id AS module_id, m.nom AS module_nom, m.coefficient,
+                   (SELECT COUNT(*) FROM notes_historique h WHERE h.note_id = n.id::text)::int AS nb_corrections,
+                   (SELECT h.ancienne_valeur FROM notes_historique h WHERE h.note_id = n.id::text
+                     ORDER BY h.created_at ASC LIMIT 1) AS valeur_initiale,
                    sn.date_session, sn.semestre, sn.annee_academique,
                    u.nom AS prof_nom, u.prenoms AS prof_prenoms
             FROM notes n
@@ -179,6 +182,9 @@ const generateBulletinPdf = async (req, res) => {
 const createGradeSession = async (req, res) => {
     try {
         const { filiere_id, filiere_nom, niveau, module_id, notes, statut, semestre, annee_academique } = req.body;
+        // Option : ajouter à chaque note les bonus de participation non encore utilisés
+        // (table bonus_etudiants), plafonnés à 20.
+        const appliquerBonus = req.body.appliquer_bonus === true;
         const professeur_id = req.user.id;
         const statutFinal = statut === 'validee' ? 'validee' : 'en_attente';
 
@@ -253,10 +259,32 @@ const createGradeSession = async (req, res) => {
                 const etudiantResult = await pool.query(`SELECT id FROM etudiants e WHERE e.matricule = $1${etabEtu(pEtu, req.etablissementId)}`, pEtu);
                 if (etudiantResult.rows.length > 0) {
                     const e_id = etudiantResult.rows[0].id;
+                    let valeurFinale = normaliserNote(note.valeur);
+                    let bonusAjoutes = false;
+                    if (appliquerBonus) {
+                        const b = await pool.query(
+                            `SELECT COALESCE(SUM(valeur), 0) AS total FROM bonus_etudiants
+                             WHERE etudiant_id = $1 AND module_id = $2 AND session_id IS NULL`,
+                            [e_id, module_id]
+                        );
+                        const totalBonus = parseFloat(b.rows[0].total) || 0;
+                        if (totalBonus > 0) {
+                            valeurFinale = Math.min(20, Math.round((valeurFinale + totalBonus) * 100) / 100);
+                            bonusAjoutes = true;
+                        }
+                    }
                     await pool.query(`
                         INSERT INTO notes (etudiant_id, module_id, session_id, valeur, mention)
                         VALUES ($1, $2, $3, $4, $5)
-                    `, [e_id, module_id, session_id, normaliserNote(note.valeur), note.mention || null]);
+                    `, [e_id, module_id, session_id, valeurFinale, note.mention || null]);
+                    if (bonusAjoutes) {
+                        // Bonus « consommés » : ils ne seront pas ajoutés une deuxième fois.
+                        await pool.query(
+                            `UPDATE bonus_etudiants SET session_id = $1
+                             WHERE etudiant_id = $2 AND module_id = $3 AND session_id IS NULL`,
+                            [session_id, e_id, module_id]
+                        );
+                    }
                 } else {
                     skippedStudents.push({ matricule: note.matricule, reason: 'étudiant introuvable' });
                 }
@@ -696,7 +724,14 @@ const getListeClasseAvecNotes = async (req, res) => {
 
         const pAbs = [module_id, filiere_id, niveau];
         const absencesRes = await pool.query(
-            `SELECT ap.matricule, COUNT(*) FILTER (WHERE ap.statut = 'absent') AS nb_absences
+            `SELECT ap.matricule,
+                COUNT(*) FILTER (WHERE ap.statut = 'absent') AS nb_absences,
+                COALESCE(SUM(a.duree_heures) FILTER (WHERE ap.statut = 'absent'), 0) AS heures_absence,
+                COUNT(*) FILTER (WHERE ap.statut = 'justifie') AS nb_justifies,
+                COALESCE(SUM(a.duree_heures) FILTER (WHERE ap.statut = 'justifie'), 0) AS heures_justifiees,
+                COUNT(*) FILTER (WHERE ap.statut = 'retard') AS nb_retards,
+                COALESCE(SUM(LEAST(GREATEST(EXTRACT(EPOCH FROM (ap.arrivee_at - a.created_at)) / 3600.0, 0), a.duree_heures))
+                    FILTER (WHERE ap.statut = 'retard' AND ap.arrivee_at IS NOT NULL), 0) AS heures_retard
              FROM appel_presences ap
              JOIN appels a ON a.id = ap.appel_id
              WHERE a.module_id = $1 AND a.filiere_id = $2 AND a.niveau = $3${etabSession(pAbs, req.etablissementId, 'a')}
@@ -704,8 +739,17 @@ const getListeClasseAvecNotes = async (req, res) => {
             pAbs
         );
         const absencesParMatricule = {};
+        const statsParMatricule = {};
+        const arrondi = (v) => Math.round((parseFloat(v) || 0) * 100) / 100;
         for (const row of absencesRes.rows) {
             absencesParMatricule[row.matricule] = parseInt(row.nb_absences, 10) || 0;
+            statsParMatricule[row.matricule] = {
+                heures_absence: arrondi(row.heures_absence),
+                nb_justifies: parseInt(row.nb_justifies, 10) || 0,
+                heures_justifiees: arrondi(row.heures_justifiees),
+                nb_retards: parseInt(row.nb_retards, 10) || 0,
+                heures_retard: arrondi(row.heures_retard),
+            };
         }
 
         const etudiants = etudiantsRes.rows.map(e => ({
@@ -714,6 +758,11 @@ const getListeClasseAvecNotes = async (req, res) => {
             prenoms: e.prenoms,
             notes: sessionIds.map(sid => notesParEtudiant[e.id]?.[sid] ?? null),
             nb_absences: absencesParMatricule[e.matricule] || 0,
+            heures_absence: statsParMatricule[e.matricule]?.heures_absence || 0,
+            nb_justifies: statsParMatricule[e.matricule]?.nb_justifies || 0,
+            heures_justifiees: statsParMatricule[e.matricule]?.heures_justifiees || 0,
+            nb_retards: statsParMatricule[e.matricule]?.nb_retards || 0,
+            heures_retard: statsParMatricule[e.matricule]?.heures_retard || 0,
         }));
 
         res.json({

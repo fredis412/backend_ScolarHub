@@ -594,6 +594,10 @@ const getProgrammeEnfant = async (req, res) => {
         .filter((e) => !jour(e.dateFin) || jour(e.dateFin) >= aujourdhui)
         .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))[0] || null;
     }
+    // Semaines suivantes déjà envoyées (même si la semaine en cours n'est pas finie).
+    const prochains = nonArchives
+      .filter((e) => (!actif || e.id !== actif.id) && jour(e.dateDebut) && jour(e.dateDebut) > aujourdhui)
+      .sort((a, b) => String(jour(a.dateDebut)).localeCompare(String(jour(b.dateDebut))));
     const historique = lignes
       .filter((e) => e.archive || (jour(e.dateFin) && jour(e.dateFin) < aujourdhui))
       .sort((a, b) => String(jour(b.dateFin) || '').localeCompare(String(jour(a.dateFin) || '')));
@@ -603,6 +607,7 @@ const getProgrammeEnfant = async (req, res) => {
         filiere: { id: fiche.filiere_id, nom: fiche.filiere_nom, domaine: fiche.domaine || '' },
         niveau: fiche.niveau,
         actif: actif || null,
+        prochains,
         historique,
       },
     });

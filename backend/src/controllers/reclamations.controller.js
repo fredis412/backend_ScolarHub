@@ -1,12 +1,14 @@
 const pool = require('../config/db');
 const { envoyerNotificationAuto } = require('./notifications.controller');
+const { envoyerNotification } = require('../services/onesignal.service');
 
 // ════════════════════════════════════════════════════════════════════════════
 // RÉCLAMATIONS — circuit en 5 étapes
 //  1. L'étudiant dépose            (etape = 'admin',        statut = 'en_attente')
 //  2. L'admin transmet ou rejette  (etape = 'professeur',   statut = 'en_cours')
-//  3. Le professeur traite/renvoie (etape = 'verification', statut = 'en_cours')
-//  4. L'admin vérifie et répond    (etape = 'termine',      statut = 'resolu')
+//  3. Le professeur DÉCIDE         (etape = 'verification', statut = 'en_cours')
+//       note maintenue, ou correction proposée (devoir + nouvelle note + justification)
+//  4. L'admin vérifie, applique la correction et répond (etape = 'termine', statut = 'resolu')
 //  5. L'étudiant reçoit la réponse
 // reclamations.etudiant_id = users.id (uuid). Le professeur = users.id aussi.
 // ════════════════════════════════════════════════════════════════════════════
@@ -15,6 +17,26 @@ const CATEGORIES = ['Notes & Moyennes', 'Accès & Connexion', 'Documents', 'Insc
 const TYPES_LEGACY = ['note', 'moyenne', 'absence'];
 // Seules ces catégories peuvent être transmises à un professeur (le reste relève de l'administration).
 const CATEGORIES_TRANSMISSIBLES = ['Notes & Moyennes', 'Documents', 'Autre'];
+
+// Décision du professeur sur une contestation de note
+const DECISIONS = ['maintenue', 'modifiee'];
+
+// Normalise une note saisie (« 12,5 » accepté). null si invalide ou hors 0–20.
+function normaliserNote(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = typeof v === 'number' ? v : Number(String(v).trim().replace(',', '.'));
+  if (!Number.isFinite(n) || n < 0 || n > 20) return null;
+  return Math.round(n * 100) / 100;
+}
+
+// Pour l'étudiant : tant que la réclamation n'est pas close, il ne voit ni la
+// décision du professeur ni la note proposée (l'administration n'a pas encore validé).
+function pourEtudiant(row) {
+  if (!row) return row;
+  if (row.statut === 'resolu' || row.statut === 'rejete') return row;
+  const { prof_commentaire, decision_prof, note_proposee, ancienne_note, note_id, ...reste } = row;
+  return reste;
+}
 
 const estAdmin = (req) => req.user.role === 'admin';
 const estProf  = (req) => req.user.role === 'professeur';
@@ -174,7 +196,7 @@ const getMesReclamations = async (req, res) => {
   try {
     const result = await pool.query(
       `${SELECT_LISTE} WHERE r.etudiant_id = $1 ORDER BY r.created_at DESC`, [req.user.id]);
-    res.json({ success: true, data: result.rows });
+    res.json({ success: true, data: result.rows.map(pourEtudiant) });
   } catch (error) {
     console.error('[getMesReclamations]', error);
     res.status(500).json({ success: false, message: 'Erreur lors du chargement.' });
@@ -243,7 +265,8 @@ const getReclamation = async (req, res) => {
        FROM reclamation_messages m LEFT JOIN users u ON u.id = m.auteur_id
        WHERE m.reclamation_id = $1 ${voitInterne ? '' : 'AND m.interne = false'}
        ORDER BY m.created_at`, [rec.id]);
-    res.json({ success: true, data: { ...liste.rows[0], pieces: pieces.rows, messages: messages.rows } });
+    const detail = { ...liste.rows[0], pieces: pieces.rows, messages: messages.rows };
+    res.json({ success: true, data: voitInterne ? detail : pourEtudiant(detail) });
   } catch (error) {
     console.error('[getReclamation]', error);
     res.status(500).json({ success: false, message: 'Erreur lors du chargement.' });
@@ -352,21 +375,98 @@ const transfererReclamation = async (req, res) => {
   }
 };
 
+// ── GET /api/reclamations/:id/notes-concernees (professeur / admin) ─────────
+// Les notes (devoirs) validées de l'étudiant dans le module contesté : le
+// professeur choisit laquelle corriger.
+const getNotesConcernees = async (req, res) => {
+  try {
+    if (!estAdmin(req) && !estProf(req)) return res.status(403).json({ success: false, message: 'Accès refusé.' });
+    const rec = await chargerAcces(req, req.params.id);
+    if (!rec) return res.status(404).json({ success: false, message: 'Réclamation introuvable.' });
+    // Un professeur ne corrige que les notes qu'il a lui-même saisies ; si la
+    // réclamation ne précise pas le module, on liste toutes ses notes pour cet étudiant.
+    const params = [rec.etudiant_id];
+    let cond = '';
+    // Module identifié par son id, ou à défaut par son nom (selon ce que le formulaire a enregistré).
+    if (rec.module_id || rec.module_nom) {
+      params.push((rec.module_id || '').toString(), (rec.module_nom || '').toString());
+      cond += ` AND (CAST(n.module_id AS text) = $${params.length - 1} OR m.nom = $${params.length})`;
+    }
+    if (estProf(req)) { params.push(req.user.id); cond += ` AND sn.professeur_id = $${params.length}`; }
+    const r = await pool.query(
+      `SELECT n.id AS note_id, n.valeur, n.mention, m.nom AS module_nom, sn.id AS session_id, sn.date_session,
+              sn.semestre, sn.annee_academique
+       FROM notes n
+       JOIN etudiants e ON e.id = n.etudiant_id
+       JOIN modules m ON m.id = n.module_id
+       JOIN sessions_notes sn ON sn.id = n.session_id
+       WHERE e.user_id = $1 AND sn.statut = 'validee'${cond}
+       ORDER BY sn.date_session`, params);
+    res.json({ success: true, data: r.rows });
+  } catch (error) {
+    console.error('[getNotesConcernees]', error);
+    res.status(500).json({ success: false, message: 'Erreur lors du chargement des notes.' });
+  }
+};
+
 // ── PATCH /api/reclamations/:id/retour (professeur) ─────────────────────────
-// body: { commentaire }
+// body: { decision: 'maintenue' | 'modifiee', commentaire, note_id?, nouvelle_note? }
+// Pour une réclamation « Notes & Moyennes », la décision est obligatoire. Si la
+// note est modifiée, le professeur indique le devoir concerné et la nouvelle valeur ;
+// RIEN n'est changé dans les notes avant la validation de l'administration.
 const retourProfesseur = async (req, res) => {
   try {
     const commentaire = (req.body.commentaire || '').toString().trim();
-    if (!commentaire) return res.status(400).json({ success: false, message: 'Votre commentaire est requis.' });
+    if (!commentaire) return res.status(400).json({ success: false, message: 'Votre justification est requise.' });
     const rec = await chargerAcces(req, req.params.id);
     if (!rec) return res.status(404).json({ success: false, message: 'Réclamation introuvable.' });
     if (rec.etape !== 'professeur') {
       return res.status(400).json({ success: false, message: 'Cette réclamation n\'est pas en attente de votre traitement.' });
     }
+
+    const estNote = rec.categorie === 'Notes & Moyennes';
+    const decision = (req.body.decision || '').toString();
+    let noteId = null, ancienne = null, proposee = null;
+
+    if (estNote) {
+      if (!DECISIONS.includes(decision)) {
+        return res.status(400).json({ success: false, message: 'Choisissez : maintenir la note ou proposer une correction.' });
+      }
+      if (decision === 'modifiee') {
+        proposee = normaliserNote(req.body.nouvelle_note);
+        if (proposee === null) return res.status(400).json({ success: false, message: 'Nouvelle note invalide (0 à 20).' });
+        if (!req.body.note_id) return res.status(400).json({ success: false, message: 'Indiquez le devoir à corriger.' });
+        const pn = [req.body.note_id, rec.etudiant_id, req.user.id];
+        let condMod = '';
+        if (rec.module_id || rec.module_nom) {
+          pn.push((rec.module_id || '').toString(), (rec.module_nom || '').toString());
+          condMod = ` AND (CAST(n.module_id AS text) = $${pn.length - 1} OR m.nom = $${pn.length})`;
+        }
+        const n = await pool.query(
+          `SELECT n.id, n.valeur FROM notes n
+           JOIN modules m ON m.id = n.module_id
+           JOIN etudiants e ON e.id = n.etudiant_id
+           JOIN sessions_notes sn ON sn.id = n.session_id
+           WHERE n.id = $1 AND e.user_id = $2 AND sn.professeur_id = $3${condMod}`, pn);
+        if (!n.rows[0]) return res.status(400).json({ success: false, message: 'Ce devoir ne correspond pas à la réclamation.' });
+        noteId = n.rows[0].id;
+        ancienne = Number(n.rows[0].valeur);
+        if (ancienne === proposee) {
+          return res.status(400).json({ success: false, message: 'La nouvelle note est identique à la note actuelle : choisissez « Maintenir la note ».' });
+        }
+      }
+    }
+
     await pool.query(
-      `UPDATE reclamations SET etape = 'verification', prof_commentaire = $1, date_retour = now() WHERE id = $2`,
-      [commentaire, rec.id]);
-    await ajouterMessage(rec.id, req, 'professeur', commentaire, true);
+      `UPDATE reclamations SET etape = 'verification', prof_commentaire = $1, date_retour = now(),
+              decision_prof = $2, note_id = $3, ancienne_note = $4, note_proposee = $5
+       WHERE id = $6`,
+      [commentaire, estNote ? decision : null, noteId, ancienne, proposee, rec.id]);
+
+    const resume = !estNote ? commentaire
+      : decision === 'modifiee' ? `Correction proposée : ${ancienne} → ${proposee}. ${commentaire}`
+      : `Note maintenue. ${commentaire}`;
+    await ajouterMessage(rec.id, req, 'professeur', resume, true);
     await notifierAdmins(req, 'Réclamation traitée par le professeur', `${rec.numero || 'Une réclamation'} est prête à être vérifiée.`);
     res.json({ success: true, message: 'Retournée à l\'administration.' });
   } catch (error) {
@@ -375,26 +475,119 @@ const retourProfesseur = async (req, res) => {
   }
 };
 
+// ── PATCH /api/reclamations/:id/renvoyer (admin) ────────────────────────────
+// body: { consigne } — l'administration n'est pas convaincue : retour au professeur.
+const renvoyerAuProfesseur = async (req, res) => {
+  try {
+    const consigne = (req.body.consigne || '').toString().trim();
+    if (!consigne) return res.status(400).json({ success: false, message: 'Précisez ce que le professeur doit revoir.' });
+    const rec = await chargerAcces(req, req.params.id);
+    if (!rec) return res.status(404).json({ success: false, message: 'Réclamation introuvable.' });
+    if (rec.etape !== 'verification' || !rec.prof_id) {
+      return res.status(400).json({ success: false, message: 'Cette réclamation n\'est pas en cours de vérification.' });
+    }
+    await pool.query(
+      `UPDATE reclamations SET etape = 'professeur', decision_prof = NULL, note_id = NULL, ancienne_note = NULL,
+              note_proposee = NULL, prof_commentaire = NULL, date_retour = NULL WHERE id = $1`, [rec.id]);
+    await ajouterMessage(rec.id, req, 'admin', consigne, true);
+    notifier(rec.prof_id, 'Réclamation à revoir', `${rec.numero || 'Une réclamation'} vous est renvoyée par l'administration.`);
+    res.json({ success: true, message: 'Renvoyée au professeur.' });
+  } catch (error) {
+    console.error('[renvoyerAuProfesseur]', error);
+    res.status(500).json({ success: false, message: 'Erreur lors du renvoi.' });
+  }
+};
+
 // ── PATCH /api/reclamations/:id/repondre (admin) ────────────────────────────
+// body: { reponse?, note_finale? }
+// Réclamation « Notes & Moyennes » : possible seulement après la décision du
+// professeur. Si la note est modifiée, la correction est appliquée ICI, en une
+// seule requête atomique (note + historique + moyenne provisoire + clôture), puis l'étudiant
+// reçoit la note définitive. L'administration peut ajuster la note finale.
 const repondreReclamation = async (req, res) => {
   try {
     const { id } = req.params;
-    const reponse = (req.body.reponse || '').toString().trim();
-    if (!reponse) return res.status(400).json({ success: false, message: 'La réponse est requise.' });
     const rec = await chargerAcces(req, id);
     if (!rec) return res.status(404).json({ success: false, message: 'Réclamation introuvable.' });
     if (rec.statut === 'resolu' || rec.statut === 'rejete') {
       return res.status(400).json({ success: false, message: 'Cette réclamation est déjà clôturée.' });
     }
-    await pool.query(
-      `UPDATE reclamations SET statut = 'resolu', etape = 'termine', reponse = $1, date_traitement = now() WHERE id = $2`,
-      [reponse, id]);
+    const estNote = rec.categorie === 'Notes & Moyennes' && rec.prof_id;
+    let reponse = (req.body.reponse || '').toString().trim();
+    let noteFinale = null, note = null, bulletins = [];
+
+    if (estNote) {
+      if (rec.etape !== 'verification' || !DECISIONS.includes(rec.decision_prof)) {
+        return res.status(400).json({ success: false, message: 'Le professeur n\'a pas encore rendu sa décision.' });
+      }
+      if (rec.decision_prof === 'modifiee') {
+        noteFinale = normaliserNote(req.body.note_finale ?? rec.note_proposee);
+        if (noteFinale === null) return res.status(400).json({ success: false, message: 'Note finale invalide (0 à 20).' });
+        const n = await pool.query(
+          `SELECT n.id, n.valeur, n.etudiant_id, n.module_id, sn.semestre, sn.annee_academique
+           FROM notes n JOIN sessions_notes sn ON sn.id = n.session_id WHERE n.id = $1`, [rec.note_id]);
+        if (!n.rows[0]) return res.status(400).json({ success: false, message: 'Note introuvable.' });
+        note = n.rows[0];
+      }
+    }
+    if (!reponse && !estNote) return res.status(400).json({ success: false, message: 'La réponse est requise.' });
+
+    const ancienneReelle = note ? Number(note.valeur) : null;
+    if (!reponse) {
+      reponse = rec.decision_prof === 'modifiee'
+        ? `Après vérification, votre note est corrigée : ${ancienneReelle} → ${noteFinale} / 20.`
+        : 'Après vérification, votre note est maintenue.';
+    }
+
+    if (note) {
+      // Tout est fait par la fonction SQL appliquer_correction_note (atomique : note, historique,
+      // moyenne provisoire, clôture). Voir migration_fonction_correction_note.sql.
+      await pool.query(
+        `SELECT appliquer_correction_note($1::int, $2::numeric, $3::uuid, $4::uuid, $5::text, $6::text) AS r`,
+        [note.id, noteFinale, id, req.user.id, rec.prof_commentaire || null, reponse]);
+      // Bulletins déjà publiés pour ce semestre : à republier par l'administration.
+      const b = await pool.query(
+        `SELECT id, semestre, annee_academique, session_type FROM bulletins
+         WHERE etudiant_id = $1 AND publie = true AND semestre = $2 AND annee_academique = $3`,
+        [note.etudiant_id, note.semestre, note.annee_academique]);
+      bulletins = b.rows;
+    } else {
+      await pool.query(
+        `UPDATE reclamations SET statut = 'resolu', etape = 'termine', reponse = $1, date_traitement = now() WHERE id = $2`,
+        [reponse, id]);
+    }
+
     await ajouterMessage(id, req, 'admin', reponse, false);
-    notifier(rec.etudiant_id, 'Réclamation traitée', `Votre réclamation ${rec.numero || ''} a été résolue.`);
-    res.json({ success: true, message: 'Réponse envoyée.' });
+    if (noteFinale !== null) {
+      // Notification dédiée (cloche + push) : la note a changé, l'étudiant doit le voir.
+      const texte = `Votre note de ${rec.module_nom || 'un module'} a été corrigée : ${ancienneReelle} → ${noteFinale} / 20.`;
+      (async () => {
+        try {
+          await envoyerNotificationAuto(rec.etudiant_id, 'Note corrigée', texte, 'note', { reclamation_id: rec.id });
+          const u = await pool.query('SELECT matricule FROM users WHERE id = $1', [rec.etudiant_id]);
+          const mat = u.rows[0]?.matricule;
+          if (mat) {
+            envoyerNotification({
+              titre: '📝 Note corrigée', message: texte, destinataires: [mat],
+              donnees: { type: 'note_corrigee', reclamation_id: rec.id },
+            }).catch((e) => console.warn('[OneSignal] note corrigée:', e.message));
+          }
+        } catch (e) { console.error('[repondreReclamation] notification', e.message); }
+      })();
+    } else {
+      notifier(rec.etudiant_id, 'Réclamation traitée', `Votre réclamation ${rec.numero || ''} a été résolue.`);
+    }
+    res.json({
+      success: true,
+      message: bulletins.length ? 'Réponse envoyée. Un bulletin déjà publié est à republier.' : 'Réponse envoyée.',
+      note_finale: noteFinale,
+      bulletins_a_republier: bulletins,
+    });
   } catch (error) {
     console.error('[repondreReclamation]', error);
-    res.status(500).json({ success: false, message: 'Erreur lors de l\'envoi de la réponse.' });
+    // Hors production, on joint la cause technique au message pour faciliter les tests.
+    const detail = process.env.NODE_ENV === 'production' ? '' : ` [${error.message}]`;
+    if (!res.headersSent) res.status(500).json({ success: false, message: 'Erreur lors de l\'envoi de la réponse.' + detail });
   }
 };
 
@@ -427,4 +620,5 @@ module.exports = {
   getMesReclamations, getAllReclamations, getReclamationsProfesseur, getNombreEnAttente,
   getReclamation, getProfesseursCandidats, envoyerMessage,
   transfererReclamation, retourProfesseur, repondreReclamation, rejeterReclamation,
+  getNotesConcernees, renvoyerAuProfesseur,
 };

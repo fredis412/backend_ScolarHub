@@ -71,7 +71,7 @@ const _calculerMoyennesModules = async (filiere_id, niveau, semestre, annee_acad
     );
     if (etudiantsRes.rows.length === 0) {
         etudiantsRes = await pool.query(
-            `SELECT id, matricule, nom, prenoms FROM etudiants WHERE filiere_id = $1 AND niveau = $2 ORDER BY nom, prenoms`,
+            `SELECT id, matricule, nom, prenoms, COALESCE(date_naissance, (SELECT u.date_naissance FROM users u WHERE u.id = etudiants.user_id)) AS date_naissance, lieu_naissance FROM etudiants WHERE filiere_id = $1 AND niveau = $2 ORDER BY nom, prenoms`,
             [filiere_id, niveau]
         );
     }
@@ -121,7 +121,7 @@ const _calculerMoyennesModules = async (filiere_id, niveau, semestre, annee_acad
                 moyenne_module: moyenneModule,
             };
         });
-        return { etudiant_id: e.id, matricule: e.matricule, nom: e.nom, prenoms: e.prenoms, modules: modulesEtudiant };
+        return { etudiant_id: e.id, matricule: e.matricule, nom: e.nom, prenoms: e.prenoms, date_naissance: e.date_naissance, lieu_naissance: e.lieu_naissance, modules: modulesEtudiant };
     });
 
     // ── Après rattrapage : la note de rattrapage d'un module remplace la moyenne normale
@@ -356,6 +356,8 @@ const getPreparationBulletin = async (req, res) => {
                 matricule: e.matricule,
                 nom: e.nom,
                 prenoms: e.prenoms,
+                date_naissance: e.date_naissance,
+                lieu_naissance: e.lieu_naissance,
                 filiere_nom: filiereNom,
                 niveau,
                 moyenne_calculee: moyenneCalculee,
@@ -539,7 +541,7 @@ const getMonBulletin = async (req, res) => {
         const userId = req.user.id;
 
         const etudiantResult = await pool.query(
-            `SELECT id, nom, prenoms, filiere_nom, niveau FROM etudiants WHERE user_id = $1`,
+            `SELECT id, nom, prenoms, filiere_nom, niveau, COALESCE(date_naissance, (SELECT u.date_naissance FROM users u WHERE u.id = etudiants.user_id)) AS date_naissance, lieu_naissance FROM etudiants WHERE user_id = $1`,
             [userId]
         );
         const etudiant = etudiantResult.rows[0];
@@ -562,6 +564,8 @@ const getMonBulletin = async (req, res) => {
                 prenoms: etudiant.prenoms,
                 filiere_nom: etudiant.filiere_nom,
                 niveau: etudiant.niveau,
+                date_naissance: etudiant.date_naissance,
+                lieu_naissance: etudiant.lieu_naissance,
             },
         });
     } catch (error) {

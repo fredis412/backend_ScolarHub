@@ -318,11 +318,18 @@ const marquerPresenceManuelle = async (req, res) => {
       [session.appel_id, etudiant.id],
     );
     if (existant.rows.length > 0) {
-      await pool.query(`UPDATE appel_presences SET statut = $1 WHERE id = $2`, [statut, existant.rows[0].id]);
+      await pool.query(`
+        UPDATE appel_presences SET
+          arrivee_at = CASE WHEN $1::text = 'retard'
+            THEN COALESCE(CASE WHEN statut = 'retard' THEN arrivee_at END, CURRENT_TIMESTAMP)
+            ELSE NULL END,
+          statut = $1::text
+        WHERE id = $2
+      `, [statut, existant.rows[0].id]);
     } else {
       await pool.query(`
-        INSERT INTO appel_presences (appel_id, etudiant_id, matricule, nom, prenoms, statut)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO appel_presences (appel_id, etudiant_id, matricule, nom, prenoms, statut, arrivee_at)
+        VALUES ($1, $2, $3, $4, $5, $6::text, CASE WHEN $6::text = 'retard' THEN CURRENT_TIMESTAMP END)
       `, [session.appel_id, etudiant.id, etudiant.matricule, etudiant.nom, etudiant.prenoms, statut]);
     }
 

@@ -93,6 +93,7 @@ app.use('/api/rattrapage', require('./src/routes/rattrapage.routes'));
 app.use('/api/annuel', require('./src/routes/annuel.routes'));
 app.use('/api/reinscriptions', require('./src/routes/reinscriptions.routes'));
 app.use('/api/archives', require('./src/routes/archives.routes'));
+app.use('/api/bonus',         require('./src/routes/bonus.routes'));
  
 app.get('/', (req, res) => res.json({ message: 'ScolarHub API — IST Ouaga 2000', status: 'OK' }));
  

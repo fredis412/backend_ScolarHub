@@ -11,6 +11,7 @@ router.get('/mes-reclamations', authMiddleware, c.getMesReclamations);
 // Professeur (avant /:id)
 router.get('/professeur/mes', authMiddleware, requireRole('professeur'), c.getReclamationsProfesseur);
 router.patch('/:id/retour', authMiddleware, requireRole('professeur'), c.retourProfesseur);
+router.get('/:id/notes-concernees', authMiddleware, c.getNotesConcernees); // professeur + admin (contrôlé dans le contrôleur)
 
 // Admin (avant /:id)
 router.get('/en-attente/count', authMiddleware, requireRole('admin'), c.getNombreEnAttente);
@@ -18,6 +19,7 @@ router.get('/', authMiddleware, requireRole('admin'), c.getAllReclamations);
 router.get('/:id/professeurs', authMiddleware, requireRole('admin'), c.getProfesseursCandidats);
 router.patch('/:id/transferer', authMiddleware, requireRole('admin'), c.transfererReclamation);
 router.patch('/:id/repondre', authMiddleware, requireRole('admin'), c.repondreReclamation);
+router.patch('/:id/renvoyer', authMiddleware, requireRole('admin'), c.renvoyerAuProfesseur);
 router.patch('/:id/rejeter', authMiddleware, requireRole('admin'), c.rejeterReclamation);
 
 // Tous rôles (l'accès est contrôlé dans le contrôleur)

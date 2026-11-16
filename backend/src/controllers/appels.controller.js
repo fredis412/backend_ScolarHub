@@ -24,6 +24,11 @@ const createAppel = async (req, res) => {
             return res.status(400).json({ success: false, message: 'filiere_id et module_id sont requis.' });
         }
 
+        // Durée de la séance (heures) : sert au calcul des heures d'absence / de retard.
+        let duree = parseFloat(req.body.duree_heures);
+        if (!(duree > 0)) duree = 2;
+        duree = Math.min(Math.max(duree, 0.5), 12);
+
         if (!(await filiereDeMonEtab(filiere_id, req.etablissementId))) {
             return res.status(404).json({ success: false, message: 'Filière introuvable.' });
         }
@@ -33,9 +38,9 @@ const createAppel = async (req, res) => {
         const module_nom = moduleRes.rows.length > 0 ? moduleRes.rows[0].nom : 'Module';
 
         const appelResult = await pool.query(`
-            INSERT INTO appels (filiere_id, filiere_nom, niveau, module_id, professeur_id)
-            VALUES ($1, $2, $3, $4, $5) RETURNING id
-        `, [filiere_id, filiere_nom || '', niveau || 'Tous', module_id, professeur_id]);
+            INSERT INTO appels (filiere_id, filiere_nom, niveau, module_id, professeur_id, duree_heures)
+            VALUES ($1, $2, $3, $4, $5, $6) RETURNING id
+        `, [filiere_id, filiere_nom || '', niveau || 'Tous', module_id, professeur_id, duree]);
 
         const appel_id = appelResult.rows[0].id;
 
@@ -57,8 +62,8 @@ const createAppel = async (req, res) => {
                 
                 const statut = p.statut || 'present';
                 await pool.query(`
-                    INSERT INTO appel_presences (appel_id, etudiant_id, matricule, nom, prenoms, statut)
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                    INSERT INTO appel_presences (appel_id, etudiant_id, matricule, nom, prenoms, statut, arrivee_at)
+                    VALUES ($1, $2, $3, $4, $5, $6::text, CASE WHEN $6::text = 'retard' THEN CURRENT_TIMESTAMP END)
                 `, [appel_id, etudiant.id, p.matricule, etudiant.nom, etudiant.prenoms, statut]);
 
                 if (statut === 'absent') {
@@ -146,7 +151,7 @@ const getAppelDetail = async (req, res) => {
         }
 
         const presencesResult = await pool.query(`
-            SELECT matricule, nom, prenoms, statut FROM appel_presences WHERE appel_id = $1 ORDER BY nom
+            SELECT matricule, nom, prenoms, statut, arrivee_at FROM appel_presences WHERE appel_id = $1 ORDER BY nom
         `, [id]);
 
         res.json({ success: true, data: { ...appel, presences: presencesResult.rows } });
@@ -175,8 +180,14 @@ const updateAppel = async (req, res) => {
             for (const p of presences) {
                 if (!p.matricule) continue;
                 const statut = p.statut || 'present';
+                // Heure d'arrivée : posée au moment où la fiche passe à « retard »
+                // (conservée si déjà retard, effacée pour tout autre statut).
                 await client.query(`
-                    UPDATE appel_presences SET statut = $1 
+                    UPDATE appel_presences SET
+                        arrivee_at = CASE WHEN $1::text = 'retard'
+                            THEN COALESCE(CASE WHEN statut = 'retard' THEN arrivee_at END, CURRENT_TIMESTAMP)
+                            ELSE NULL END,
+                        statut = $1::text
                     WHERE appel_id = $2 AND matricule = $3
                 `, [statut, id, p.matricule]);
             }

@@ -674,6 +674,23 @@ const modifierProfil = async (req, res) => {
       }
       champs.push(`email = $${i++}`); valeurs.push(nouvelEmail);
     }
+    // Téléphone : sert aussi à la connexion (nom + prénom + téléphone).
+    let nouveauTel = null;
+    const telBrut = req.body.tel ?? req.body.telephone;
+    if (telBrut !== undefined) {
+      nouveauTel = String(telBrut || '').replace(/[\s.\-()]/g, '');
+      if (!/^\+?\d{8,15}$/.test(nouveauTel)) {
+        return res.status(400).json({ success: false, message: 'Numéro de téléphone invalide.' });
+      }
+      const dup = await pool.query(
+        `SELECT 1 FROM users me JOIN users o ON o.id <> me.id
+           AND o.etablissement_id IS NOT DISTINCT FROM me.etablissement_id
+           AND LOWER(o.nom) = LOWER(me.nom) AND LOWER(o.prenoms) = LOWER(me.prenoms)
+           AND REPLACE(COALESCE(o.tel,''),' ','') = $1
+         WHERE me.id = $2 LIMIT 1`, [nouveauTel, req.user.id]);
+      if (dup.rows.length) return res.status(409).json({ success: false, message: 'Ce numéro est déjà utilisé par un autre compte.' });
+      champs.push(`tel = $${i++}`); valeurs.push(nouveauTel);
+    }
     // Champs libres du profil (texte court, tronqué côté serveur).
     const texteLibre = { biographie: 300, centres_interet: 200, facebook: 200, whatsapp: 200, linkedin: 200 };
     for (const [col, max] of Object.entries(texteLibre)) {
@@ -696,6 +713,9 @@ const modifierProfil = async (req, res) => {
     if (nouvelEmail) {
       // La fiche étudiant garde sa propre copie de l'email : on la synchronise.
       try { await pool.query('UPDATE etudiants SET email = $1 WHERE user_id = $2', [nouvelEmail, req.user.id]); } catch (_) {}
+    }
+    if (nouveauTel) {
+      try { await pool.query('UPDATE etudiants SET tel = $1 WHERE user_id = $2', [nouveauTel, req.user.id]); } catch (_) {}
     }
     res.status(200).json({ success: true, message: 'Profil mis à jour.' });
   } catch (err) {

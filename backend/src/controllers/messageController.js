@@ -250,6 +250,57 @@ async function peutEcrireCanal(canal, userId, userRole) {
 
 // ── GET /api/messages/canaux ──────────────────────────────
 // Liste des canaux accessibles par l'utilisateur connecté
+// ── Destinataires push d'un canal ────────────────────────────────────────────
+// Renvoie les external_id OneSignal (matricule, sinon email — même règle que
+// OneSignalService.login côté Flutter) de ceux qui LISENT ce canal, hors
+// expéditeur. Avant, seule la table canal_membres était utilisée : or les
+// canaux standard (Administration, Admin & Filière, BDE…) et les canaux
+// « Admin Filière » par niveau sont ouverts par type/rôle, sans ligne
+// canal_membres → personne n'était notifié.
+const ROLES_STAFF_SQL = "('admin', 'professeur', 'prof', 'enseignant', 'teacher')";
+async function destinatairesPushCanal(canal, canalId, auteurId, etabId) {
+  const type = canal ? canal.type : null;
+  const params = [auteurId];
+  let joinEtu = '';
+  let condition;
+
+  if (type === 'admin_filiere_niveau' && canal) {
+    // L'admin + les étudiants de CE (filière, niveau) — même règle que accesCanal.
+    joinEtu = 'LEFT JOIN etudiants e ON e.user_id = u.id';
+    params.push(canal.filiere_id, canal.niveau);
+    condition = `(LOWER(u.role) = 'admin' OR (e.filiere_id = $2 AND e.niveau = $3))`;
+  } else if (['administration', 'admin_filiere', 'bde', 'general'].includes(type)) {
+    // Canaux lisibles par tout l'établissement.
+    condition = 'TRUE';
+  } else if (type === 'admin_delegues') {
+    condition = `(LOWER(u.role) = 'admin' OR LOWER(u.etudiant_role) IN ('delegue', 'delegue_adjoint'))`;
+  } else if (['admin_profs', 'professeurs'].includes(type)) {
+    condition = `LOWER(u.role) IN ${ROLES_STAFF_SQL}`;
+  } else {
+    // Autres types (prof_delegue_niveau, canaux de prof…) : membres explicites.
+    params.push(canalId);
+    condition = `u.id IN (SELECT user_id FROM canal_membres WHERE canal_id = $${params.length})`;
+  }
+
+  const etab = (canal && canal.etablissement_id) || etabId;
+  let filtreEtab = '';
+  if (etab) {
+    params.push(etab);
+    filtreEtab = ` AND u.etablissement_id = $${params.length}`;
+  }
+
+  const { rows } = await pool.query(
+    `SELECT DISTINCT COALESCE(NULLIF(TRIM(u.matricule), ''), NULLIF(TRIM(u.email), '')) AS ext_id
+       FROM users u
+       ${joinEtu}
+      WHERE u.id != $1
+        AND COALESCE(u.statut, 'actif') NOT IN ('suspendu', 'renvoye')
+        AND ${condition}${filtreEtab}`,
+    params
+  );
+  return rows.map(r => r.ext_id).filter(Boolean);
+}
+
 const getCanaux = async (req, res) => {
   try {
     const pCan = [req.user.id];
@@ -519,25 +570,24 @@ const envoyerMessageCanal = async (req, res) => {
     const io = req.app.get('io');
     if (io) io.to(`canal:${id}`).emit('message:canal', message);
 
-    // 🔔 Notification push OneSignal aux membres du canal (hors expéditeur)
+    // 🔔 Notification push OneSignal aux lecteurs du canal (hors expéditeur).
+    // Les destinataires dépendent du TYPE de canal (voir destinatairesPushCanal) :
+    // la plupart des canaux sont ouverts par type/rôle, sans ligne canal_membres.
     try {
-      const { rows: membres } = await pool.query(
-        `SELECT u.matricule FROM canal_membres cm
-         JOIN users u ON u.id = cm.user_id
-         WHERE cm.canal_id = $1 AND cm.user_id != $2 AND u.matricule IS NOT NULL`,
-        [id, req.user.id]
-      );
-      if (membres.length > 0) {
-        const matricules = membres.map(m => m.matricule);
+      const destinataires = await destinatairesPushCanal(canal, id, req.user.id, req.etablissementId);
+      if (destinataires.length > 0) {
         const canalNom = canal?.nom || 'Canal';
         const expediteurNom = `${message.prenoms || ''} ${message.nom || ''}`.trim();
         const apercu = contenu.trim().length > 80 ? contenu.trim().substring(0, 80) + '...' : contenu.trim();
-        envoyerNotification({
-          titre: `📢 ${canalNom}`,
-          message: `${expediteurNom}: ${apercu}`,
-          destinataires: matricules,
-          donnees: { type: 'message_canal', canal_id: id },
-        }).catch(e => console.warn('[OneSignal] Erreur notif canal:', e.message));
+        // OneSignal accepte au plus 2000 external_id par envoi.
+        for (let i = 0; i < destinataires.length; i += 2000) {
+          envoyerNotification({
+            titre: `📢 ${canalNom}`,
+            message: `${expediteurNom}: ${apercu}`,
+            destinataires: destinataires.slice(i, i + 2000),
+            donnees: { type: 'message_canal', canal_id: id },
+          }).catch(e => console.warn('[OneSignal] Erreur notif canal:', e.message));
+        }
       }
     } catch (e) {
       console.warn('[OneSignal] Erreur notif canal:', e.message);

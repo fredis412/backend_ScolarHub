@@ -25,9 +25,17 @@ async function envoyerNotification({ titre, message, destinataires = null, donne
   };
 
   if (destinataires) {
-    const list = Array.isArray(destinataires) ? destinataires : [destinataires];
+    const list = (Array.isArray(destinataires) ? destinataires : [destinataires])
+      .map(d => (d !== null && d !== undefined ? String(d).trim() : ''))
+      .filter(Boolean);
+
+    if (list.length === 0) {
+      console.warn('[OneSignal] Aucun destinataire valide fourni. Envoi ignoré.');
+      return;
+    }
+
     payload.include_aliases = {
-      external_id: list.map(String),
+      external_id: list,
     };
     payload.target_channel = 'push';
   } else {
@@ -60,7 +68,10 @@ async function envoyerNotification({ titre, message, destinataires = null, donne
             resolve(json);
           } else {
             console.error('[OneSignal] Erreur retournée:', json);
-            reject(new Error(json.errors ? json.errors.join(', ') : 'Erreur OneSignal'));
+            const errMsg = Array.isArray(json?.errors)
+              ? json.errors.join(', ')
+              : (typeof json?.errors === 'object' ? JSON.stringify(json.errors) : (json?.errors || 'Erreur OneSignal'));
+            reject(new Error(errMsg));
           }
         } catch (e) {
           resolve(responseBody);

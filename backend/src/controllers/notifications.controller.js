@@ -1,5 +1,7 @@
 const supabase = require('../config/supabase');
+const pool = require('../config/db');
 const { pushToUser } = require('../socket/socketHandler');
+const { envoyerNotification } = require('../services/onesignal.service');
 
 // GET /api/notifications - Liste des notifications de l'utilisateur
 const getNotifications = async (req, res) => {
@@ -114,6 +116,30 @@ const envoyerNotificationAuto = async (userId, titre, corps, type = null, data =
 
     // Push temps réel vers la cloche de l'utilisateur (si connecté).
     pushToUser(userId, 'notification', row);
+
+    // 🔔 Push OneSignal automatique vers l'appareil de l'utilisateur (non bloquant)
+    (async () => {
+      try {
+        const { rows } = await pool.query(
+          'SELECT matricule, email FROM users WHERE id = $1',
+          [userId]
+        );
+        const user = rows[0];
+        const targets = [];
+        if (user?.matricule) targets.push(user.matricule);
+        if (user?.email && user.email !== user?.matricule) targets.push(user.email);
+        const destinataires = targets.length > 0 ? targets : [String(userId)];
+
+        await envoyerNotification({
+          titre: titre || 'ScolarHub',
+          message: corps || '',
+          destinataires,
+          donnees: { type: type || 'notification', ...(data || {}) },
+        });
+      } catch (osErr) {
+        console.warn('[OneSignal Auto] Erreur envoi push:', osErr.message);
+      }
+    })();
 
     return { success: true, data: row };
   } catch (error) {

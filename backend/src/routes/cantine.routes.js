@@ -11,6 +11,7 @@ router.get('/aujourdhui', authMiddleware, cantineController.getMenuAujourdhui);
 // Écran d'édition (admin / cantinière) : voir et publier un menu.
 router.get('/jour', authMiddleware, requireRole('admin'), cantineController.getMenuJour);
 router.post('/publier', authMiddleware, requireRole('admin'), cantineController.publierMenu);
+router.post('/copier', authMiddleware, requireRole('admin'), cantineController.copierMenu);
 
 // Plats du menu : photo, ajout, modification, suppression.
 router.post('/plats/image', authMiddleware, requireRole('admin'), upload.single('file'), uploadToCloudinary('scolarhub/cantine'), cantineController.televerserImagePlat);

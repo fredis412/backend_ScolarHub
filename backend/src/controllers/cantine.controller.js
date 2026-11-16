@@ -564,7 +564,76 @@ const traiterCommande = async (req, res) => {
   }
 };
 
+// POST /api/cantine/copier  { source: 'YYYY-MM-DD', cible: 'YYYY-MM-DD', repas?: 'dejeuner' }
+// Reprend les plats d'un autre jour (menu deja prepare) vers la date cible.
+// Ne publie rien : l'admin verifie puis publie. Les plats deja presents ce jour-la
+// (meme repas + meme nom) ne sont pas dupliques.
+const copierMenu = async (req, res) => {
+  try {
+    const { source, cible, repas } = req.body;
+    const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+    if (!DATE_RE.test(String(source)) || !DATE_RE.test(String(cible))) {
+      return res.status(400).json({ success: false, message: 'Dates invalides (format AAAA-MM-JJ).' });
+    }
+    if (source === cible) {
+      return res.status(400).json({ success: false, message: 'Choisissez un autre jour que celui affiche.' });
+    }
+    if (repas && !REPAS_VALIDES.includes(repas)) {
+      return res.status(400).json({ success: false, message: 'Repas invalide.' });
+    }
+    const etabId = req.etablissementId || null;
+
+    const ps = [source];
+    let filtreRepas = '';
+    if (repas) { ps.push(repas); filtreRepas = ` AND repas = $${ps.length}`; }
+    const src = await pool.query(
+      `SELECT repas, nom, description, categorie, prix, image_url, ordre FROM cantine_plats
+       WHERE date = $1${filtreRepas}${etabMenu(ps, etabId)}
+       ORDER BY ordre, created_at`,
+      ps
+    );
+    if (src.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Aucun plat a reprendre pour ce jour-la.' });
+    }
+
+    const pc = [cible];
+    const deja = await pool.query(
+      `SELECT repas, nom FROM cantine_plats WHERE date = $1${etabMenu(pc, etabId)}`,
+      pc
+    );
+    const cle = (p) => `${p.repas}|${String(p.nom).trim().toLowerCase()}`;
+    const existants = new Set(deja.rows.map(cle));
+    const aCopier = src.rows.filter((p) => !existants.has(cle(p)));
+    if (aCopier.length === 0) {
+      return res.status(409).json({ success: false, message: 'Ces plats sont deja dans le menu de ce jour.' });
+    }
+
+    const params = [cible, String(req.user.id), etabId];
+    const tuples = aCopier.map((p) => {
+      params.push(p.repas, p.nom, p.description || '', p.categorie, p.prix, p.image_url || null, p.ordre ?? 0);
+      const n = params.length;
+      return `($1, $${n - 6}, $${n - 5}, $${n - 4}, $${n - 3}, $${n - 2}, $${n - 1}, $${n}, true, $2, $3)`;
+    });
+    const ins = await pool.query(
+      `INSERT INTO cantine_plats (date, repas, nom, description, categorie, prix, image_url, ordre, disponible, created_by, etablissement_id)
+       VALUES ${tuples.join(', ')}
+       RETURNING ${COLONNES_PLAT}`,
+      params
+    );
+
+    const ignores = src.rows.length - aCopier.length;
+    const msg = `${ins.rows.length} plat${ins.rows.length > 1 ? 's' : ''} repris`
+      + (ignores > 0 ? ` (${ignores} deja present${ignores > 1 ? 's' : ''})` : '')
+      + '. Verifiez puis publiez le menu.';
+    res.status(201).json({ success: true, message: msg, data: ins.rows });
+  } catch (err) {
+    console.error('[copierMenu]', err);
+    res.status(500).json({ success: false, message: 'Erreur lors de la reprise du menu.' });
+  }
+};
+
 module.exports = {
+  copierMenu,
   getMenuJour,
   getMenuAujourdhui,
   publierMenu,
